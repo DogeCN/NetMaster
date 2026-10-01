@@ -1,0 +1,138 @@
+# netmaster 默认分流规则（顺序匹配，首条命中即返回）
+# 语法: <action> <kind> <value>
+#   action = direct | proxy          （某条规则的动作）
+#   kind   = domain | suffix | cidr  （domain 已含精确匹配；suffix 只匹配子域；cidr 匹配 IP）
+# 未命中任何规则的走文件末尾的 `default auto`。
+#
+# 匹配类型只有上面三种：每种都要有人真的用才留。
+
+# ---------- 强制代理（被墙/必须走海外出口）----------
+proxy domain google.com
+proxy domain googleapis.com
+proxy domain gstatic.com
+proxy domain googleusercontent.com
+proxy domain youtube.com
+proxy domain youtu.be
+proxy domain googlevideo.com
+proxy domain ytimg.com
+proxy domain facebook.com
+proxy domain fb.com
+proxy domain fbcdn.net
+proxy domain instagram.com
+proxy domain twitter.com
+proxy domain x.com
+proxy domain t.co
+proxy domain telegram.org
+proxy domain telegram.me
+proxy domain t.me
+proxy domain openai.com
+proxy domain chatgpt.com
+proxy domain oaistatic.com
+proxy domain oaiusercontent.com
+proxy domain anthropic.com
+proxy domain claude.ai
+proxy domain github.com
+proxy domain githubusercontent.com
+proxy domain github.io
+proxy domain gitlab.com
+proxy domain raw.githubusercontent.com
+proxy domain wikipedia.org
+proxy domain wikipedia.net
+proxy domain reddit.com
+proxy domain redd.it
+proxy domain netflix.com
+proxy domain disneyplus.com
+proxy domain hbo.com
+proxy domain primevideo.com
+proxy domain spotify.com
+proxy domain nytimes.com
+proxy domain bbc.co.uk
+proxy domain bbc.com
+proxy domain medium.com
+proxy domain wordpress.com
+proxy domain blogspot.com
+proxy domain duckduckgo.com
+proxy domain pastebin.com
+proxy domain wikimedia.org
+proxy domain docker.io
+proxy domain docker.com
+proxy domain npmjs.com
+proxy domain pypi.org
+proxy domain crates.io
+
+# ---------- 国内直连（CN 站点/服务，避免绕路变慢）----------
+direct suffix cn
+direct suffix com.cn
+direct suffix net.cn
+direct suffix org.cn
+direct suffix gov.cn
+direct suffix edu.cn
+direct domain baidu.com
+direct domain bdstatic.com
+direct domain qq.com
+direct domain qpic.cn
+direct domain gtimg.cn
+direct domain weixin.qq.com
+direct domain taobao.com
+direct domain tmall.com
+direct domain alipay.com
+direct domain aliyun.com
+direct domain aliyuncs.com
+direct domain alicdn.com
+direct domain jd.com
+direct domain 360buyimg.com
+direct domain 163.com
+direct domain 126.com
+direct domain sina.com.cn
+direct domain sina.cn
+direct domain sohu.com
+direct domain ifeng.com
+direct domain bilibili.com
+direct domain bilivideo.com
+direct domain hdslb.com
+direct domain zhihu.com
+direct domain zhimg.com
+direct domain douyin.com
+direct domain douyinvod.com
+direct domain byteimg.com
+direct domain pstatp.com
+direct domain snssdk.com
+direct domain xiaomi.com
+direct domain mi.com
+direct domain huawei.com
+direct domain oppo.com
+direct domain vivo.com
+direct domain meizu.com
+direct domain gitee.com
+direct domain csdn.net
+direct domain cnblogs.com
+direct domain jianshu.com
+direct domain meituan.com
+direct domain dianping.com
+direct domain eleme.me
+direct domain ctrip.com
+direct domain qunar.com
+direct domain 12306.cn
+direct domain didi.com
+direct domain tmall.hk
+
+# ---------- 局域网/本机直连 ----------
+direct cidr 127.0.0.0/8
+direct cidr 10.0.0.0/8
+direct cidr 172.16.0.0/12
+direct cidr 192.168.0.0/16
+direct cidr 169.254.0.0/16
+direct domain localhost
+# IPv6 侧。localhost 常优先解析成 ::1，漏了它本机服务会被送去代理，
+# 再由边缘去连 ::1 —— 必然失败。
+direct cidr ::1/128
+direct cidr fc00::/7
+direct cidr fe80::/10
+
+# ---------- 兜底 ----------
+# 未明确列出的主机交给出口层自动判断（route.Auto）：解析域名后落在 CN 网段就直连，
+# 否则走代理；两条路互相回退，并按域名记住选择。
+#
+# 注意这里不能改成按后缀穷举送代理：域名列表无法穷举，那会把大量国内 IP、
+# 没被墙的站点绕到海外再绕回来。
+default auto

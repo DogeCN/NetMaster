@@ -1,0 +1,19 @@
+# 构建产物：_worker.js 由 src/ 生成，不进版本库
+server/_worker.js
+client/netmaster.exe
+client/netmaster
+server/node_modules/
+.wrangler/
+
+# 客户端配置可能含口令，不进版本库
+config.json
+
+# 凭据。wrangler.toml 要进版本库 —— 里面只有占位符，真实 database_id 由
+# deploy 工作流解析后改写；真正的秘密走 GitHub Secrets 与 `wrangler secret put`。
+.env
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

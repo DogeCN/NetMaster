@@ -1,0 +1,18 @@
+{
+  "name": "netmaster-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "NetMaster 服务端：自有协议 mux-over-WebSocket，经 Cloudflare Worker 转发",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node test/crypto.mjs && node test/protocol.mjs && node test/integration.mjs && node test/control.mjs && node test/relay.mjs",
+    "test:unit": "node test/crypto.mjs && node test/protocol.mjs"
+  },
+  "devDependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,47 @@
+name: ci
+
+# Quality gate: build the bundle (which fails on a syntax error) -> unit tests.
+# Deliberately thin — there is no linter or type-checker in this project yet, and
+# a gate that only ever passes teaches you to ignore it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # build.mjs is the real syntax gate: it concatenates src/ into _worker.js and
+      # a stray character anywhere in src/ fails here rather than in production.
+      - name: Build worker bundle
+        run: |
+          node build.mjs
+          node -e "import('./_worker.js').then(()=>console.log('bundle loads OK'))"
+
+      - name: Unit tests
+        run: |
+          for t in crypto protocol integration control relay; do
+            printf '%-12s ' "$t"
+            node "test/$t.mjs" | tail -1
+          done
