@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"sort"
 	"strconv"
@@ -174,7 +173,7 @@ func cmdNodes(args []string) {
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
 			resp.Body.Close()
 			counts[strings.TrimSpace(string(b))]++
-			logger.Printf("=== 出口IP分布 ===")
+			logger.Printf("=== egress IP distribution ===")
 			type kv struct {
 				ip string
 				n  int
@@ -344,9 +343,9 @@ func cmdServe(args []string) {
 	// 结果出来补一行日志 —— 部署是否健康，这一行就是最直接的回答。
 	go func() {
 		if node, err := pool.Verify(); err != nil {
-			logger.Printf("隧道建立失败: %v", err)
+			logger.Printf("tunnel failed: %v", err)
 		} else {
-			logger.Printf("隧道建立成功（经节点 %s）", node)
+			logger.Printf("tunnel established via node %s", node)
 		}
 	}()
 
@@ -381,30 +380,6 @@ func pickPort(preferred int) (int, error) {
 	return 0, fmt.Errorf("no free port from %d", preferred)
 }
 
-// spawnWatchdog 启动一个脱离的看门狗子进程，监视当前进程；当前进程异常消失时由它还原系统代理。
-func spawnWatchdog(logger *log.Logger) {
-	exe, err := os.Executable()
-	if err != nil {
-		logger.Printf("WARN locate exe for watchdog: %v", err)
-		return
-	}
-	cmd := exec.Command(exe, "watchdog")
-	cmd.Env = append(os.Environ(), "NETMASTER_OWNER_PID="+fmt.Sprint(os.Getpid()))
-	// 脱离：不让看门狗继承控制台输入，独立存活。
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		HideWindow:    true,
-		CreationFlags: 0x00000008 | 0x00000200, // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-	}
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
-	if err := cmd.Start(); err != nil {
-		logger.Printf("WARN start watchdog: %v", err)
-		return
-	}
-	// 不 Wait，让它独立运行；父进程退出后由它接管清理。
-	go func() { _ = cmd.Process.Release() }()
-	logger.Printf("[sys] watchdog started (pid %d) to auto-restore on crash", cmd.Process.Pid)
-}
-
 // cmdWatchdog 内部命令：等待 owner 进程退出，若系统代理仍指向 netmaster 则还原。
 // serve 被强杀（任务管理器结束进程、断电）时，由它把系统代理还原回去。
 //
@@ -414,7 +389,7 @@ func cmdWatchdog(args []string) {
 	_ = args
 	pid, err := strconv.Atoi(strings.TrimSpace(os.Getenv("NETMASTER_OWNER_PID")))
 	if err != nil || pid <= 0 {
-		fmt.Fprintln(os.Stderr, "watchdog 只能由 serve 派生运行（缺 NETMASTER_OWNER_PID）")
+		fmt.Fprintln(os.Stderr, "watchdog can only be spawned by serve (missing NETMASTER_OWNER_PID)")
 		os.Exit(2)
 	}
 	procwait.Wait(pid) // 阻塞到 owner 退出
@@ -429,10 +404,10 @@ func cmdRestore(args []string) {
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
 	fs.Parse(args)
 	if err := sysproxy.Restore(); err != nil {
-		fmt.Println("restore err:", err)
+		fmt.Println("restore error:", err)
 		os.Exit(1)
 	}
-	fmt.Println("system proxy restored (netmaster cleaned up)")
+	fmt.Println("system proxy restored")
 }
 
 func waitForSignal() {
@@ -443,10 +418,11 @@ func waitForSignal() {
 
 func usage() {
 	fmt.Println("usage: netmaster <serve|nodes|restore> [flags]")
-	fmt.Println("  serve   - 起本地 HTTP+SOCKS5 代理并接管系统代理（日常唯一命令）")
-	fmt.Println("  nodes   - 持续发请求，观察自适应选路的实时效果")
-	fmt.Println("  restore - 还原系统代理（serve 被强杀后用它收拾）")
-	fmt.Print("\n配置：命令行 flag > config.json > 默认值。config.json 与 serve 的 flag 一一对应：\n" +
-		"  { \"server\": \"<域名>\", \"password\": \"<口令>\", \"manual\": false, \"rules\": \"\" }\n" +
-		"放在当前目录或 %AppData%/netmaster/config.json。\n每个子命令加 -h 看它自己的参数。分流与出口逻辑见 docs/。\n")
+	fmt.Println("  serve   - run the local HTTP+SOCKS5 proxy and take over the system proxy")
+	fmt.Println("  nodes   - keep firing requests and watch adaptive exit selection live")
+	fmt.Println("  restore - restore the system proxy (after serve was killed uncleanly)")
+	fmt.Print("\nConfig precedence: CLI flag > config.json > default. config.json mirrors the serve flags:\n" +
+		"  { \"server\": \"<domain>\", \"password\": \"<password>\", \"manual\": false, \"rules\": \"\" }\n" +
+		"Place it next to the binary or in %AppData%/netmaster/config.json.\n" +
+		"Add -h to any subcommand for its own flags. Routing and exit logic: see docs/.\n")
 }
