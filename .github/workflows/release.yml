@@ -1,0 +1,63 @@
+name: release
+
+# Tag 触发：构建全部产物并创建 Release。
+# 资产凑齐"直接部署"所需的一切 —— 不克隆仓库的用户下载后照 README 走完即可：
+#   _worker.js    Worker 脚本
+#   wrangler.toml 部署配置（database_id 是占位符，部署前自己填）
+#   schema.sql    D1 表结构
+#   netmaster.exe Windows 客户端
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: client/go.mod
+          cache-dependency-path: client/go.sum
+
+      - name: Build worker bundle
+        working-directory: server
+        run: |
+          npm ci
+          node build.mjs
+
+      - name: Run server tests
+        working-directory: server
+        run: npm test
+
+      - name: Build client
+        working-directory: client
+        run: go build -trimpath -ldflags="-s -w" -o netmaster.exe ./cmd/netmaster
+
+      - name: Run client tests
+        working-directory: client
+        run: go test ./...
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            server/_worker.js \
+            server/wrangler.toml \
+            server/schema.sql \
+            client/netmaster.exe

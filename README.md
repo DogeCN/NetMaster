@@ -23,38 +23,43 @@
 
 ## 快速开始
 
+前提：一个 Cloudflare 账号、一个托管在 CF 的域名（客户端要连它）。全程只涉及
+一个口令（PASSWORD）和一个域名，没有别的。
+
 ### 1. 服务端
 
-整个部署只有三步，全部在 GitHub 上完成：
+**首选：不克隆仓库，直接部署。** 从 [Release](../../releases/latest) 下载
+`_worker.js`、`wrangler.toml`、`schema.sql` 放进同一目录，然后：
 
-**① 配三个 Secret**（`gh secret set` 或仓库 Settings 页面）：
+```bash
+npx wrangler login
+npx wrangler d1 create netmaster                          # 把输出的 database_id 填进 wrangler.toml
+npx wrangler d1 execute netmaster --remote --file=schema.sql
+npx wrangler secret put PASSWORD                          # 你定的口令，客户端要用同一个
+npx wrangler deploy
+```
 
-| Secret | 用途 |
-|---|---|
-| `CLOUDFLARE_API_TOKEN` | CI 调 Cloudflare API（需 Workers Scripts / D1 编辑权限） |
-| `CLOUDFLARE_ACCOUNT_ID` | 账号 ID |
-| `PASSWORD` | 客户端连接口令，CI 透传成 Worker Secret |
+最后在 Cloudflare 控制台给这个 Worker 绑定你的域名（custom domain）——
+这一步同时建 DNS 和路由，是客户端能连上它的全部前提。
 
-**② push 到 main**。CI 自动：跑测试 → 建同名 D1 → 应用 schema → 部署 Worker →
-把 PASSWORD 传给 Worker。CI 绿了就是部署完了，没有部署后验证 —— runner 的
-网络环境和用户差别很大，健康与否由"客户端能不能连上"直接回答。
-
-**③ 绑你自己的域名**。这是你自己的事，项目不管可达性：在 Cloudflare 控制台给
-Worker 加一个 custom domain（会同时建 DNS 和路由），或自己用 wrangler 绑。
+**或者：克隆仓库走 CI。** 给仓库配三个 Secret（`CLOUDFLARE_API_TOKEN`、
+`CLOUDFLARE_ACCOUNT_ID`、`PASSWORD`，用 `gh secret set` 或仓库设置页），push
+到 main，CI 自动完成建库、schema、部署、透传 PASSWORD。打 `v*` tag 会额外
+构建 Release 产物。
 
 ### 2. 客户端
 
-```bash
-cd client
-go build -o netmaster.exe ./cmd/netmaster     # Windows；Linux/macOS 去掉 .exe
-./netmaster.exe serve --server <你的域名> --password <PASSWORD>
-```
-
-配置来源优先级：**命令行 flag > config.json > 默认值**。写一份 config.json（当前
-目录或 `%AppData%/netmaster/config.json`）之后，日常就是裸的 `netmaster serve`：
+从 [Release](../../releases/latest) 下载 `netmaster.exe`（或克隆仓库自己
+`go build`）。写一份 `config.json` 放在 exe 旁边（或 `%AppData%/netmaster/config.json`）：
 
 ```json
 { "server": "<你的域名>", "password": "<PASSWORD>" }
+```
+
+然后：
+
+```bash
+./netmaster.exe serve
 ```
 
 启动后监听端口自动选择（先试 8080/1080，被占则顺延），系统代理自动指向选定
@@ -104,4 +109,7 @@ cd server && npm install && node build.mjs && npm test
 # 端到端（Go 客户端 ↔ 真实 forward.js）
 cd server && node test/devserver.mjs 8799 &
 cd client && go test ./internal/outbound -run TestMuxE2E -v
+
+# 发版：打 tag 即构建全部 Release 产物（.github/workflows/release.yml）
+git tag v0.1.0 && git push --tags
 ```
