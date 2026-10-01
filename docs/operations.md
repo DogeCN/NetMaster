@@ -80,12 +80,32 @@ netmaster serve --server <域名> --password <PASSWORD>
 `%AppData%/netmaster/config.json`：
 
 ```json
-{ "server": "<域名>", "password": "<口令>", "manual": false, "rules": "" }
+{ "server": "<域名>", "password": "<口令>", "manual": false, "rules": "", "latencyToleranceMs": 300 }
 ```
 
 写好之后日常就是裸的 `netmaster serve`。环境变量 `NETMASTER_SERVER` /
 `NETMASTER_PASSWORD`（`PASSWORD` 也认）是最后一级兜底，优先级低于 config.json。
 缺 server/password 时以退出码 2 报错，而不是拿空凭据去连。
+
+### 延迟容忍（latencyToleranceMs）
+
+出口亲和默认是"通一次就粘住，直到明确失败"。`latencyToleranceMs` 给粘性加一个
+天花板：
+
+| 值 | 行为 |
+|---|---|
+| 不设（默认） | 粘死 —— 保守，出口 IP 最稳定 |
+| `0` 或负数 | 自优化 —— 每次请求都重新选优，哪个快走哪个，代价是出口 IP 不稳定 |
+| 正数 N | 绑定节点的实测延迟（EWMA）超过 N ms 时改选更快的出口，改选成功后重绑 |
+
+只影响代理出口；直连出口不测延迟，不参与。改选只发生在自适应路径**成功**之后
+（bindAffinity 只在成功路径调用），不会因为换出口把请求本身弄失败。
+
+### 入口候选规模
+
+候选 = 服务端域名 DNS + 三个社区源（各最多 50 条，总数截断到 64，DNS 优先保留），
+全部后台探测（12 并发、单节点 4s 预算）。探测只是排序，运行期自适应评分
+（成功率 × 1000 + 延迟 + 连败惩罚）才是真正的选择。
 
 **双击 exe 等价于 `serve`**：无参数启动即 serve；首次双击没有 config.json 时
 在 exe 旁生成模板，填好 server/password 再点一次；任何启动错误都会等一次

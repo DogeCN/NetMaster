@@ -62,11 +62,15 @@ func FromServer(ctx context.Context, server string) []Node {
 var Sources = []string{
 	"https://ipdb.api.030101.xyz/?type=bestcf&country=true",
 	"https://addressesapi.090227.xyz/CloudFlareYes",
-	"https://090227.pages.dev/bestcf?isp=all&ips=20",
+	"https://090227.pages.dev/bestcf?isp=all&ips=50",
 }
 
 // fetchTimeout 是单个源的超时。源的响应是一小段文本，超过这个时间基本就是死了。
 const fetchTimeout = 4 * time.Second
+
+// maxPerSource 是单个源最多贡献的候选数。优选源给的就是排好序的头部结果，
+// 尾部的重复/劣质条目没有探测价值。
+const maxPerSource = 50
 
 // Community 并行拉取全部社区源，合并去重。
 //
@@ -169,8 +173,8 @@ func parseList(body string) []Node {
 		}
 		seen[key] = struct{}{}
 		out = append(out, Node{Addr: host, Port: port, Name: name})
-		if len(out) >= 24 {
-			break // 候选集够大了，再多只是浪费探测预算
+		if len(out) >= maxPerSource {
+			break
 		}
 	}
 	return out

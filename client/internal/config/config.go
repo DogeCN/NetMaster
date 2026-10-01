@@ -26,6 +26,10 @@ type Config struct {
 	Password string `json:"password,omitempty"`
 	Manual   bool   `json:"manual,omitempty"`
 	Rules    string `json:"rules,omitempty"`
+	// LatencyToleranceMs 缺省（nil）= 出口粘死直到失败（默认）；
+	// 0 或负数 = 每次请求重新选优（自优化，代价是出口 IP 不稳定）；
+	// 正数 = 绑定节点的实测延迟超过该毫秒数时改选更快的出口。
+	LatencyToleranceMs *int `json:"latencyToleranceMs,omitempty"`
 }
 
 // searchPaths 返回按优先级排列的候选路径。

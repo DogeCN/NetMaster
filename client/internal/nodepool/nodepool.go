@@ -89,6 +89,9 @@ type Config struct {
 	// StateKey 亲和与直连冷却的持久化标识（用服务端域名）。换服务端时旧状态
 	// 天然失效；为空则不持久化（仅诊断命令用）。
 	StateKey string
+	// LatencyToleranceMs 出口亲和的延迟容忍值（毫秒），语义见 config.Config。
+	// nil = 粘死直到失败；<=0 = 每次重新选优；>0 = 绑定节点延迟超过阈值即改选。
+	LatencyToleranceMs *int
 }
 
 // Pool 持有一个入口候选列表，支持自适应选择、故障转移与延迟排序。
@@ -125,6 +128,9 @@ type Pool struct {
 	saveMu      sync.Mutex
 	savePending bool
 
+	// 出口亲和的延迟容忍值，语义见 Config.LatencyToleranceMs。
+	latencyToleranceMs *int
+
 	// mux 连接池：每个节点复用一条 WS 传输，上面并发跑多个会话，
 	// 避免每请求都做 TCP+TLS(ECH)+WS 握手。mux 是唯一传输路径。
 	muxMu    sync.Mutex
@@ -138,17 +144,18 @@ func New(cfg Config) *Pool {
 		states[i] = &nodeState{}
 	}
 	p := &Pool{
-		nodes:         cfg.Nodes,
-		states:        states,
-		sni:           cfg.SNI,
-		auth:          cfg.Auth,
-		useECH:        cfg.UseECH,
-		insecure:      cfg.Insecure,
-		affinity:      make(map[string]Exit),
-		directBlocked: make(map[string]time.Time),
-		stateKey:      cfg.StateKey,
-		muxConns:      make(map[int][]*outbound.MuxConn),
-		rng:           rand.New(rand.NewSource(time.Now().UnixNano())),
+		nodes:              cfg.Nodes,
+		states:             states,
+		sni:                cfg.SNI,
+		auth:               cfg.Auth,
+		useECH:             cfg.UseECH,
+		insecure:           cfg.Insecure,
+		affinity:           make(map[string]Exit),
+		directBlocked:      make(map[string]time.Time),
+		stateKey:           cfg.StateKey,
+		latencyToleranceMs: cfg.LatencyToleranceMs,
+		muxConns:           make(map[int][]*outbound.MuxConn),
+		rng:                rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 	p.loadState()
 	return p
@@ -263,8 +270,10 @@ func (p *Pool) Dial(target string) (net.Conn, error) {
 	}
 	host := hostOf(target)
 
-	// 1) 域名亲和：该域名已绑定过节点 → 直接用它（同站出口稳定）
-	if idx := p.affinityOf(host); idx >= 0 && idx < n && !p.states[idx].isDisabled() {
+	// 1) 域名亲和：该域名已绑定过节点 → 直接用它（同站出口稳定）。
+	// 绑定节点的延迟超出容忍值时视为未绑定，落到自适应重新选优；
+	// 选中的新出口成功后自动重绑（bindAffinity 只在成功路径上调用）。
+	if idx := p.affinityOf(host); idx >= 0 && idx < n && !p.states[idx].isDisabled() && !p.latencyExceeded(idx) {
 		if conn, ok := p.tryDial(idx, target); ok {
 			atomic.StoreUint32(&p.idx, uint32(idx))
 			return conn, nil
@@ -401,6 +410,26 @@ func (p *Pool) SortByLatency() {
 	p.affMu.Unlock()
 	// 主节点指向探测最快且成功的
 	atomic.StoreUint32(&p.idx, 0)
+}
+
+// latencyExceeded 报告绑定节点的延迟是否超出容忍值（只影响节点出口，
+// 直连出口不测延迟，不参与）。
+// 容忍值未配置 → 永不超出（默认粘死）；<=0 → 恒超出（自优化模式）；
+// >0 → 绑定节点的 EWMA 延迟超过该毫秒数才算超出，未知延迟（0）不算，
+// 避免没有探测数据时无谓地换出口。
+func (p *Pool) latencyExceeded(idx int) bool {
+	if p.latencyToleranceMs == nil {
+		return false
+	}
+	t := *p.latencyToleranceMs
+	if t <= 0 {
+		return true
+	}
+	s := p.states[idx]
+	s.mu.Lock()
+	lat := s.latency
+	s.mu.Unlock()
+	return lat > time.Duration(t)*time.Millisecond
 }
 
 // Nodes 返回当前节点顺序（可能是延迟排序后的）。

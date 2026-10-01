@@ -91,11 +91,18 @@ func requireConn(serverFlag, passwordFlag string) (string, [16]byte) {
 
 // resolveEntries 组装入口候选：服务端域名解析（永远可用）+ 社区优选源
 // （每次启动都尝试更新，全挂退缓存）。有界等待 —— 网络全断时最多等 3 秒。
+// maxEntries 是入口候选的总上限。DNS 源排在最前所以必然保留；社区源超过
+// 部分直接截断 —— 64 个候选以 12 并发探测一轮在秒级完成，再多只是浪费预算。
+const maxEntries = 64
+
 func resolveEntries(ctx context.Context, server string) ([]entry.Node, string) {
 	commCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	comm, src := entry.Community(commCtx)
 	nodes := entry.Merge(entry.FromServer(ctx, server), comm)
+	if len(nodes) > maxEntries {
+		nodes = nodes[:maxEntries]
+	}
 	if len(nodes) == 0 {
 		fatal("no entries: server domain unresolvable and community sources unreachable")
 	}
@@ -249,12 +256,13 @@ func cmdServe(args []string) {
 	logger.Printf("entries: %d (community: %s)", len(nodes), src)
 
 	pool := nodepool.New(nodepool.Config{
-		Nodes:    nodes,
-		SNI:      host,
-		Auth:     auth[:],
-		UseECH:   true,
-		Insecure: true,
-		StateKey: host,
+		Nodes:              nodes,
+		SNI:                host,
+		Auth:               auth[:],
+		UseECH:             true,
+		Insecure:           true,
+		StateKey:           host,
+		LatencyToleranceMs: cfg.LatencyToleranceMs,
 	})
 	pool.SetDialTimeout(15 * time.Second)
 
@@ -281,7 +289,8 @@ func cmdServe(args []string) {
 	// 探测节点延迟。改在后台跑：几十个节点同步探测要数秒，而这段时间代理还
 	// 没起来。延迟估计的收益（首个请求走快节点）也不必在启动前就拿到 ——
 	// 缓存命中时已经预置过，没有缓存时后台探测跑完前用默认顺序即可。
-	if len(nodes) <= 32 {
+	// 候选总量被 maxEntries 截住，所以这里无条件全量探测。
+	{
 		handle := func(results []nodepool.ProbeResult) {
 			logger.Printf("[probe] %s", nodepool.Summary(results))
 			if err := nodepool.SaveProbeCache(nodes, results); err != nil {
