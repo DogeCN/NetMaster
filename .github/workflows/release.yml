@@ -51,9 +51,12 @@ jobs:
         run: go test ./...
 
       - name: Create release
+        # 标签重打时 Release 不会随标签删除而消失 —— 先删旧的再建，保证
+        # v0.1.0 的产物永远来自 v0.1.0 当前指向的提交。
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          gh release delete "$GITHUB_REF_NAME" --yes --cleanup-tag=false 2>/dev/null || true
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \

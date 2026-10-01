@@ -1,9 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/md5"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -62,16 +62,29 @@ func normalizeServer(s string) string {
 	return s
 }
 
+// doubleClick 是"无参数启动"的标记：双击 exe 时没有任何参数，此时出错的话
+// 控制台窗口会随进程一起消失，错误没人看得见 —— 所以退出前等一次回车；
+// 终端里带参数启动则保持即时退出，不拖累脚本。
+var doubleClick bool
+
+// fatal 打印错误并退出；双击启动时等待回车，让用户看清窗口里的原因。
+func fatal(msg string) {
+	fmt.Fprintln(os.Stderr, msg)
+	if doubleClick {
+		fmt.Fprintln(os.Stderr, "\npress Enter to close...")
+		_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+	}
+	os.Exit(1)
+}
+
 // requireConn 在缺少 server/password 时给出可操作的报错，返回派生好的鉴权字节。
 func requireConn(serverFlag, passwordFlag string) (string, [16]byte) {
 	server := normalizeServer(serverFlag)
 	if server == "" {
-		fmt.Fprintln(os.Stderr, "no server: pass --server or set it in config.json / NETMASTER_SERVER")
-		os.Exit(2)
+		fatal("no server: pass --server or set it in config.json / NETMASTER_SERVER")
 	}
 	if passwordFlag == "" {
-		fmt.Fprintln(os.Stderr, "no password: pass --password or set it in config.json / NETMASTER_PASSWORD")
-		os.Exit(2)
+		fatal("no password: pass --password or set it in config.json / NETMASTER_PASSWORD")
 	}
 	return server, md5.Sum([]byte(passwordFlag))
 }
@@ -84,18 +97,22 @@ func resolveEntries(ctx context.Context, server string) ([]entry.Node, string) {
 	comm, src := entry.Community(commCtx)
 	nodes := entry.Merge(entry.FromServer(ctx, server), comm)
 	if len(nodes) == 0 {
-		fmt.Fprintln(os.Stderr, "no entries: server domain unresolvable and community sources unreachable")
-		os.Exit(1)
+		fatal("no entries: server domain unresolvable and community sources unreachable")
 	}
 	return nodes, src
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		usage()
+		// 无参数 = 双击启动：直接 serve，用法说明走 -h / help。
+		doubleClick = true
+		cmdServe(nil)
 		return
 	}
 	switch os.Args[1] {
+	case "-h", "--help", "help":
+		usage()
+		return
 	case "serve":
 		cmdServe(os.Args[2:])
 	case "nodes":
@@ -206,8 +223,13 @@ func cmdServe(args []string) {
 	appStart := time.Now()
 	cfg, cfgPath, err := config.Load()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		fatal(err.Error())
+	}
+	if doubleClick && cfgPath == "" {
+		// 首次双击且没有任何配置：生成模板再退出，用户填好两个值即可再点。
+		path, _ := config.WriteTemplate()
+		fatal("no config.json found — created a template at " + path +
+			"\nopen it, fill in server and password, then start netmaster again")
 	}
 
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
@@ -279,18 +301,18 @@ func cmdServe(args []string) {
 		router, err = route.LoadDefault(route.Proxy)
 	}
 	if err != nil {
-		logger.Fatal("load rules: ", err)
+		fatal("load rules: " + err.Error())
 	}
 
 	// 3. 监听端口自动选择：先试 8080/1080，被占则顺延。用户通常不需要知道
 	// 端口号 —— 系统代理自动指向选定值；--manual 下端口只用来打印。
 	httpPort, err := pickPort(8080)
 	if err != nil {
-		logger.Fatal("pick http port: ", err)
+		fatal("pick http port: " + err.Error())
 	}
 	socksPort, err := pickPort(1080)
 	if err != nil {
-		logger.Fatal("pick socks port: ", err)
+		fatal("pick socks port: " + err.Error())
 	}
 	httpAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(httpPort))
 	socksAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(socksPort))
@@ -305,7 +327,7 @@ func cmdServe(args []string) {
 		DialTimeout:    15 * time.Second,
 	})
 	if err := srv.Start(); err != nil {
-		logger.Fatal("start proxy: ", err)
+		fatal("start proxy: " + err.Error())
 	}
 
 	// 4. 系统代理：只在接管时设置并拉起看门狗；--manual 只打印地址。
@@ -336,7 +358,7 @@ func cmdServe(args []string) {
 		}
 	}
 
-	logger.Printf("ready in %s. browse normally; Ctrl+C to stop and restore system proxy.",
+	logger.Printf("ready in %s. browse normally; Ctrl+C or close this window to stop (system proxy is restored).",
 		time.Since(appStart).Round(time.Millisecond))
 
 	// 首次连通验证：一次真实的传输层建连（TLS+WS+auth），在后台跑，
@@ -362,10 +384,14 @@ func cmdServe(args []string) {
 	logger.Println("bye")
 }
 
-// pickPort 从 preferred 开始顺延找第一个空闲端口。
+// pickPort 从 preferred 开始顺延找第一个可用端口。
+// 任何绑定失败都视为"这个端口用不了"继续顺延 —— Windows 上 EADDRINUSE 的
+// errno 映射不可靠（errors.Is 匹配不到 WSAEADDRINUSE），而权限/防火墙之类的
+// 失败换一个端口同样解决。全部失败时报最后一个真实原因。
 // 先占住再立刻放开存在一个极小的竞态窗口（探测到 proxy.Start 之间被抢），
 // 后果只是 Start 明确报端口占用，不会静默错绑。
 func pickPort(preferred int) (int, error) {
+	var lastErr error
 	for i := 0; i < 100; i++ {
 		p := preferred + i
 		ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(p)))
@@ -373,11 +399,9 @@ func pickPort(preferred int) (int, error) {
 			ln.Close()
 			return p, nil
 		}
-		if !errors.Is(err, syscall.EADDRINUSE) {
-			return 0, err // 不是端口占用（权限/防火墙等），报真实原因
-		}
+		lastErr = err
 	}
-	return 0, fmt.Errorf("no free port from %d", preferred)
+	return 0, fmt.Errorf("no free port from %d: %w", preferred, lastErr)
 }
 
 // cmdWatchdog 内部命令：等待 owner 进程退出，若系统代理仍指向 netmaster 则还原。

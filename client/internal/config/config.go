@@ -52,3 +52,24 @@ func Load() (Config, string, error) {
 	}
 	return Config{}, "", nil
 }
+
+// template 是首次启动时写出的 config.json 样例。占位符本身是合法 JSON，
+// 用户只要替换两个尖括号里的值。
+const template = `{
+  "server": "<your worker domain, e.g. nm.example.com>",
+  "password": "<the PASSWORD you set on the Worker>"
+}
+`
+
+// WriteTemplate 在当前目录写出配置模板，返回绝对路径。
+// 只在"完全没有配置文件"时由 serve 的双击路径调用；任意位置已有配置则不动。
+func WriteTemplate() (string, error) {
+	if _, found, _ := Load(); found != "" {
+		return "", nil
+	}
+	abs, _ := filepath.Abs("config.json")
+	if err := os.WriteFile("config.json", []byte(template), 0o644); err != nil {
+		return abs, err
+	}
+	return abs, nil
+}

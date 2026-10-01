@@ -87,6 +87,11 @@ netmaster serve --server <域名> --password <PASSWORD>
 `NETMASTER_PASSWORD`（`PASSWORD` 也认）是最后一级兜底，优先级低于 config.json。
 缺 server/password 时以退出码 2 报错，而不是拿空凭据去连。
 
+**双击 exe 等价于 `serve`**：无参数启动即 serve；首次双击没有 config.json 时
+在 exe 旁生成模板，填好 server/password 再点一次；任何启动错误都会等一次
+回车再关窗口，不让人盯着一闪而过的黑框猜原因。注意直接关闭窗口 = 强杀进程，
+系统代理由看门狗还原（这正是它存在的意义）。
+
 serve 的 flag 收敛为 4 个：
 
 | 参数 | config.json 键 | 说明 |
@@ -109,8 +114,8 @@ HTTP 先试 8080、SOCKS5 先试 1080，被占则顺延找空闲端口，结果�
 ready 之后 serve 在后台做一次真实的传输层建连（TLS+WS+auth），补一行日志：
 
 ```
-隧道建立成功（经节点 [3] 104.17.x.x）
-隧道建立失败: <原因>
+tunnel established via node [3] 104.17.x.x
+tunnel failed: <原因>
 ```
 
 部署是否健康，这一行就是最直接的回答（Worker 没有健康检查端点，CI 也不做
