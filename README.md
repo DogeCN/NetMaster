@@ -49,8 +49,10 @@ npx wrangler deploy
 
 ### 2. 客户端
 
-从 [Release](../../releases/latest) 下载 `netmaster.exe`（或克隆仓库自己
-`go build`）。写一份 `config.json` 放在 exe 旁边（或 `%AppData%/netmaster/config.json`）：
+从 [Release](../../releases/latest) 下载对应平台的客户端
+（`netmaster-windows-amd64.exe` / `netmaster-linux-amd64` / `netmaster-linux-arm64`，
+或克隆仓库自己 `go build`）。写一份 `config.json` 放在可执行文件旁边
+（或 `%AppData%/netmaster/config.json`）：
 
 ```json
 { "server": "<你的域名>", "password": "<PASSWORD>" }
@@ -59,7 +61,7 @@ npx wrangler deploy
 然后：
 
 ```bash
-./netmaster.exe serve        # 或直接双击 exe，等价
+./netmaster serve             # Windows: 双击 netmaster-windows-amd64.exe，等价
 ```
 
 双击启动的细节：首次双击若没有 config.json，会在 exe 旁边生成一个模板，填好

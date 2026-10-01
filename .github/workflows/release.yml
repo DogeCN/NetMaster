@@ -1,11 +1,9 @@
 name: release
 
 # Tag 触发：构建全部产物并创建 Release。
-# 资产凑齐"直接部署"所需的一切 —— 不克隆仓库的用户下载后照 README 走完即可：
-#   _worker.js    Worker 脚本
-#   wrangler.toml 部署配置（database_id 是占位符，部署前自己填）
-#   schema.sql    D1 表结构
-#   netmaster.exe Windows 客户端
+# 资产凑齐"直接部署"所需的一切 —— 不克隆仓库的用户下载后照 README 走完即可。
+# Windows 与 Linux 双平台客户端；标签重打时旧 Release 会被删除重建，
+# 保证 vX.Y.Z 的产物永远来自该标签当前指向的提交。
 on:
   push:
     tags: ['v*']
@@ -42,25 +40,51 @@ jobs:
         working-directory: server
         run: npm test
 
-      - name: Build client
+      - name: Build client (windows / linux)
         working-directory: client
-        run: GOOS=windows go build -trimpath -ldflags="-s -w" -o netmaster.exe ./cmd/netmaster
+        run: |
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o netmaster-windows-amd64.exe ./cmd/netmaster
+          GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o netmaster-linux-amd64 ./cmd/netmaster
+          GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o netmaster-linux-arm64 ./cmd/netmaster
 
       - name: Run client tests
         working-directory: client
         run: go test ./...
 
+      - name: Write release notes
+        run: |
+          cat > notes.md <<'EOF'
+          ## 文件说明
+
+          | 文件 | 用途 |
+          |---|---|
+          | `_worker.js` | Worker 脚本。部署到 Cloudflare Workers（配合 `wrangler.toml` 与 `schema.sql`，步骤见 README「快速开始」） |
+          | `wrangler.toml` | Worker 部署配置。`database_id` 是占位符，`wrangler d1 create` 后填入真实值 |
+          | `schema.sql` | D1 表结构（仅一张表：中继亲和）。部署前执行一次 |
+          | `netmaster-windows-amd64.exe` | Windows 客户端（x86_64）。双击即 serve；首次双击会生成 config.json 模板 |
+          | `netmaster-linux-amd64` | Linux 客户端（x86_64） |
+          | `netmaster-linux-arm64` | Linux 客户端（ARM64，如树莓派 / ARM 服务器） |
+
+          客户端最小配置（`config.json`，放可执行文件旁边）：
+
+          ```json
+          { "server": "<你的 Worker 域名>", "password": "<部署时设置的 PASSWORD>" }
+          ```
+
+          完整步骤见 README「快速开始」。
+          EOF
+
       - name: Create release
-        # 标签重打时 Release 不会随标签删除而消失 —— 先删旧的再建，保证
-        # v0.1.0 的产物永远来自 v0.1.0 当前指向的提交。
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete "$GITHUB_REF_NAME" --yes --cleanup-tag=false 2>/dev/null || true
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
-            --generate-notes \
+            --notes-file notes.md \
             server/_worker.js \
             server/wrangler.toml \
             server/schema.sql \
-            client/netmaster.exe
+            client/netmaster-windows-amd64.exe \
+            client/netmaster-linux-amd64 \
+            client/netmaster-linux-arm64
