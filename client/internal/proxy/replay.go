@@ -134,3 +134,81 @@ func (s *Server) retryViaProxy(host string) (net.Conn, error) {
 	}
 	return s.cfg.Pool.RetryProxy(host)
 }
+
+// relayWithProxyReplay 处理代理路径的 CONNECT 隧道 —— 与 relayWithReplay 同一
+// 哲学的另一半：直连侧的问题是"TCP 连通 ≠ 没被墙"，代理侧的问题是"隧道建立
+// ≠ 这跳真能用"。worker 首次见到一个 Cloudflare 承载的目标时要内联选中继，
+// 可能先踩到"TCP 能通但不干活"的中继；此时 200 已经回了，TLS 握手期隧道死亡，
+// 浏览器只能看到一个莫名的安全错误。
+//
+// 做法与直连侧对称：缓存首个飞行段并转发，若上游在回任何字节之前死掉，
+// 解绑该域名的出口、给绑定节点记一次失败，换一个出口重放一次。只重试一次，
+// 且只对"零字节即断"负责 —— 已经有数据回来的会话属于中途断流，重放解决不了
+// （浏览器看到的半截 TLS 记录无法撤销），好在 worker 侧会把坏中继忘掉，
+// 下一次连接自然命中别的中继。
+//
+// 探测窗口语义与直连侧不同：mux 会话的 SetReadDeadline 到期即关闭会话，
+// 所以"超时无回应"在这里也按死亡处理 —— 443 的 ServerHello 来自边缘，
+// 正常情况远快于 3 秒，值得为之重试而不是让浏览器干等一条可能已死的隧道。
+func (s *Server) relayWithProxyReplay(client, up net.Conn, host string) {
+	first := make([]byte, 0, 4096)
+	buf := make([]byte, 32*1024)
+
+	_ = client.SetReadDeadline(time.Now().Add(relayClientWait))
+	n, _ := client.Read(buf)
+	if n > 0 {
+		first = append(first, buf[:n]...)
+		_ = client.SetReadDeadline(time.Now().Add(relayFlushWait))
+		for len(first) < relaySpoolMax {
+			m, merr := client.Read(buf)
+			if m > 0 {
+				first = append(first, buf[:m]...)
+			}
+			if merr != nil {
+				break
+			}
+		}
+	}
+	_ = client.SetReadDeadline(time.Time{})
+
+	if n == 0 {
+		s.relay(client, up, host)
+		return
+	}
+	if _, err := up.Write(first); err != nil {
+		return
+	}
+
+	probe := make([]byte, 32*1024)
+	_ = up.SetReadDeadline(time.Now().Add(relayProbeWait))
+	pn, perr := up.Read(probe)
+	_ = up.SetReadDeadline(time.Time{})
+
+	if pn > 0 {
+		if _, err := client.Write(probe[:pn]); err != nil {
+			return
+		}
+		s.relay(client, up, host)
+		return
+	}
+
+	reason := "peer closed before responding"
+	if perr != nil {
+		reason = perr.Error()
+	}
+	// 这次隧道没用：解绑出口并记一次失败，换一个出口重放。
+	if s.cfg.Pool != nil {
+		s.cfg.Pool.NoteProxyFailure(host)
+	}
+	up2, _, derr := s.dial(host)
+	if derr != nil {
+		s.cfg.Logger.Printf("[route] %s proxy tunnel dead (%s), retry failed: %v", host, reason, derr)
+		return
+	}
+	defer up2.Close()
+	if _, err := up2.Write(first); err != nil {
+		return
+	}
+	s.cfg.Logger.Printf("[route] %s proxy tunnel dead (%s) — switched exit and replayed", host, reason)
+	s.relay(client, up2, host)
+}

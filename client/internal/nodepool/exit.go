@@ -72,10 +72,10 @@ func (p *Pool) PickExit(host string) Exit {
 		if e.Direct {
 			return e
 		}
-		if e.Idx >= 0 && e.Idx < p.Len() && !p.states[e.Idx].isDisabled() {
+		if e.Idx >= 0 && e.Idx < p.Len() && !p.states[e.Idx].isDisabled() && !p.latencyExceeded(host, e.Idx) {
 			return e
 		}
-		// 绑定的节点已熔断 → 落到下面重新判断
+		// 绑定的节点已熔断、或延迟升高超出容忍值 → 落到下面重新判断
 	}
 
 	// 没有历史、或历史已失效：用 IP 归属给个先验。
@@ -154,6 +154,7 @@ func (p *Pool) blockDirect(host string) {
 	}
 	p.directBlocked[host] = time.Now()
 	delete(p.affinity, host)
+	delete(p.bindBase, host)
 	p.affMu.Unlock()
 }
 

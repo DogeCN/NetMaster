@@ -393,6 +393,21 @@ export class Forwarder {
 		if (this.ctx && typeof this.ctx.waitUntil === 'function') this.ctx.waitUntil(run);
 	}
 
+	/**
+	 * Forget a binding whose relay turned out dead (zero-byte stream). Same
+	 * best-effort contract as rememberRelayDurably: losing the delete only costs
+	 * one extra bad session before the next forget.
+	 */
+	forgetRelayDurably(host, relay) {
+		if (!this.db) return;
+		const run = this.db
+			.prepare('DELETE FROM relay_binding WHERE host = ? AND relay = ?')
+			.bind(host, relay)
+			.run()
+			.catch((err) => this.log(`[fwd] D1 delete ${host} failed: ${err?.message || err}`));
+		if (this.ctx && typeof this.ctx.waitUntil === 'function') this.ctx.waitUntil(run);
+	}
+
 	async openUpstream(s, r) {
 		if (s.opening) return s.opening;
 		s.opening = (async () => {
@@ -418,6 +433,8 @@ export class Forwarder {
 					// Remember which relay worked for this host so later requests
 					// for the same domain skip the ones that fail for it.
 					if (t.relay) {
+						s.host = r.host;
+						s.relay = t.hostname;
 						rememberRelay(r.host, t.hostname);
 						this.rememberRelayDurably(r.host, t.hostname);
 					}
@@ -489,6 +506,14 @@ export class Forwarder {
 			// dead session.
 			if (bytesOut === 0 && !s.dead) {
 				await this.sendControl(s.id, 'upstream closed without sending data');
+				// 这条隧道经中继建立却一个字节都没回来：多半是中继半死
+				// （TCP 能通、转发不工作）。探测和 D1 记的都是它 —— 忘掉，
+				// 下一次（可能就是客户端的透明重试）重新探测别的中继。
+				if (s.relay) {
+					relayAffinity.delete(s.host);
+					this.forgetRelayDurably(s.host, s.relay);
+					this.log(`[fwd] ${s.host}: relay ${s.relay} delivered nothing — forgotten`);
+				}
 			}
 			this.drop(s);
 		}

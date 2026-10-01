@@ -112,6 +112,10 @@ type Pool struct {
 	// 出口既可以是某个节点，也可以是本机直连（见 exit.go）。
 	affMu    sync.RWMutex
 	affinity map[string]Exit
+	// bindBase 记录绑定该节点时的 EWMA 延迟（延迟容忍的漂移基线）。
+	// 只对节点出口有意义；直连出口不测延迟，没有基线。不落盘 —— 重启后
+	// 在首次评估时以当前延迟重新锚定。
+	bindBase map[string]time.Duration
 
 	// geo 判断域名是否解析到 CN 网段，用于给"未明确分流"的主机挑首次出口。
 	// 可为 nil —— 此时 Auto 一律偏代理。
@@ -151,6 +155,7 @@ func New(cfg Config) *Pool {
 		useECH:             cfg.UseECH,
 		insecure:           cfg.Insecure,
 		affinity:           make(map[string]Exit),
+		bindBase:           make(map[string]time.Duration),
 		directBlocked:      make(map[string]time.Time),
 		stateKey:           cfg.StateKey,
 		latencyToleranceMs: cfg.LatencyToleranceMs,
@@ -214,9 +219,17 @@ func (p *Pool) exitOf(host string) (Exit, bool) {
 }
 
 // bindExit 把域名绑定到出口。限制表大小，超出时随机淘汰一部分（避免无限增长）。
+// 节点出口同时锚定延迟漂移基线 = 绑定时刻该节点的 EWMA 延迟。
 func (p *Pool) bindExit(host string, e Exit) {
 	p.affMu.Lock()
 	p.affinity[host] = e
+	if e.Direct || e.Idx < 0 || e.Idx >= len(p.states) {
+		delete(p.bindBase, host)
+	} else {
+		p.states[e.Idx].mu.Lock()
+		p.bindBase[host] = p.states[e.Idx].latency
+		p.states[e.Idx].mu.Unlock()
+	}
 	if len(p.affinity) > 4096 {
 		// 简单随机淘汰一半
 		n := 0
@@ -242,6 +255,7 @@ func (p *Pool) bindAffinity(host string, idx int) {
 func (p *Pool) unbindAffinity(host string) {
 	p.affMu.Lock()
 	delete(p.affinity, host)
+	delete(p.bindBase, host)
 	p.affMu.Unlock()
 	p.markStateDirty()
 }
@@ -273,7 +287,7 @@ func (p *Pool) Dial(target string) (net.Conn, error) {
 	// 1) 域名亲和：该域名已绑定过节点 → 直接用它（同站出口稳定）。
 	// 绑定节点的延迟超出容忍值时视为未绑定，落到自适应重新选优；
 	// 选中的新出口成功后自动重绑（bindAffinity 只在成功路径上调用）。
-	if idx := p.affinityOf(host); idx >= 0 && idx < n && !p.states[idx].isDisabled() && !p.latencyExceeded(idx) {
+	if idx := p.affinityOf(host); idx >= 0 && idx < n && !p.states[idx].isDisabled() && !p.latencyExceeded(host, idx) {
 		if conn, ok := p.tryDial(idx, target); ok {
 			atomic.StoreUint32(&p.idx, uint32(idx))
 			return conn, nil
@@ -412,12 +426,15 @@ func (p *Pool) SortByLatency() {
 	atomic.StoreUint32(&p.idx, 0)
 }
 
-// latencyExceeded 报告绑定节点的延迟是否超出容忍值（只影响节点出口，
+// latencyExceeded 报告绑定节点的延迟是否"升高超过容忍值"（只影响节点出口，
 // 直连出口不测延迟，不参与）。
-// 容忍值未配置 → 永不超出（默认粘死）；<=0 → 恒超出（自优化模式）；
-// >0 → 绑定节点的 EWMA 延迟超过该毫秒数才算超出，未知延迟（0）不算，
-// 避免没有探测数据时无谓地换出口。
-func (p *Pool) latencyExceeded(idx int) bool {
+//
+// 语义是漂移而非绝对阈值：绑定时刻锚定该节点的 EWMA 延迟为基线，当前延迟
+// 超过 基线 + 容忍值 才算超出。全网变慢时基线随重绑而重锚，不会乱跳；
+// 单个节点劣化则立刻显现。容忍值未配置 → 永不超出（默认粘死）；
+// <=0 → 恒超出（自优化模式，每次请求重新选优）。
+// 未知延迟（EWMA 为 0）视为未评估：先以当前值锚定基线，不换出口。
+func (p *Pool) latencyExceeded(host string, idx int) bool {
 	if p.latencyToleranceMs == nil {
 		return false
 	}
@@ -427,9 +444,35 @@ func (p *Pool) latencyExceeded(idx int) bool {
 	}
 	s := p.states[idx]
 	s.mu.Lock()
-	lat := s.latency
+	cur := s.latency
 	s.mu.Unlock()
-	return lat > time.Duration(t)*time.Millisecond
+	if cur == 0 {
+		return false
+	}
+
+	p.affMu.Lock()
+	base, ok := p.bindBase[host]
+	if !ok || base == 0 {
+		p.bindBase[host] = cur // 首次评估（重启后）：以当前延迟锚定
+		p.affMu.Unlock()
+		return false
+	}
+	p.affMu.Unlock()
+	return cur > base+time.Duration(t)*time.Millisecond
+}
+
+// NoteProxyFailure 在"隧道已建立但死于上游（零字节即断）"后调用：解绑该域名
+// 的出口绑定，并给绑定节点记一次失败，使重试拨号选到别的出口。
+func (p *Pool) NoteProxyFailure(target string) {
+	host := hostOf(target)
+	p.affMu.Lock()
+	e, ok := p.affinity[host]
+	delete(p.affinity, host)
+	delete(p.bindBase, host)
+	p.affMu.Unlock()
+	if ok && !e.Direct && e.Idx >= 0 && e.Idx < len(p.states) {
+		p.states[e.Idx].recordFailure()
+	}
 }
 
 // Nodes 返回当前节点顺序（可能是延迟排序后的）。

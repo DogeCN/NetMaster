@@ -69,6 +69,67 @@ console.log('--- relays: [] disables the fallback ---');
 	ok(calls.length === 1, 'only the direct attempt', JSON.stringify(calls));
 }
 
+console.log('--- a zero-byte relay stream is forgotten so the next session re-probes ---')
+{
+	const calls = [];
+	const request = {
+		fetcher: {
+			connect(opts) {
+				calls.push(opts);
+				if (opts.hostname === 'goodrelay.test') {
+					// Opens fine but delivers nothing: the "half-dead relay" shape.
+					return {
+						opened: Promise.resolve(),
+						readable: new ReadableStream({ start(c) { c.close(); } }),
+						writable: new WritableStream(),
+						close() {},
+					};
+				}
+				throw new Error('blocked');
+			},
+		},
+	};
+	const fakeWs = { binaryType: '', addEventListener() {}, send() {}, close() {} };
+	const sid = Uint8Array.from([1, 1, 2, 2]);
+	{
+		const fwd = new Forwarder(request, fakeWs, AUTH, { log: () => {}, relays: ['badrelay.test', 'goodrelay.test'] });
+		await fwd.onMessage(AUTH);
+		await fwd.onMessage(buildMuxFrame(sid, buildSessionOpen({ host: 'forget.test', port: 443 })));
+		await new Promise((r) => setTimeout(r, 50));
+		ok(calls.some((c) => c.hostname === 'goodrelay.test'), 'the session went through goodrelay');
+	}
+	// Same isolate, same host: the binding to goodrelay must have been forgotten,
+	// so the next session re-probes and can pick differently.
+	{
+		const calls2 = [];
+		const request2 = {
+			fetcher: {
+				connect(opts) {
+					calls2.push(opts);
+					if (opts.hostname === 'badrelay.test') {
+						return {
+							opened: Promise.resolve(),
+							readable: new ReadableStream({ start(c) { c.enqueue(Buffer.from('HTTP/1.1 200 OK\r\n\r\n')); c.close(); } }),
+							writable: new WritableStream(),
+							close() {},
+						};
+					}
+					throw new Error('blocked');
+				},
+			},
+		};
+		const fwd2 = new Forwarder(request2, fakeWs, AUTH, { log: () => {}, relays: ['badrelay.test', 'goodrelay.test'] });
+		await fwd2.onMessage(AUTH);
+		await fwd2.onMessage(buildMuxFrame(sid, buildSessionOpen({ host: 'forget.test', port: 443 })));
+		await new Promise((r) => setTimeout(r, 50));
+		ok(calls2[0] !== undefined && calls2[0].hostname === 'forget.test', 'direct is still first');
+		// 遗忘生效的证明：badrelay 被重新尝试 —— 若仍钉死 goodrelay，
+		// shuffled 顺序再怎么变也不会碰它。
+		ok(calls2.some((c) => c.hostname === 'badrelay.test'),
+			'forgotten binding re-probes instead of pinning goodrelay', JSON.stringify(calls2.map((c) => c.hostname)));
+	}
+}
+
 console.log('--- a fully blocked target reports the reason ---');
 {
 	const request = {
@@ -106,10 +167,11 @@ console.log('--- relay affinity: a host remembers the relay that worked ---');
 				calls.push(opts);
 				if (opts.hostname === 'relayA.test') {
 					succeeded = opts.hostname;
-					// Minimal but valid socket shape for the success path.
+					// Valid success shape: must actually deliver bytes, otherwise
+					// the zero-byte forget treats it as a half-dead relay.
 					return {
 						opened: Promise.resolve(),
-						readable: new ReadableStream({ start(c) { c.close(); } }),
+						readable: new ReadableStream({ start(c) { c.enqueue(Buffer.from('HTTP/1.1 200 OK\r\n\r\n')); c.close(); } }),
 						writable: new WritableStream(),
 						close() {},
 					};

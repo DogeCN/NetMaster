@@ -246,6 +246,9 @@ func (s *Server) handleHTTPConn(c net.Conn) {
 //
 // 若这次连的是"尝试性直连"的 HTTPS，走 relayWithReplay —— 它会把选择推迟到
 // 首个数据包回来之后再定，以便在被 GFW 阻断时无缝改走代理。
+// 代理路径的 HTTPS 走 relayWithProxyReplay —— 与直连侧对称：隧道已建立但不等于
+// 这跳真能用（worker 内联选中继，首次可能踩到"TCP 能通但不干活"的中继），
+// 上游零字节即断时换出口重放一次，浏览器无感。
 func (s *Server) tunnel(client net.Conn, host string) {
 	up, tentativeDirect, err := s.dial(host)
 	if err != nil {
@@ -257,6 +260,10 @@ func (s *Server) tunnel(client net.Conn, host string) {
 
 	if tentativeDirect && isHTTPSPort(host) {
 		s.relayWithReplay(client, up, host)
+		return
+	}
+	if !tentativeDirect && s.cfg.Pool != nil && isHTTPSPort(host) {
+		s.relayWithProxyReplay(client, up, host)
 		return
 	}
 	s.relay(client, up, host)
@@ -287,7 +294,7 @@ func (s *Server) handleSocksConn(c net.Conn) {
 		return
 	}
 	c.SetReadDeadline(time.Time{})
-	up, _, err := s.dial(host)
+	up, tentativeDirect, err := s.dial(host)
 	if err != nil {
 		// reply: 失败
 		c.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) //nolint:errcheck
@@ -296,6 +303,14 @@ func (s *Server) handleSocksConn(c net.Conn) {
 	defer up.Close()
 	// reply 成功（bound addr 填 0.0.0.0:0）
 	c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) //nolint:errcheck
+	if tentativeDirect && isHTTPSPort(host) {
+		s.relayWithReplay(c, up, host)
+		return
+	}
+	if !tentativeDirect && s.cfg.Pool != nil && isHTTPSPort(host) {
+		s.relayWithProxyReplay(c, up, host)
+		return
+	}
 	s.relay(c, up, host)
 }
 
