@@ -135,6 +135,7 @@ console.log('--- relay affinity: a host remembers the relay that worked ---');
 	};
 	const fwd2 = new Forwarder(request2, fakeWs, AUTH, { log: () => {}, relays: ['relayA.test', 'relayB.test', 'relayC.test'] });
 	const sid2 = Uint8Array.from([8, 8, 8, 8]);
+	await fwd2.onMessage(AUTH);
 	await fwd2.onMessage(buildMuxFrame(sid2, buildSessionOpen({
 		host: 'affinity.test', port: 443,
 	})));
@@ -148,6 +149,7 @@ console.log('--- relay affinity: a host remembers the relay that worked ---');
 	};
 	const fwd3 = new Forwarder(request3, fakeWs, AUTH, { log: () => {}, relays: ['relayA.test', 'relayB.test', 'relayC.test'] });
 	const sid3 = Uint8Array.from([6, 6, 6, 6]);
+	await fwd3.onMessage(AUTH);
 	await fwd3.onMessage(buildMuxFrame(sid3, buildSessionOpen({
 		host: 'other.test', port: 443,
 	})));
