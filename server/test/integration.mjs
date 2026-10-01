@@ -138,8 +138,7 @@ async function main() {
 	}
 
 	// the FIRST message must be the auth frame - anything else is unauthorized
-	console.log('
---- first message that is not auth is closed as unauthorized ---');
+	console.log('\n--- first message that is not auth is closed as unauthorized ---');
 	{
 		const c2 = new WebSocket(`ws://127.0.0.1:${wssPort}`);
 		await new Promise((r, j) => { c2.once('open', r); c2.once('error', j); });
