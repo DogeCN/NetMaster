@@ -56,7 +56,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -o pipefail   # 报错走 stderr，tee 会吞掉退出码
-          node tools/refresh-relays.mjs 2>&1 | tee refresh-relays.log
+          NODE_OPTIONS="--import ./test/shims/register.mjs" node tools/refresh-relays.mjs 2>&1 | tee refresh-relays.log
 
       - name: Upload refresh log
         if: always()
