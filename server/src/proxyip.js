@@ -156,7 +156,14 @@ export async function connectViaProxyIP(relayHost, relayPort, targetHost, target
   const t0 = Date.now();
   let socket = null;
   try {
-    socket = connect({ hostname: relayHost, port: relayPort });
+    // 中继可能是域名（CMLiussss 全系）：connect() 只吃 IP 字面量，先解析。
+    let relayIp = relayHost;
+    if (!/^([0-9]{1,3}\.){3}[0-9]{1,3}$/.test(relayHost)) {
+      const ips = await resolve4(relayHost);
+      if (!ips.length) return { error: `dns: no A record for relay ${relayHost}` };
+      relayIp = ips[0];
+    }
+    socket = connect({ hostname: relayIp, port: relayPort });
     // 超时后我们先走人，opened 这时再拒绝就成了没人接的 promise 拒绝（平台会打日志）。
     socket.opened.catch(() => {});
     await withTimeout(socket.opened, timeoutMs, "relay connect timeout");

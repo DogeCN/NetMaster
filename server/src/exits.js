@@ -121,24 +121,76 @@ export function isForbidden(atyp, addr, port) {
   return false;
 }
 
-// ---- 直连出口 ----
+// ---- DNS 与直连出口 ----
 
 export const CONNECT_TIMEOUT_MS = 15000;
+export const DOH_TIMEOUT_MS = 4000;
+
+// 平台规则（M0 探针 E6/E7 实测，docs/m0-findings.md）：
+//   connect() 只接受 IP 字面量 —— 域名目标被平台直接拒绝（"consider using fetch"）；
+//   80 端口禁拨；CF 网段禁拨；无 IPv6。所以域名目标必须先自己解析成 A 记录。
+// 解析走 DoH（fetch 出站通道，不受 connect() 禁连清单约束），结果进程内缓存。
+
+const dnsCache = new Map(); // host -> { ips, at }
+const DNS_TTL_MS = 300000;
+
+export async function resolve4(host) {
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(host)) return [host]; // 已是 IPv4 字面量
+  const cached = dnsCache.get(host);
+  if (cached && Date.now() - cached.at < DNS_TTL_MS) return cached.ips;
+
+  const endpoints = [
+    "https://cloudflare-dns.com/dns-query?name=" + encodeURIComponent(host) + "&type=A",
+    "https://dns.google/resolve?name=" + encodeURIComponent(host) + "&type=A",
+  ];
+  for (const url of endpoints) {
+    try {
+      const r = await fetch(url, {
+        headers: { accept: "application/dns-json" },
+        signal: AbortSignal.timeout(DOH_TIMEOUT_MS),
+      });
+      if (!r.ok) continue;
+      const j = await r.json();
+      const ips = (j.Answer || []).filter((a) => a.type === 1).map((a) => a.data);
+      if (ips.length) {
+        dnsCache.set(host, { ips, at: Date.now() });
+        return ips;
+      }
+      // NXDOMAIN 也不必再试下一个端点：记一个空结果快速失败
+      dnsCache.set(host, { ips: [], at: Date.now() });
+      return [];
+    } catch {
+      // 换下一个 DoH 端点
+    }
+  }
+  return [];
+}
 
 // directConnect 用 connect() 建立到目标的出站 TCP。
-// 返回 { socket } 或 { error }。域名交给运行时解析。
+// 域名目标先 resolve4（connect() 不接受域名），逐个候选拨号直到成功。
 export async function directConnect(atyp, addr, port) {
   const t0 = Date.now();
-  let socket;
-  try {
-    socket = connect({ hostname: addr, port });
-    await Promise.race([
-      socket.opened,
-      new Promise((_, rej) => setTimeout(() => rej(new Error("connect timeout")), CONNECT_TIMEOUT_MS)),
-    ]);
-    return { socket };
-  } catch (e) {
-    try { socket?.close(); } catch {}
-    return { error: `${e.message || e} (${Date.now() - t0}ms)` };
+  let candidates = [addr];
+  if (atyp === ATYP_DOMAIN || !/^([0-9]{1,3}\.){3}[0-9]{1,3}$/.test(addr)) {
+    candidates = await resolve4(addr);
+    if (!candidates.length) {
+      return { error: `dns: no A record for ${addr} (${Date.now() - t0}ms)` };
+    }
   }
+  let lastErr = "";
+  for (const ip of candidates) {
+    let socket;
+    try {
+      socket = connect({ hostname: ip, port });
+      await Promise.race([
+        socket.opened,
+        new Promise((_, rej) => setTimeout(() => rej(new Error("connect timeout")), CONNECT_TIMEOUT_MS)),
+      ]);
+      return { socket };
+    } catch (e) {
+      lastErr = e.message || e;
+      try { socket?.close(); } catch {}
+    }
+  }
+  return { error: `${lastErr} (${Date.now() - t0}ms, ${candidates.length} candidates)` };
 }
