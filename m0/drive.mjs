@@ -59,7 +59,20 @@ function wsConnect(name) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const b64 = (s) => Buffer.from(s).toString("base64");
+const b64 = (s) =>
+  Buffer.isBuffer(s) ? s.toString("base64") : Buffer.from(s).toString("base64");
+
+// example.com A 的 DNS 查询报文：向 9.9.9.9:53 的空闲 TCP socket 写入后应收到应答，
+// 以此作为"socket 仍然活着"的正向证据。
+function dnsQuery() {
+  const head = Buffer.from([0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+  const name = Buffer.concat([
+    Buffer.from([7]), Buffer.from("example"),
+    Buffer.from([3]), Buffer.from("com"),
+    Buffer.from([0, 0, 1, 0, 1]),
+  ]);
+  return Buffer.concat([head, name]);
+}
 
 // ---- E1: WS 消息计数跨休眠持久（20:1 折算的对照数据） ----
 async function e1() {
@@ -97,23 +110,20 @@ async function e2() {
 }
 
 // ---- E3: IPv6 字面量 / NAT64 合成 / DoH ----
+// 注意目标全避开 Cloudflare 自有 IP：connect() 禁连 CF 网段（这也是要测的结论之一）。
 async function e3() {
-  const v6 = await http("/do/p/connect?host=" + encodeURIComponent("2606:4700:4700::1111") + "&port=443");
-  const nat64http = await http(
-    "/do/p/connect?host=" +
-      encodeURIComponent("2a00:1098:2b::101:101") +
-      "&port=80&payload=" +
-      encodeURIComponent("GET / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n")
-  );
-  const nat64tcp = await http("/do/p/connect?host=" + encodeURIComponent("2a00:1098:2b::101:101") + "&port=443");
+  const v6 = await http("/do/p/connect?host=" + encodeURIComponent("2001:4860:4860::8888") + "&port=443");
+  // 2a00:1098:2b::/96 (nat64.net) + 8.8.8.8 -> 2a00:1098:2b::808:808
+  const nat64tcp = await http("/do/p/connect?host=" + encodeURIComponent("2a00:1098:2b::808:808") + "&port=443");
+  const nat64tcp53 = await http("/do/p/connect?host=" + encodeURIComponent("2a00:1098:2b::808:808") + "&port=53");
   const doh = await http("/w/doh?name=cloudflare.com");
-  report("E3", { ipv6_443: v6, nat64_80_http: nat64http, nat64_443_tcp: nat64tcp, doh });
+  report("E3", { ipv6_443: v6, nat64_443_tcp: nat64tcp, nat64_53_tcp: nat64tcp53, doh });
 }
 
 // ---- E4: 出站 socket 跨休眠存活 ----
 async function e4() {
   const c = await wsConnect("e4");
-  const opened = await c.req("open:E4:1.1.1.1:80");
+  const opened = await c.req("open:E4:9.9.9.9:53");
   const meta1 = await c.req("meta");
   report("E4-open", { opened, meta1 });
 
@@ -124,7 +134,7 @@ async function e4() {
   const check = await c.req("check:E4");
   let write = null;
   if (check.where !== "none") {
-    write = await c.req("write:E4:" + b64("GET / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n"), 15000);
+    write = await c.req("write:E4:" + b64(dnsQuery()), 15000);
   }
   const count = await http("/do/e4/count");
   c.close();

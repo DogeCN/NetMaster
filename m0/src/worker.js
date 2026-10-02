@@ -81,7 +81,7 @@ async function probeConnect(url) {
 // 并发出站：n 条 connect() 同时发起，统计成功数（E2）。
 async function runConcurrent(url) {
   const n = Math.min(Math.max(parseInt(url.searchParams.get("n") || "8"), 1), 32);
-  const host = url.searchParams.get("host") || "1.1.1.1";
+  const host = url.searchParams.get("host") || "8.8.8.8";
   const port = parseInt(url.searchParams.get("port") || "443");
   const jobs = Array.from({ length: n }, (_, i) =>
     probeConnect(new URL(`https://x/?host=${encodeURIComponent(host)}&port=${port}&waitMs=8000`)).then((r) => r.json())
