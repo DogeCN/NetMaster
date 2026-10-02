@@ -21,15 +21,15 @@ import (
 )
 
 // Config 是 config.json 的结构。
+//
+// 字段与 serve 的 flag 一一对应，不多一个：曾经有个 LatencyToleranceMs
+// （出口优选容差），它描述的"延迟容忍 / 自优化选路"在 v2 里已随 nodepool
+// 一起退役，留着只会让用户以为填了有用。
 type Config struct {
 	Server   string `json:"server,omitempty"`
 	Password string `json:"password,omitempty"`
 	Manual   bool   `json:"manual,omitempty"`
 	Rules    string `json:"rules,omitempty"`
-	// LatencyToleranceMs 缺省（nil）= 出口粘死直到失败（默认）；
-	// 0 或负数 = 每次请求重新选优（自优化，代价是出口 IP 不稳定）；
-	// 正数 = 绑定节点的实测延迟超过该毫秒数时改选更快的出口。
-	LatencyToleranceMs *int `json:"latencyToleranceMs,omitempty"`
 }
 
 // searchPaths 返回按优先级排列的候选路径。
@@ -59,6 +59,9 @@ func Load() (Config, string, error) {
 
 // template 是首次启动时写出的 config.json 样例。占位符本身是合法 JSON，
 // 用户只要替换两个尖括号里的值。
+//
+// 故意只写必填的两项：manual / rules 是可选增强，把四个字段全铺开会让
+// 第一次打开这个文件的人以为都得填。要用它们照 README 加即可。
 const template = `{
   "server": "<your worker domain, e.g. nm.example.com>",
   "password": "<the PASSWORD you set on the Worker>"

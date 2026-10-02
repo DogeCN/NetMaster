@@ -88,19 +88,19 @@ func TestRelayWithReplayFailsOver(t *testing.T) {
 	_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
 	got := make([]byte, len(payload))
 	if _, err := io.ReadFull(peer, got); err != nil {
-		t.Fatalf("没有收到重放后的回显: %v", err)
+		t.Fatalf("no replayed echo: %v", err)
 	}
 	if string(got) != string(payload) {
-		t.Fatalf("回显内容不符: got %q want %q", got, payload)
+		t.Fatalf("echo mismatch: got %q want %q", got, payload)
 	}
 
 	select {
 	case h := <-retried:
 		if h != "blocked.example:443" {
-			t.Fatalf("回退目标不对: %s", h)
+			t.Fatalf("retry target = %s, want blocked.example:443", h)
 		}
 	default:
-		t.Fatal("没有触发代理回退")
+		t.Fatal("expected a proxy failover, got none")
 	}
 }
 
@@ -114,7 +114,7 @@ func TestRelayWithReplayStaysDirect(t *testing.T) {
 	srv := &Server{cfg: Config{
 		Logger: newTestLogger(t),
 		RetryViaProxy: func(string) (net.Conn, error) {
-			t.Error("直连正常却触发了代理回退")
+			t.Error("direct path was fine, but a proxy failover fired anyway")
 			return nil, io.EOF
 		},
 	}}
@@ -127,10 +127,10 @@ func TestRelayWithReplayStaysDirect(t *testing.T) {
 	_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
 	got := make([]byte, len(payload))
 	if _, err := io.ReadFull(peer, got); err != nil {
-		t.Fatalf("没有收到直连回显: %v", err)
+		t.Fatalf("no direct echo: %v", err)
 	}
 	if string(got) != string(payload) {
-		t.Fatalf("回显内容不符: got %q", got)
+		t.Fatalf("echo mismatch: got %q", got)
 	}
 }
 

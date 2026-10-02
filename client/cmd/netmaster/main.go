@@ -89,17 +89,38 @@ func requireConn(serverFlag, passwordFlag string) (string, string) {
 	return server, passwordFlag
 }
 
+// rulesActionFromFile 按文件名后缀判定整份列表的动作。第二个返回值是"认出来了没有"。
+//
+// 抽成纯函数是为了能测：rulesOverridesFromFile 自己会 fatal 退出，测不了。
+func rulesActionFromFile(path string) (rules.Action, bool) {
+	lower := strings.ToLower(path)
+	switch {
+	case strings.HasSuffix(lower, ".direct"):
+		return rules.Direct, true
+	case strings.HasSuffix(lower, ".proxy"):
+		return rules.Proxy, true
+	}
+	return "", false
+}
+
 // rulesOverridesFromFile 把 --rules 指向的本地规则文件转成"自定义源"。
-// 空路径返回空 Overrides = 用内置源。文件格式与 Clash RULE-SET 一致，
-// 动作按文件名后缀推断（*.direct / *.proxy），推断不出就按 proxy（安全侧）。
+// 空路径返回空 Overrides = 用内置源。
+//
+// 格式与 Clash RULE-SET 一致，动作由**文件名后缀**显式给出：
+// `xxx.direct` → 整份列表直连，`xxx.proxy` → 整份列表代理。
+//
+// 推断不出就报错退出，不再"猜一个默认值"：先前的实现按文件名里含不含
+// "direct" 来判断，`myrules.list` 这种正常名字会被静默当成 proxy，而用户
+// 完全看不出自己的文件被当成什么处理了。看得见的失败比看不见的降级好。
 func rulesOverridesFromFile(path string) rules.Overrides {
-	if strings.TrimSpace(path) == "" {
+	path = strings.TrimSpace(path)
+	if path == "" {
 		return rules.Overrides{}
 	}
-	action := rules.Proxy
-	lower := strings.ToLower(path)
-	if strings.Contains(lower, "direct") {
-		action = rules.Direct
+	action, ok := rulesActionFromFile(path)
+	if !ok {
+		fatal("--rules file must end with .direct or .proxy (got: " + path + ")\n" +
+			"  name it like 'mylist.direct' so every entry in it has a known action")
 	}
 	body, err := os.ReadFile(path)
 	if err != nil {
@@ -116,8 +137,14 @@ func rulesOverridesFromFile(path string) rules.Overrides {
 
 // resolveEntries 组装入口候选：服务端域名解析（永远可用）+ 社区优选源
 // （每次启动都尝试更新，全挂退缓存）。有界等待 —— 网络全断时最多等 3 秒。
+//
 // maxEntries 是入口候选的总上限。DNS 源排在最前所以必然保留；社区源超过
-// 部分直接截断 —— 64 个候选以 12 并发探测一轮在秒级完成，再多只是浪费预算。
+// 部分直接截断。
+//
+// 64 而不是"优选后保留的 16"：这两个数字管的是不同阶段。Optimize 之后只有
+// 16 个进节点池，但如果候选一开始就只有 16 个，那么探测时一旦发现几个不可达
+// 或延迟异常（单源抖动很常见），池子就被填不满。多备几倍是给探测留冗余 ——
+// 12 并发探测 64 个仍在秒级完成，代价可接受。
 const maxEntries = 64
 
 func resolveEntries(ctx context.Context, server string) ([]entry.Node, string) {
@@ -169,8 +196,11 @@ func connFlags(fs *flag.FlagSet, cfg config.Config) (server, password *string) {
 	return server, password
 }
 
-// cmdNodes 持续发请求，实时打印各节点的健康度/延迟/成功率，观察自适应选路的
-// 实际效果。--ipcheck 统计出口 IP 分布。
+// cmdNodes 持续通过本地代理发请求，实时看这条链路能不能通、通得多快。
+//
+// 名字里的 "nodes" 是历史遗留（它曾经逐节点打印延迟/成功率/健康度）。v2 里
+// 节点池在启动时就优选好了，运行时也不再逐节点打分 —— 现在它老实做一件事：
+// 反复请求 --target 并把结果打出来。想看出口 IP 分布用 --ipcheck。
 func cmdNodes(args []string) {
 	cfg, _, err := config.Load()
 	if err != nil {
@@ -179,8 +209,8 @@ func cmdNodes(args []string) {
 	}
 	fs := flag.NewFlagSet("nodes", flag.ExitOnError)
 	server, password := connFlags(fs, cfg)
-	target := fs.String("target", "https://www.google.com/", "probe target through proxy")
-	ipcheck := fs.String("ipcheck", "", "if set, fire requests to this URL and print observed egress IPs")
+	target := fs.String("target", "https://www.google.com/", "URL to fetch through the proxy, repeatedly")
+	ipcheck := fs.String("ipcheck", "", "if set, fetch this URL and print the observed egress IP distribution")
 	fs.Parse(args)
 	host, pw := requireConn(*server, *password)
 
@@ -200,7 +230,7 @@ func cmdNodes(args []string) {
 		logger.Fatal("start: ", err)
 	}
 	defer srv.Close()
-	logger.Printf("proxy on %s, probing %s (Ctrl+C to stop)", httpAddr, *target)
+	logger.Printf("proxy on %s, fetching %s every 2s (Ctrl+C to stop)", httpAddr, *target)
 
 	client := &http.Client{
 		Transport: &http.Transport{Proxy: func(*http.Request) (*url.URL, error) {
@@ -314,7 +344,7 @@ func cmdServe(args []string) {
 	logger.Printf("rules: %d entries (%s, skipped %d lines)", router.Size(), router.Source(), router.SkippedLines())
 
 	// 4. 监听端口自动选择：先试 8080/1080，被占则顺延。用户通常不需要知道
-	// 端口号 —— 系统代理自动指向选定值；--manual 下端口只用来打印。
+	//    端口号 —— 系统代理自动指向选定值；--manual 下端口只用来打印。
 	httpPort, err := pickPort(8080)
 	if err != nil {
 		fatal("pick http port: " + err.Error())
@@ -339,7 +369,7 @@ func cmdServe(args []string) {
 		fatal("start proxy: " + err.Error())
 	}
 
-	// 6. 系统代理：只在接管时设置并拉起看门狗；--manual 只打印地址。
+	// 5. 系统代理：只在接管时设置并拉起看门狗；--manual 只打印地址。
 	// 顺序是刻意的，见 docs/operations.md —— 先自愈残留，再监听、再接管。
 	if cleaned, err := sysproxy.CleanupStale(); err != nil {
 		logger.Printf("WARN cleanup stale system proxy: %v", err)
@@ -452,7 +482,7 @@ func waitForSignal() {
 func usage() {
 	fmt.Println("usage: netmaster <serve|nodes|restore> [flags]")
 	fmt.Println("  serve   - run the local HTTP+SOCKS5 proxy and take over the system proxy")
-	fmt.Println("  nodes   - keep firing requests and watch adaptive exit selection live")
+	fmt.Println("  nodes   - keep fetching a URL through the proxy to watch whether the tunnel works")
 	fmt.Println("  restore - restore the system proxy (after serve was killed uncleanly)")
 	fmt.Print("\nConfig precedence: CLI flag > config.json > default. config.json mirrors the serve flags:\n" +
 		"  { \"server\": \"<domain>\", \"password\": \"<password>\", \"manual\": false, \"rules\": \"\" }\n" +
