@@ -144,7 +144,8 @@ func TestLiveDirectExitAndMux(t *testing.T) {
 					errCh <- fmt.Errorf("stream %d request: %w", i, err)
 					return
 				}
-				if code != 200 {
+				// Google 按地区可能回 302 重定向：隧道健在的证据就是拿到了响应
+				if code < 200 || code >= 400 {
 					errCh <- fmt.Errorf("stream %d status %d", i, code)
 					return
 				}
