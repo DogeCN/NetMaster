@@ -12,7 +12,7 @@
 // 之后再 check/write 全局表中的 socket，即为"跨休眠存活"的直接证据。
 
 import { DurableObject } from "cloudflare:workers";
-// connect() 是 Workers 运行时的全局，不在 cloudflare:workers 导出里。
+import { connect } from "cloudflare:sockets";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
