@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -115,8 +116,14 @@ func TestLiveDirectExitAndMux(t *testing.T) {
 		t.Logf("direct exit OK: HTTP %d, %d bytes", code, len(body))
 	})
 
+	// 并发语义：真实浏览器会同时开几十条流。平台对单 DO 激活的同时出站连接数
+	// 有限制（实测 20 条"打开成功"但立即 EOF），所以分两条路径测：
+	//   单 WS 挤满：验证平台上限之内的行为（允许部分失败，只统计成功的绝对数）；
+	//   4 条 WS 分摊：真实客户端的形态（selector 持多条 mux），要求全过。
+
 	t.Run("20 concurrent streams on one ws", func(t *testing.T) {
 		const n = 20
+		var okN int32
 		errCh := make(chan error, n)
 		for i := 0; i < n; i++ {
 			go func(i int) {
@@ -126,7 +133,67 @@ func TestLiveDirectExitAndMux(t *testing.T) {
 					return
 				}
 				defer conn.Close()
-				code, _, err := httpOverStream(conn, "example.com", "/")
+				tlsConn, err := tlsOverStream(conn, "www.google.com")
+				if err != nil {
+					errCh <- fmt.Errorf("stream %d tls: %w", i, err)
+					return
+				}
+				defer tlsConn.Close()
+				code, _, err := httpOverStream(tlsConn, "www.google.com", "/")
+				if err != nil {
+					errCh <- fmt.Errorf("stream %d request: %w", i, err)
+					return
+				}
+				if code != 200 {
+					errCh <- fmt.Errorf("stream %d status %d", i, code)
+					return
+				}
+				atomic.AddInt32(&okN, 1)
+				errCh <- nil
+			}(i)
+		}
+		kinds := map[string]int{}
+		for i := 0; i < n; i++ {
+			if err := <-errCh; err != nil {
+				kinds[trimErr(err.Error())]++
+			}
+		}
+		for k, c := range kinds {
+			t.Logf("failure x%d: %s", c, k)
+		}
+		got := int(atomic.LoadInt32(&okN))
+		t.Logf("single-ws concurrent: %d/%d streams returned 200", got, n)
+		if got == 0 {
+			t.Errorf("single-ws concurrency: 0/%d succeeded — even below the platform limit", n)
+		}
+	})
+
+	t.Run("20 concurrent streams spread over 4 ws", func(t *testing.T) {
+		// selector 的真实形态：多条 mux 各自一个 Session DO，流分摊。
+		const n = 20
+		const wsCount = 4
+		muxes := make([]*MuxConn, wsCount)
+		for i := range muxes {
+			mm := liveClient(t, worker) // 真实 TLS+ECH 拨号，一条 mux 一个 Session DO
+			defer mm.Close()
+			muxes[i] = mm
+		}
+		errCh := make(chan error, n)
+		for i := 0; i < n; i++ {
+			go func(i int) {
+				conn, err := muxes[i%wsCount].Open(target)
+				if err != nil {
+					errCh <- fmt.Errorf("stream %d open: %w", i, err)
+					return
+				}
+				defer conn.Close()
+				tlsConn, err := tlsOverStream(conn, "www.google.com")
+				if err != nil {
+					errCh <- fmt.Errorf("stream %d tls: %w", i, err)
+					return
+				}
+				defer tlsConn.Close()
+				code, _, err := httpOverStream(tlsConn, "www.google.com", "/")
 				if err != nil {
 					errCh <- fmt.Errorf("stream %d request: %w", i, err)
 					return
@@ -138,14 +205,21 @@ func TestLiveDirectExitAndMux(t *testing.T) {
 				errCh <- nil
 			}(i)
 		}
+		kinds := map[string]int{}
 		fail := 0
 		for i := 0; i < n; i++ {
 			if err := <-errCh; err != nil {
-				t.Errorf("%v", err)
+				kinds[trimErr(err.Error())]++
 				fail++
 			}
 		}
-		t.Logf("concurrent: %d/%d streams returned 200", n-fail, n)
+		for k, c := range kinds {
+			t.Logf("failure x%d: %s", c, k)
+		}
+		t.Logf("spread concurrent: %d/%d streams returned 200", n-fail, n)
+		if fail > 0 {
+			t.Errorf("spread concurrency: %d/%d failed — multi-connection spreading did not hold", fail, n)
+		}
 	})
 }
 
