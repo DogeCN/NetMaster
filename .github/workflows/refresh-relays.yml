@@ -12,6 +12,10 @@
 name: refresh-relays
 
 on:
+  # push 触发器只为注册工作流（非默认分支上的 dispatch-only 文件不会注册）
+  push:
+    branches: [v2]
+    paths: [".github/workflows/refresh-relays.yml"]
   schedule:
     - cron: "0 * * * *"
   workflow_dispatch:
