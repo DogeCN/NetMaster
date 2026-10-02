@@ -39,9 +39,10 @@ export function mergeScore(prev, latencyMs, success) {
 
 // ---- 候选源 ----
 
-export const RELAY_SOURCES = [
-  // 域名型：v0.1.x 用过的 9 个 CMLiussss 公共中继
-  { url: "https://raw.githubusercontent.com/DogeCN/NetMaster/v2/server/sources/relays.txt", kind: "text" },
+export // 内置源：IPDB 的 bestproxy（纯文本 ip:port，小时级更新）与 CMLiussss 域名型中继。
+// 两者互为备份；任一源挂掉都不影响其他源，全挂则用下面的 BUILTIN_RELAYS 兜底。
+const RELAY_SOURCES = [
+  { url: "https://ipdb.api.030101.xyz/?type=bestproxy", kind: "text" },
 ];
 
 export const BUILTIN_RELAYS = [

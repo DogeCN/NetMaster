@@ -53,7 +53,7 @@ jobs:
       - name: Live tunnel checks (direct exit + mux)
         working-directory: client
         env:
-          NETMASTER_E2E_WORKER: ${{ inputs.worker }}
+          NETMASTER_E2E_WORKER: ${{ inputs.worker != '' && inputs.worker || 'netmaster.edge-tunnel.workers.dev' }}
           NETMASTER_E2E_PASSWORD: ${{ secrets.PASSWORD }}
         run: go test ./internal/outbound/ -run TestLive -v -count=1 -timeout 300s
 
@@ -61,7 +61,7 @@ jobs:
       - name: CF-hosted target success rate
         working-directory: client
         env:
-          NETMASTER_E2E_WORKER: ${{ inputs.worker }}
+          NETMASTER_E2E_WORKER: ${{ inputs.worker != '' && inputs.worker || 'netmaster.edge-tunnel.workers.dev' }}
           NETMASTER_E2E_PASSWORD: ${{ secrets.PASSWORD }}
           NETMASTER_E2E_ROUNDS: ${{ inputs.rounds }}
         run: go test ./internal/outbound/ -run TestLiveCFHosted -v -count=1 -timeout 600s
