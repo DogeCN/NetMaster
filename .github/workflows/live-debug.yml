@@ -59,6 +59,11 @@ jobs:
             echo
           done
 
+      # 单次调用里顺序 fetch+connect 能走多少对 —— 免费版子请求预算实测
+      - name: Invocation subrequest budget probe
+        run: |
+          curl -sS --max-time 60 "https://netmaster-m0.edge-tunnel.workers.dev/w/budget?n=30&t=${{ secrets.PROBE_TOKEN }}"
+
       - name: Tail while driving live traffic
         working-directory: client
         env:

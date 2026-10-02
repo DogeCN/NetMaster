@@ -124,6 +124,31 @@ export default {
     if (url.pathname === "/w/connect") return probeConnect(url);
     if (url.pathname === "/w/doh") return runDoh(url);
 
+    if (url.pathname === "/w/budget") {
+      // 顺序消耗：单次调用里连续 fetch(DoH)+connect 对，数到第几个被
+      // "Too many subrequests" 拒绝。n 默认 30。
+      const n = Math.min(parseInt(url.searchParams.get("n") || "30"), 60);
+      const events = [];
+      let socket;
+      for (let i = 1; i <= n; i++) {
+        try {
+          const r = await fetch("https://cloudflare-dns.com/dns-query?name=example.com&type=A", {
+            headers: { accept: "application/dns-json" },
+          });
+          events.push(`${i}:fetch ${r.status}`);
+          socket = connect({ hostname: "8.8.8.8", port: 443 });
+          await socket.opened;
+          events.push(`${i}:connect ok`);
+          socket.close();
+        } catch (e) {
+          events.push(`${i}:FAIL ${String(e.message || e).slice(0, 80)}`);
+          try { socket?.close(); } catch {}
+          break;
+        }
+      }
+      return Response.json({ events, completed: events.filter((e) => e.includes("ok")).length / 2 });
+    }
+
     if (url.pathname.startsWith("/do/")) {
       const name = url.pathname.split("/")[2];
       if (!name) return new Response(null, { status: 404 });
