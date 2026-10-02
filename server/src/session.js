@@ -200,6 +200,8 @@ class SessionDO {
   async openExit(atyp, host, port) {
     const direct = await directConnect(atyp, host, port);
     if (!direct.error) return { socket: direct.socket };
+    // 出口失败的归因是排障刚需，不受 DEBUG 门控（tail 里必现）。
+    console.error(`[exit] direct ${host}:${port} failed: ${direct.error}`);
     this.log(`direct exit failed (${direct.error}); trying proxyip`);
     // 没部署出口层（无 ROUTER/KV 绑定）时保持纯直连语义：直连失败就是失败。
     if (!this.env.ROUTER && !this.env.KV) return { error: direct.error };
@@ -230,7 +232,10 @@ class SessionDO {
 
     // ③ 竞速：候选 = KV top4 → 内置兜底补齐 6 槽（Router 映射刚被证伪或本就没有）。
     const race = await startRace({ env: this.env, log: (m) => this.log(m) }, { host, port });
-    if (race.error) return { error: `${direct.error}; ${race.error}` };
+    if (race.error) {
+      console.error(`[exit] race ${host}:${port} all slots failed: ${race.error}`);
+      return { error: `${direct.error}; ${race.error}` };
+    }
     const relay = parseRelay(race.relay);
     this.rememberEgress(hash, relay);
     this.learn(hash, RELAY_TYPE_HTTP_CONNECT, race.relay);
