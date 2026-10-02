@@ -110,17 +110,28 @@ async function e2() {
 }
 
 // ---- E3: IPv6 字面量 / NAT64 合成 / DoH ----
-// 判读：对 CF IPv6（2606:4700:4700::1111）若报"HTTP-based service"（CF 网段拒绝特有
-// 错误），说明 IPv6 拨号本身是通的、只是 CF 网段拦截；若报"cannot connect"（通用
-// 失败），说明 IPv6 出站根本没拨出去。
+// NAT64 /96 合成 = 前缀(96bit) | IPv4(32bit)，8.8.8.8 → ::808:808。
+// 前缀覆盖：level66 2001:67c:2960:6464::/96、well-known 64:ff9b::/96、
+// Trex 2001:67c:2b::/96；裸 IPv6 对照组看 IPv6 出站本身通不通。
 async function e3() {
-  const v6google443 = await http("/do/p/connect?host=" + encodeURIComponent("2001:4860:4860::8888") + "&port=443");
-  const v6google853 = await http("/do/p/connect?host=" + encodeURIComponent("2001:4860:4860::8888") + "&port=853");
-  const v6cf = await http("/do/p/connect?host=" + encodeURIComponent("2606:4700:4700::1111") + "&port=443");
-  const nat64tcp53 = await http("/do/p/connect?host=" + encodeURIComponent("2a00:1098:2b::808:808") + "&port=53");
-  const v4google = await http("/do/p/connect?host=8.8.8.8&port=443");
+  const tests = {
+    v4_google_443: { host: "8.8.8.8", port: 443 },
+    nat64_level66_443: { host: "2001:67c:2960:6464::808:808", port: 443 },
+    nat64_level66_53: { host: "2001:67c:2960:6464::808:808", port: 53 },
+    nat64_wkp_443: { host: "64:ff9b::808:808", port: 443 },
+    nat64_wkp_53: { host: "64:ff9b::808:808", port: 53 },
+    nat64_trex_53: { host: "2001:67c:2b::808:808", port: 53 },
+    nat64_net_53: { host: "2a00:1098:2b::808:808", port: 53 },
+    v6_google_53: { host: "2001:4860:4860::8888", port: 53 },
+    v6_google_853: { host: "2001:4860:4860::8888", port: 853 },
+    v6_cf_443: { host: "2606:4700:4700::1111", port: 443 },
+  };
+  const out = {};
+  for (const [k, t] of Object.entries(tests)) {
+    out[k] = await http(`/do/p/connect?host=${encodeURIComponent(t.host)}&port=${t.port}`);
+  }
   const doh = await http("/w/doh?name=cloudflare.com");
-  report("E3", { v4_google_443: v4google, v6_google_443: v6google443, v6_google_853: v6google853, v6_cf_443: v6cf, nat64_53_tcp: nat64tcp53, doh });
+  report("E3", { ...out, doh });
 }
 
 // ---- E4: 出站 socket 跨休眠存活 ----
