@@ -91,8 +91,8 @@ func TestLiveDirectExitAndMux(t *testing.T) {
 	defer m.Close()
 
 	// 目标非 CF 托管：验证 connect() 直连路径（不消耗 ProxyIP 槽位）。
-	// 80 端口被平台禁拨（m0 探针实测），一律走 443 + TLS。
-	const target = "example.com:443"
+	// 注意 example.com 在 2026 年已解析到 CF 网段（直连必被平台拒），选 Google。
+	const target = "www.google.com:443"
 
 	t.Run("single stream", func(t *testing.T) {
 		conn, err := m.Open(target)
@@ -100,12 +100,12 @@ func TestLiveDirectExitAndMux(t *testing.T) {
 			t.Fatalf("open %s: %v", target, err)
 		}
 		defer conn.Close()
-		tlsConn, err := tlsOverStream(conn, "example.com")
+		tlsConn, err := tlsOverStream(conn, "www.google.com")
 		if err != nil {
 			t.Fatalf("tls handshake: %v", err)
 		}
 		defer tlsConn.Close()
-		code, body, err := httpOverStream(tlsConn, "example.com", "/")
+		code, body, err := httpOverStream(tlsConn, "www.google.com", "/")
 		if err != nil {
 			t.Fatalf("request: %v", err)
 		}

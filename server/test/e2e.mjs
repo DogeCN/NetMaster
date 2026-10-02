@@ -33,7 +33,7 @@ import {
   STATUS_FORBIDDEN,
   STATUS_NOEXIT,
 } from "../src/protocol.js";
-import { parseRelayEntries } from "../src/race.js";
+import { parseRelayEntries, KV_RELAY_KEY } from "../src/race.js";
 import { startDevserver } from "./devserver.mjs";
 
 // ---- 小工具 ----
@@ -709,38 +709,36 @@ async function item6() {
   });
 }
 
-// 7 Cron / KV：读 proxyip:top 与 cron:lastRun。key 为空 = Cron 还没写出结果，
-// 如实判 FAIL，不当通过。
+// 7 KV / 中继池：读 proxyip:top。
+//
+// 这个 key 由 GitHub Actions 的 refresh-relays 定时任务写（Worker Cron 已移除），
+// 而那个定时任务**默认是关的**：KV 为空不代表部署坏了，只代表"还没启用刷新或还没跑过"。
+// 所以空 = SKIP 并写清怎么让它有值，而不是 FAIL —— 否则一个全新部署会红着一项，
+// 而红的原因与"这个 Worker 能不能用"毫无关系。
+//
+// 有数据时照旧校验格式（喂给 race.js 的 parseRelayEntries 能读回可用中继）。
+// 不再读 cron:lastRun：那个键随 Worker Cron 一起没了，refresher 只写 proxyip:top
+// 一个键；新鲜度只能去 Actions 的 run 页面看（这里如实说明，不伪造证据）。
 async function item7() {
-  await step("7.1 cron wrote proxyip:top + cron:lastRun to KV", async () => {
+  await step("7.1 relay pool in KV (proxyip:top)", async () => {
     if (!CF.token || !CF.account) {
       return skip("CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID not set (KV is only readable through the Cloudflare REST API)");
     }
     const ns = await resolveKvNamespace();
     if (ns.error) return fail(ns.error);
-    const top = await kvGet(ns.id, "proxyip:top");
-    const last = await kvGet(ns.id, "cron:lastRun");
+    const top = await kvGet(ns.id, KV_RELAY_KEY);
     note(`namespace ${ns.id} (${ns.how})`);
     const show = (k, v) => (v.missing ? `${k} = (missing)` : v.error ? `${k} = ERROR ${v.error}` : `${k} = ${v.value.trim().slice(0, 300)}`);
-    note(show("proxyip:top", top));
-    note(show("cron:lastRun", last));
-    if (top.error || last.error) return fail("KV read failed");
-    const relays = top.missing ? [] : parseRelayEntries(top.value);
+    note(show(KV_RELAY_KEY, top));
+    if (top.error) return fail("KV read failed");
+
     if (top.missing || !String(top.value).trim()) {
-      return fail("proxyip:top is empty/missing — Cron has not written it yet (it fires hourly; check `wrangler tail` for [cron] output)");
+      return skip("subscription refresh workflow has not run; enable it to populate proxyip:top");
     }
+    const relays = parseRelayEntries(top.value);
     if (!relays.length) return fail(`proxyip:top present but yields 0 usable relays: ${top.value.trim().slice(0, 120)}`);
-    let ageMin = null;
-    if (!last.missing) {
-      try {
-        const at = Number(JSON.parse(last.value).at);
-        if (Number.isFinite(at)) ageMin = Math.round((Date.now() - at) / 60000);
-      } catch {}
-    }
-    return pass(
-      `${relays.length} relay(s): ${relays.map((r) => `${r.host}:${r.port}`).join(", ")}` +
-        (ageMin === null ? "; cron:lastRun missing or unparsable" : `; cron:lastRun ${ageMin} min ago`)
-    );
+    note("freshness: no lastRun key — the refresher writes only proxyip:top; check the Actions run page for when it last ran");
+    return pass(`${relays.length} relay(s): ${relays.map((r) => `${r.host}:${r.port}`).join(", ")}`);
   });
 }
 

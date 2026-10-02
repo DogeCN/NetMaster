@@ -41,6 +41,8 @@ class SessionDO {
     this.streams = new Map(); // id -> { writer, wq, wqBytes, writing }
     this.closedIds = new Set(); // 近期已关流：迟到数据帧按原样丢弃，不误解析成开帧
     this.egress = new Map(); // target_hash -> { host, port }：本连接内的出口亲和
+    this.directFailed = new Set(); // 直连被平台拒绝的目标（hash），本连接内不再重试
+    this.connectCount = 0; // 本激活期已消耗的出站连接数（≈子请求预算）
     this.idleTimer = null;
     this.lastActivity = 0;
   }
@@ -198,17 +200,19 @@ class SessionDO {
   // Cloudflare 网段或不可达"的信号（connect() 拨 CF 段必被平台拒），这时才走
   // ProxyIP：会话缓存 → Router DO → 竞速。
   async openExit(atyp, host, port) {
-    const direct = await directConnect(atyp, host, port);
-    if (!direct.error) return { socket: direct.socket };
-    // 出口失败的归因是排障刚需，不受 DEBUG 门控（tail 里必现）。
-    console.error(`[exit] direct ${host}:${port} failed: ${direct.error}`);
-    // tail 对 Session DO 的 console 输出不可见（实测），KV 是可靠的诊断通道
-    this.env.KV?.put("debug:lastExit", `${new Date().toISOString()} ${host}:${port} direct: ${direct.error}`).catch?.(() => {});
-    this.log(`direct exit failed (${direct.error}); trying proxyip`);
-    // 没部署出口层（无 ROUTER/KV 绑定）时保持纯直连语义：直连失败就是失败。
-    if (!this.env.ROUTER && !this.env.KV) return { error: direct.error };
-
     const hash = await targetHash(host);
+
+    // 直连失败记忆：解析到 CF 网段的目标直连必被平台拒（每次失败还白烧子请求
+    // 预算），本连接内直接走 ProxyIP。
+    if (!this.directFailed.has(hash)) {
+      const direct = await directConnect(atyp, host, port);
+      if (!direct.error) return { socket: direct.socket };
+      console.error(`[exit] direct ${host}:${port} failed: ${direct.error}`);
+      this.directFailed.add(hash);
+      this.log(`direct exit failed (${direct.error}); trying proxyip`);
+    }
+    // 没部署出口层（无 ROUTER/KV 绑定）时保持纯直连语义：直连失败就是失败。
+    if (!this.env.ROUTER && !this.env.KV) return { error: "direct failed" };
 
     // ① 会话级缓存：只在本 WebSocket 会话内有效。
     const mem = this.egress.get(hash);
@@ -319,6 +323,14 @@ class SessionDO {
       this.send(encodeCloseControl(id));
       this.rememberClosed(id);
       return;
+    }
+    // 预算管理：免费版每个 invocation 50 个子请求，每条流约 1 个（connect），
+    // 加上 DNS 缓存未命中时的 DoH。预算见底前优雅断开，客户端会带着等待队列
+    // 重连拿到全新预算 —— 这是有意的续命机制，不是故障。
+    if (++this.connectCount >= 30) {
+      this.log(`connect budget ${this.connectCount} reached, recycling session`);
+      console.error(`[exit] budget recycled after ${this.connectCount} connects`);
+      try { this.ws.close(1000, "budget"); } catch {}
     }
     const rec = {
       socket: ex.socket,

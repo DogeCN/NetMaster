@@ -104,7 +104,7 @@ GitHub Actions 里（口令与 token 走 secrets）：
 | 4.1 | 一条 WS 上并发 100 条流 | 100 条全 `0x00`，且 100 个请求各自拿到 HTTP 200 | **M2「单 WS 并发 ≥ 100 条流」** |
 | 5.1 | CF 托管目标 N 轮 | 成功率 ≥ 99%，打印百分比与失败原因分类 | **M3「ProxyIP 成功率 ≥ 99%」** |
 | 6.1 | 同一目标连 3 次（每次新连接） | 第 2/3 轮不再出现 `0x03`，并打印建流耗时 | M3「映射命中后建流更快 / 缓存复用」 |
-| 7.1 | KV `proxyip:top` + `cron:lastRun` | key 非空且能解析出中继；打印内容与 lastRun 距今分钟数 | **M5「评分写入 KV 且下一周期可读到」** |
+| 7.1 | KV `proxyip:top` | key 有值时能解析出 ≥1 条可用中继；**为空则 SKIP**（见下） | M5「评分写入 KV 且下一周期可读到」 |
 | 8.1 | 空闲存活 | 只走 WS 协议层 Ping 静置 5 分钟，连接未断、Pong 持续回来 | **M2「空闲 5 分钟会话存活」** |
 
 ## 判定口径与已知局限
@@ -135,3 +135,11 @@ GitHub Actions 里（口令与 token 走 secrets）：
    开关），而生产是按 `port === 25` 最先判；用域名才能验到同一条代码路径。
 8. **本地模式不是部署验收。** 它的 PASS 只证明脚本逻辑本身（第 1-4 项），
    输出里会明确标注。
+9. **第 7 项为空判 SKIP 而不是 FAIL。** `proxyip:top` 由 GitHub Actions 的
+   `refresh-relays` 定时任务写（Worker Cron 已移除），而那个定时任务**默认不开**：
+   KV 为空只说明"还没启用刷新或还没跑过"，与"这个 Worker 能不能用"无关，红着
+   一项会误导排障。同理脚本不再读 `cron:lastRun`——那个键随 Worker Cron 一起
+   没了，refresher 只写 `proxyip:top` 一个键；新鲜度只能去 Actions 的 run 页面
+   看，脚本如实说明而不伪造证据。
+   要让第 7 项真正参与验收：给仓库配 `CLOUDFLARE_API_TOKEN`（需 KV 读权限）与
+   `CLOUDFLARE_ACCOUNT_ID`，并手动 dispatch 一次 `refresh-relays`。
