@@ -168,18 +168,22 @@ async function runCron(env, ctx, workerHost) {
 	}
 
 	// 3) 全部跑完：EWMA 排序 → 取前 4 → 写 KV（last-good-wins）
+	//
+	// last-good-wins 的判定是"本轮至少有一条探测成功"，不是"排序结果非空"：
+	// 候选全灭时 rankRelays 照样返回列表（死候选排在后面留着下轮翻身），
+	// 若拿列表长度当成功标志，全灭的一轮会用死列表覆盖好数据。
 	const scored = rankRelays(pending);
-	const top = scored.slice(0, RACE_KV_TOP).map((s) => ({ host: s.host, port: s.port, type: RELAY_TYPE_HTTP_CONNECT, ms: Math.round(s.ms), score: Number(s.score.toFixed(1)) }));
-
-	if (top.length === 0) {
-		// 本轮全败：保留上一轮数据（last-good-wins）
+	const okCount = scored.filter((s) => s.success > 0).length;
+	if (okCount === 0) {
 		await env.KV?.delete(CRON_KEY_CURSOR);
 		await env.KV?.delete(CRON_KEY_PENDING);
-		return { batch: batch.length, total: relays.length, done: true, source, written: 0, reason: "all probes failed" };
+		return { batch: batch.length, total: relays.length, done: true, source, written: 0, okCount, reason: "all probes failed" };
 	}
 
+	const top = scored.filter((s) => s.success > 0).slice(0, RACE_KV_TOP).map((s) => ({ host: s.host, port: s.port, type: RELAY_TYPE_HTTP_CONNECT, ms: Math.round(s.ms), score: Number(s.score.toFixed(1)) }));
 	await env.KV?.put(KV_RELAY_KEY, JSON.stringify(top));
-	await env.KV?.put(CRON_KEY_LAST, JSON.stringify({ at: bucketStart, n: top.length, of: relays.length }));
+	const failSamples = pending.filter((r) => !r.ok).slice(0, 3).map((r) => `${r.host}:${r.port} ${r.ms}ms`);
+	await env.KV?.put(CRON_KEY_LAST, JSON.stringify({ at: bucketStart, n: top.length, of: relays.length, ok: okCount, fails: failSamples }));
 	await env.KV?.delete(CRON_KEY_CURSOR);
 	await env.KV?.delete(CRON_KEY_PENDING);
 	return { batch: batch.length, total: relays.length, done: true, source, written: top.length };
