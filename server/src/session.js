@@ -202,6 +202,8 @@ class SessionDO {
     if (!direct.error) return { socket: direct.socket };
     // 出口失败的归因是排障刚需，不受 DEBUG 门控（tail 里必现）。
     console.error(`[exit] direct ${host}:${port} failed: ${direct.error}`);
+    // tail 对 Session DO 的 console 输出不可见（实测），KV 是可靠的诊断通道
+    this.env.KV?.put("debug:lastExit", `${new Date().toISOString()} ${host}:${port} direct: ${direct.error}`).catch?.(() => {});
     this.log(`direct exit failed (${direct.error}); trying proxyip`);
     // 没部署出口层（无 ROUTER/KV 绑定）时保持纯直连语义：直连失败就是失败。
     if (!this.env.ROUTER && !this.env.KV) return { error: direct.error };
@@ -234,6 +236,7 @@ class SessionDO {
     const race = await startRace({ env: this.env, log: (m) => this.log(m) }, { host, port });
     if (race.error) {
       console.error(`[exit] race ${host}:${port} all slots failed: ${race.error}`);
+      this.env.KV?.put("debug:lastExit", `${new Date().toISOString()} ${host}:${port} race: ${race.error} | direct: ${direct.error}`).catch?.(() => {});
       return { error: `${direct.error}; ${race.error}` };
     }
     const relay = parseRelay(race.relay);
