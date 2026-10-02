@@ -985,7 +985,7 @@ async function item6() {
     if (bad.length) return fail(`round(s) ${bad.map((r) => r.round).join(", ")} did not get 0x00 even after one retry → cached route not reused (or relay pool down, see 5.1)`);
     const retried = rows.filter((r) => r.attempt > 1).map((r) => r.round);
     return pass(`round 1 ${statusName(rows[0].status)} (${rows[0].openMs}ms), rounds 2-3 ${statusName(STATUS_OK)} (${rows[1].openMs}ms / ${rows[2].openMs}ms) with no 0x03${retried.length ? ` (rounds ${retried.join(",")} needed one retry)` : ""}`);
-  });
+  }, 3 * 2 * (cfg.streamTimeoutMs + 20_000) + 2 * 6_000 + 60_000); // 3 轮 × 2 次尝试 × (拨号+请求) + 轮间等待
 }
 
 // 7 KV / 中继池：读 proxyip:top。
