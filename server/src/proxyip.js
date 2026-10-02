@@ -1,14 +1,26 @@
-// ProxyIP 出口（PRD §7.4，本版只有 HTTP CONNECT 这一种）。
+// ProxyIP 出口（PRD §7.4）。两种中继语义：
 //
-// Workers connect() 拨 Cloudflare 自有网段会被平台拒绝（M0 实测），所以目标是 CF
-// 承载的站点时只能借第三方中继：connect() 拨中继 → HTTP CONNECT → 隧道里跑的是
-// 客户端到目标的原始字节。目标是 HTTPS 时 TLS 由客户端端到端完成，中继只搬运
-// 密文——CONNECT 隧道正是为此设计，我们不碰明文。
+//   sni（公共 CMLiussss 中继全是这一类）：不是 HTTP CONNECT 代理 —— 实测对
+//   CONNECT 请求回 400。它读客户端 TLS ClientHello 里的 SNI 并据此转发
+//   （v0.1.x 的 resolveOverride 走的就是同一种机制）。worker 只需把隧道建起来，
+//   字节原样双向灌，ClientHello 会带着真实 SNI 经过它。
 //
-// 出口类型名：写进 Router DO 的 egress_type，KV 条目预留同一字段（PRD §7.4）。
+//   http-connect（自建 VPS）：connect() 拨中继 → HTTP CONNECT → 隧道。目标是
+//   HTTPS 时 TLS 由客户端端到端完成，中继只搬运密文。
+//
+// 出口类型名：写进 Router DO 的 egress_type，KV 条目带同一字段（PRD §7.4）。
 
+import { connect } from './socket.js';
+import { resolve4 as dohResolve4 } from './exits.js';
+
+// resolver 可注入：测试里把 DoH 换成恒等解析，避免单测打真实网络。
+let resolve4Impl = dohResolve4;
+export function setResolver(fn) {
+  resolve4Impl = fn;
+}
 
 export const RELAY_TYPE_HTTP_CONNECT = "http-connect";
+export const RELAY_TYPE_SNI = "sni";
 
 // 中继语义就是反代 CF 的 443，因此只收 443 的条目（与 v0.1 的解析一致）。
 export const RELAY_PORT = 443;
@@ -35,9 +47,9 @@ export const FALLBACK_RELAY_HOSTS = [
   "ProxyIP.Multacom.CMLiussss.net",
 ];
 
-// fallbackRelays 返回兜底候选（复制，调用方可自由打乱）。
+// fallbackRelays 返回兜底候选（复制，调用方可自由打乱）。公共中继是 SNI 型。
 export function fallbackRelays() {
-  return FALLBACK_RELAY_HOSTS.map((host) => ({ host, port: RELAY_PORT }));
+  return FALLBACK_RELAY_HOSTS.map((host) => ({ host, port: RELAY_PORT, type: RELAY_TYPE_SNI }));
 }
 
 // parseRelay 拆 "host[:port]"，端口缺省 443（订阅源格式，纯文本 ip:port）。
@@ -149,6 +161,40 @@ function tunnel(reader, leftover) {
   });
 }
 
+// connectViaSNI 拨 SNI 路由型中继（CMLiussss 公共中继全是这一类）。
+//
+// 这类中继不是 HTTP CONNECT 代理 —— 实测对 CONNECT 请求回 400。它读的是
+// 客户端 TLS ClientHello 里的 SNI 并据此转发（v0.1.x 用 resolveOverride 走的
+// 就是同一种机制）。所以这里只需要把隧道建起来，字节原样双向灌：
+// 客户端的 ClientHello 会带着真实 SNI 经过它。
+export async function connectViaSNI(relayHost, relayPort, opts = {}) {
+  const timeoutMs = opts.timeoutMs || RELAY_CONNECT_TIMEOUT_MS;
+  let socket;
+  try {
+    let relayIp = relayHost;
+    if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(relayHost)) {
+      const ips = await resolve4Impl(relayHost);
+      if (!ips.length) return { error: `dns: no A record for relay ${relayHost}` };
+      relayIp = ips[0];
+    }
+    socket = connect({ hostname: relayIp, port: relayPort });
+    await withTimeout(socket.opened, timeoutMs, "relay connect timeout");
+    return { socket };
+  } catch (e) {
+    try { socket?.close(); } catch {}
+    return { error: e.message || e };
+  }
+}
+
+// dialRelay 按 KV 条目的 type 分发。缺省 sni：公共源（CMLiussss 域名、IPDB 的
+// ProxyIP 条目）全是 SNI 路由型，HTTP CONNECT 只在自建 VPS 中继上出现。
+export async function dialRelay(relay, targetHost, targetPort, opts = {}) {
+  if (relay.type === RELAY_TYPE_HTTP_CONNECT) {
+    return connectViaProxyIP(relay.host, relay.port, targetHost, targetPort, opts);
+  }
+  return connectViaSNI(relay.host, relay.port, opts);
+}
+
 // connectViaProxyIP 拨中继并发 CONNECT，成功后返回可直接 getWriter/getReader 的
 // 隧道 socket；失败返回 { error }。opts.timeoutMs 由竞速传入（单槽预算）。
 export async function connectViaProxyIP(relayHost, relayPort, targetHost, targetPort, opts = {}) {
@@ -159,7 +205,7 @@ export async function connectViaProxyIP(relayHost, relayPort, targetHost, target
     // 中继可能是域名（CMLiussss 全系）：connect() 只吃 IP 字面量，先解析。
     let relayIp = relayHost;
     if (!/^([0-9]{1,3}\.){3}[0-9]{1,3}$/.test(relayHost)) {
-      const ips = await resolve4(relayHost);
+      const ips = await resolve4Impl(relayHost);
       if (!ips.length) return { error: `dns: no A record for relay ${relayHost}` };
       relayIp = ips[0];
     }

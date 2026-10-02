@@ -11,7 +11,7 @@
 // 背压（PRD §4.7）：客户端→目标方向每流缓冲上限 1 MiB，超过即 CLOSE 该流，
 // 不影响其他流。
 
-import { connectViaProxyIP, parseRelay, RELAY_TYPE_HTTP_CONNECT } from './proxyip.js';
+import { dialRelay, parseRelay, RELAY_TYPE_SNI } from './proxyip.js';
 import { startRace } from './race.js';
 import { targetHash, routerName, routerShardId } from './router.js';
 
@@ -217,7 +217,7 @@ class SessionDO {
     // ① 会话级缓存：只在本 WebSocket 会话内有效。
     const mem = this.egress.get(hash);
     if (mem) {
-      const r = await connectViaProxyIP(mem.host, mem.port, host, port);
+      const r = await dialRelay(mem, host, port);
       if (!r.error) return { socket: r.socket, hash, relay: mem };
       this.log(`cached relay ${mem.host}:${mem.port} failed: ${r.error}`);
       this.egress.delete(hash);
@@ -226,10 +226,10 @@ class SessionDO {
     // ② Router DO：跨会话复用的唯一来源。
     const hit = await this.routerLookup(hash);
     if (hit) {
-      const r = await connectViaProxyIP(hit.host, hit.port, host, port);
+      const r = await dialRelay(hit, host, port);
       if (!r.error) {
         this.rememberEgress(hash, hit);
-        this.learn(hash, hit.type || RELAY_TYPE_HTTP_CONNECT, `${hit.host}:${hit.port}`);
+        this.learn(hash, hit.type || RELAY_TYPE_SNI, `${hit.host}:${hit.port}`);
         return { socket: r.socket, hash, relay: hit };
       }
       this.log(`router relay ${hit.host}:${hit.port} failed: ${r.error}`);
@@ -245,7 +245,7 @@ class SessionDO {
     }
     const relay = parseRelay(race.relay);
     this.rememberEgress(hash, relay);
-    this.learn(hash, RELAY_TYPE_HTTP_CONNECT, race.relay);
+    this.learn(hash, race.type || RELAY_TYPE_SNI, race.relay);
     return { socket: race.socket, hash, relay };
   }
 

@@ -9,6 +9,7 @@
 // 自己手里，赛道上丢一个 Promise 只能丢引用、关不掉连接。
 
 import {
+  dialRelay,
   RELAY_PORT,
   connectViaProxyIP,
   fallbackRelays,
@@ -143,7 +144,7 @@ export async function startRace(ctx = {}, target = {}, routerLookup) {
     candidates.forEach((cand, i) => {
       timers.push(
         setTimeout(() => {
-          connectViaProxyIP(cand.host, cand.port, target.host, target.port, { timeoutMs: cfg.slotMs })
+          dialRelay(cand, target.host, target.port, { timeoutMs: cfg.slotMs })
             .then((r) => {
               live--;
               if (r.error) {
@@ -157,7 +158,7 @@ export async function startRace(ctx = {}, target = {}, routerLookup) {
                 try { r.socket.close(); } catch {}
                 return;
               }
-              finish({ socket: r.socket, relay: `${cand.host}:${cand.port}`, viaRouter: cand.viaRouter === true });
+              finish({ socket: r.socket, relay: `${cand.host}:${cand.port}`, type: cand.type, viaRouter: cand.viaRouter === true });
             })
             .catch(() => {
               live--;

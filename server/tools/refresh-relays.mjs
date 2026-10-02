@@ -22,7 +22,7 @@ import {
   fallbackRelays,
   parseRelay,
   RELAY_PORT,
-  RELAY_TYPE_HTTP_CONNECT,
+  RELAY_TYPE_SNI,
 } from "../src/proxyip.js";
 
 // ---- 常量 ----
@@ -214,7 +214,7 @@ export function buildTop(ranked, n = KV_TOP_N) {
   return ranked
     .filter((r) => r.success > 0)
     .slice(0, n)
-    .map((r) => ({ host: r.host, port: r.port, type: RELAY_TYPE_HTTP_CONNECT, ms: r.ms }));
+    .map((r) => ({ host: r.host, port: r.port, type: RELAY_TYPE_SNI, ms: r.ms }));
 }
 
 // ---- Cloudflare REST ----

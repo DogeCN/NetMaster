@@ -21,7 +21,7 @@ async function relay(opts) {
 	return r;
 }
 
-const cand = (r) => ({ host: r.host, port: r.port });
+const cand = (r) => ({ host: r.host, port: r.port, type: "http-connect" });
 const at = (key) => opened.find((e) => e.key === key).at;
 
 const restore = installMockConnect(endpoints, opened);

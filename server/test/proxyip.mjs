@@ -90,7 +90,10 @@ export async function startRelayMock(opts = {}) {
  * @param {Map<string, number>} endpoints "host:port" -> 本地端口
  * @param {Array} [opened] 装配记录（key / opened / closed / at），at 用于时序断言
  */
+import { setResolver } from '../src/proxyip.js';
+
 export function installMockConnect(endpoints, opened = []) {
+	setResolver(async (host) => [host]); // 恒等解析：mock 直接看到域名，不打真实 DoH
 	globalThis.connect = ({ hostname, port }) => {
 		const key = `${hostname}:${port}`;
 		const local = endpoints.get(key);
