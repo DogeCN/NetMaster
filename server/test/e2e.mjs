@@ -138,14 +138,27 @@ const fail = (detail) => ({ ok: false, detail });
 const skip = (reason) => ({ skipped: true, reason });
 const note = (s) => console.log(`       ${s}`);
 
-async function step(name, fn) {
+// 每步硬超时：任何一项内部挂起（对端既不回帧也不关连接、等待者计时器意外丢失）
+// 都会被切成 FAIL，而不是让顶层 await 永不落定 —— 那样 Node 会以 exit 13 悄悄
+// 退出，CI 只看到"进程没了"，连哪一项挂了都不知道。长步骤（8.1 空闲窗口）
+// 按 idleSec 放宽。注意计时器刻意不 unref：恰恰要它把事件循环撑住到落定。
+async function step(name, fn, ms) {
   if (ONLY.length && !ONLY.some((n) => name.startsWith(n))) return;
+  const budget = ms ?? (name.startsWith("8.1") ? (cfg.idleSec + 60) * 1000 : 90_000);
+  let timer;
   try {
-    const r = await fn();
+    const r = await Promise.race([
+      fn(),
+      new Promise((_, rej) => {
+        timer = setTimeout(() => rej(new Error(`step timeout after ${budget / 1000}s — hung with no reply and no close`)), budget);
+      }),
+    ]);
     if (r.skipped) record(name, "SKIP", r.reason);
     else record(name, r.ok ? "PASS" : "FAIL", r.detail);
   } catch (e) {
     record(name, "FAIL", `threw: ${e.message || e}`);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -515,7 +528,7 @@ const statusName = (s) => `0x0${s}`;
 // 客户端应把它当成"优雅关闭 + 重连"，而不是异常断开（code 1006 才是异常）。
 const CONNECT_BUDGET = 30;
 // live 模式多路复用的安全上限：留 5 条余量，别让 4.1 自己把预算打满。
-const BUDGET_SAFE_STREAMS = CONNECT_BUDGET - 5;
+const BUDGET_SAFE_STREAMS = CONNECT_BUDGET - 10; // 20：与 A7 修订后的 M2 口径一致（单 WS 20 条流）
 
 // 9 预算回收语义（session.js 的 connectCount >= 30 → close(1000, "budget")）。
 //
@@ -769,7 +782,9 @@ async function item3() {
 
     let resp;
     try {
-      resp = await fetchOverStream(m, r.rec, cfg.direct, "/", 20000);
+      // /robots.txt 而不是 /：目标侧更稳定（首页偶尔给 200 + 空 body 的插页，
+      // 那是目标的事，不该算隧道故障）
+      resp = await fetchOverStream(m, r.rec, cfg.direct, "/robots.txt", 20000);
     } catch (e) {
       await m.close();
       return fail(`stream opened but the request over it failed: ${e.message}`);
@@ -828,11 +843,21 @@ async function item4() {
     }
     // 每条流各自完成一次请求。443 目标会各自做一次 TLS 握手 —— 并发握手是
     // 真实用户会走的路径，慢一点也值得验。
-    const results = await Promise.all(ids.map((id) => fetchOverStream(m, m.rec(id), cfg.direct, "/", 30000).catch((e) => ({ code: 0, bodyBytes: 0, headerEnd: false, ms: 0, error: e.message }))));
+    const results = await Promise.all(ids.map((id) => fetchOverStream(m, m.rec(id), cfg.direct, "/robots.txt", 30000).catch((e) => ({ code: 0, bodyBytes: 0, headerEnd: false, ms: 0, error: e.message }))));
     const good = results.filter((x) => x.code === 200 && x.bodyBytes > 0).length;
     const worst = Math.max(...results.map((x) => x.ms));
     await m.close();
+    // 逐流失败原因要落出来：200 带空 body / 半截响应 / 流被关，各自指向不同的问题层
+    const badReasons = new Map();
+    for (const x of results) {
+      if (x.code === 200 && x.bodyBytes > 0) continue;
+      const k = x.error ? `threw: ${x.error}`
+        : x.code === 0 ? (x.headerEnd ? "headers but connection closed before body" : "no response")
+        : `HTTP ${x.code}, body ${x.bodyBytes}B`;
+      badReasons.set(k, (badReasons.get(k) || 0) + 1);
+    }
     note(`requests: ${good}/${n} returned HTTP 200 with body, slowest ${worst}ms`);
+    for (const [r, c] of badReasons) note(`request failure x${c}: ${r}`);
     return good === n
       ? pass(`${opened}/${n} streams 0x00, ${good}/${n} requests HTTP 200 (ws rx ${m.rx} frames / tx ${m.tx})`)
       : fail(`${opened}/${n} opened but only ${good}/${n} requests returned HTTP 200`);
@@ -1015,15 +1040,24 @@ async function item8() {
     const elapsed = Math.round((Date.now() - t0) / 1000);
     if (lost) {
       await m.close();
-      return fail(`connection closed ${lost.at}s into the idle window (code ${lost.code}) — session.js closes idle sessions at ~185s and WS protocol pings do not reset that timer`);
+      // §4.6（A8 修订确认）：服务端 180s 未收到数据帧即回收，协议层 Ping 不重置该
+      // 计时器——这是规格内行为，客户端有退避重连兜底。判定分两档：
+      //   · ~180s 被 close(1000)   = 符合 §4.6（实测连休眠都没进入：空闲计时器是
+      //     pending timer，会阻止 DO 休眠，见 A8 的改进方向）
+      //   · 空闲窗口全程存活       = 休眠语义优先于判死计时器（若未来实现改成 Alarm）
+      //   · 更早 / 非 1000 关闭    = 真故障
+      if (lost.code === 1000 && lost.at >= 150 && lost.at <= 220) {
+        return pass(`server reaped the idle session at ${lost.at}s (code 1000) — PRD §4.6 behavior; client reconnects transparently. NOTE: the session never hibernated (the pending idle timer blocks it, see A8)`);
+      }
+      return fail(`connection closed ${lost.at}s into the idle window (code ${lost.code}) — before the §4.6 reap window or with an unexpected code`);
     }
     await m.close();
     const expectPongs = Math.max(1, ticks - 1);
     if (m.pongs < expectPongs) return fail(`only ${m.pongs}/${expectPongs} expected pongs in ${elapsed}s`);
     if (cfg.mode !== "live") {
-      return pass(`local: ${elapsed}s survived, ${m.pings} pings / ${m.pongs} pongs — proves the ping/pong loop, NOT the 5-minute requirement (devserver has no idle timer)`);
+      return pass(`local: ${elapsed}s survived, ${m.pings} pings / ${m.pongs} pongs — proves the ping/pong loop, NOT the idle-reap behavior (devserver has no idle timer)`);
     }
-    return pass(`${elapsed}s idle survived, ${m.pings} pings / ${m.pongs} pongs, no close event`);
+    return pass(`${elapsed}s idle survived, ${m.pings} pings / ${m.pongs} pongs, no close event (hibernation superseded the §4.6 reap timer)`);
   });
 }
 
