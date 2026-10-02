@@ -194,7 +194,7 @@ func TestProtoE2EConcurrentStreams(t *testing.T) {
 	}
 	defer m.Close()
 
-	const n = 32
+	const n = 100 // PRD §14 M2：单 WS 并发 ≥ 100 条流
 	var wg sync.WaitGroup
 	errs := make([]error, n)
 	for i := 0; i < n; i++ {
@@ -283,3 +283,46 @@ func TestProtoE2ELargePayload(t *testing.T) {
 
 // MaxWriteChunk 写路径每次投喂的最大量（客户端 Write 有 64KB 上限断言）。
 const MaxWriteChunk = 32 * 1024
+
+// TestProtoE2EReconnectAfterKill WS 被强断后，重建传输并立刻可用。
+// 这是 PRD §6.7 "断线重连" 的行为验收（时间预算由 selector 侧断言，这里只验协议层）。
+func TestProtoE2EReconnectAfterKill(t *testing.T) {
+	dev := startDev(t)
+	echo := echoServer(t)
+
+	m1, err := DialMuxPlain(dev.url, devPassword)
+	if err != nil {
+		t.Fatalf("first dial: %v", err)
+	}
+	if _, err := m1.Open(echo); err != nil {
+		t.Fatalf("open on first transport: %v", err)
+	}
+	m1.Close() // 强断：不等优雅关闭
+
+	m2, err := DialMuxPlain(dev.url, devPassword)
+	if err != nil {
+		t.Fatalf("reconnect dial: %v", err)
+	}
+	defer m2.Close()
+	if !m2.Alive() {
+		t.Fatal("reconnected transport not alive")
+	}
+	conn, err := m2.Open(echo)
+	if err != nil {
+		t.Fatalf("open on reconnected transport: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("after reconnect")
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write after reconnect: %v", err)
+	}
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read after reconnect: %v", err)
+	}
+	if string(buf) != string(payload) {
+		t.Fatalf("echo mismatch after reconnect: %q", buf)
+	}
+}

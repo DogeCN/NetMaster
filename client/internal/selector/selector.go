@@ -46,10 +46,13 @@ type Pool struct {
 	muxes         map[int]*outbound.MuxConn // 节点索引 -> 活跃 mux
 	directBlocked map[string]time.Time
 	direct        map[string]bool // host -> 已学习的直连/代理粘性
+	fails         map[int]int     // 节点索引 -> 连续失败次数
+	dead          map[int]bool    // 连续失败到阈值判死，等待重随机时复活
+	pending       *dialPending    // 断线等待队列与退避重连
 }
 
 func New(cfg Config) *Pool {
-	return &Pool{
+	p := &Pool{
 		nodes:         cfg.Nodes,
 		sni:           cfg.SNI,
 		password:      cfg.Password,
@@ -58,7 +61,101 @@ func New(cfg Config) *Pool {
 		muxes:         make(map[int]*outbound.MuxConn),
 		directBlocked: make(map[string]time.Time),
 		direct:        make(map[string]bool),
+		fails:         make(map[int]int),
+		dead:          make(map[int]bool),
 	}
+	p.pending = newDialPending(p)
+	return p
+}
+
+// Close 停止等待队列并关闭所有传输（进程退出 / 测试收尾）。
+func (p *Pool) Close() {
+	p.pending.stop()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, m := range p.muxes {
+		m.Close()
+	}
+	p.muxes = make(map[int]*outbound.MuxConn)
+}
+
+// liveMux 返回任一存活传输及其节点索引（idx = -1 表示全灭）。
+func (p *Pool) liveMux() (int, *outbound.MuxConn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for idx, m := range p.muxes {
+		if m.Alive() {
+			return idx, m
+		}
+	}
+	return -1, nil
+}
+
+// redial 重建一条传输；成功返回 true（失败时 mux 不入表）。
+func (p *Pool) redial() bool {
+	idx := p.pickNode()
+	if idx < 0 {
+		return false
+	}
+	client := &outbound.Client{
+		Node:     p.nodes[idx],
+		SNI:      p.sni,
+		Password: p.password,
+		UseECH:   p.useECH,
+		Insecure: p.insecure,
+	}
+	m, err := outbound.DialMux(client)
+	if err != nil {
+		return false
+	}
+	p.mu.Lock()
+	p.muxes[idx] = m
+	p.mu.Unlock()
+	return true
+}
+
+// pickNode 随机选一个未判死的节点；全判死时全部复活（池耗尽后仍要能继续用）。
+func (p *Pool) pickNode() int {
+	p.mu.Lock()
+	live := make([]int, 0, len(p.nodes))
+	for i := range p.nodes {
+		if !p.dead[i] {
+			live = append(live, i)
+		}
+	}
+	if len(live) == 0 {
+		for i := range p.nodes {
+			p.dead[i] = false
+			p.fails[i] = 0
+			live = append(live, i)
+		}
+	}
+	p.mu.Unlock()
+	if len(live) == 0 {
+		return -1
+	}
+	return live[rand.Intn(len(live))]
+}
+
+// noteFailure 记一次节点失败；到阈值判死（退避与重随机由 pickNode 接管）。
+func (p *Pool) noteFailure(idx int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.fails[idx]++
+	if p.fails[idx] >= nodeFailLimit {
+		p.dead[idx] = true
+		p.fails[idx] = 0
+		delete(p.muxes, idx)
+	}
+}
+
+// noteSuccess 清零某节点的失败计数。
+func (p *Pool) noteSuccess(idx int) {
+	p.mu.Lock()
+	if p.fails[idx] > 0 {
+		p.fails[idx] = 0
+	}
+	p.mu.Unlock()
 }
 
 func (p *Pool) SetGeo(g GeoResolver)    { p.geo = g }
@@ -84,42 +181,51 @@ func hostOf(target string) string {
 	return host
 }
 
-// Dial 经代理出口建连到 target。在节点池里随机起点轮询，节点 mux 失效时
-// 重拨一次；整池失败返回最后一个错误。
+// Dial 经代理出口建连到 target。
+//
+// 快路径：任一存活传输直接开流。传输全灭（或建流途中断链）时不立刻把失败
+// 丢给用户，而是排进等待队列等重连 —— 断线瞬间上层往往正有一批连接在建立。
 func (p *Pool) Dial(target string) (net.Conn, error) {
-	p.mu.Lock()
-	order := rand.Perm(len(p.nodes))
-	muxes := make(map[int]*outbound.MuxConn, len(p.muxes))
-	for k, v := range p.muxes {
-		muxes[k] = v
+	if len(p.nodes) == 0 {
+		return nil, errNoUsableExit
 	}
-	p.mu.Unlock()
-
-	var lastErr error
-	for _, idx := range order {
-		m, ok := muxes[idx]
-		if ok && m.Alive() {
+	for attempt := 0; attempt < 2; attempt++ {
+		idx, m := p.liveMux()
+		if m != nil {
 			conn, err := m.Open(target)
 			if err == nil {
+				p.noteSuccess(idx)
 				return conn, nil
 			}
-			lastErr = err
-			// 流被拒（0x01-0x03）是服务端裁决，换节点也是同一裁决，不再轮询。
 			if m.Alive() {
-				return nil, lastErr
+				// 流被拒（0x01-0x03）是服务端裁决，换节点也是同一裁决。
+				p.noteFailure(idx)
+				return nil, err
 			}
+			// 传输在半路死了：记一次失败（到阈值判死）并重建
+			p.noteFailure(idx)
+			if !p.redial() {
+				break
+			}
+			continue
 		}
-		// mux 不存在或已死：重拨这条传输，再试一次流。
-		conn, err := p.dialNode(idx, target)
-		if err == nil {
-			return conn, nil
+		// 没有可用传输：当场重建一条
+		if !p.redial() {
+			break
 		}
-		lastErr = err
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("selector: node pool is empty")
+	// 仍然不可用 → 排队等待（带退避）
+	req, err := p.pending.enqueue(target)
+	if err != nil {
+		return nil, err
 	}
-	return nil, lastErr
+	if err := p.pending.wait(req); err != nil {
+		return nil, err
+	}
+	if _, m := p.liveMux(); m != nil {
+		return m.Open(target)
+	}
+	return nil, errNoUsableExit
 }
 
 // dialNode 建立节点 idx 的 mux 并在其上打开 target。
@@ -234,8 +340,26 @@ func (p *Pool) RetryProxy(target string) (net.Conn, error) {
 	return p.Dial(target)
 }
 
-// NoteProxyFailure 记录某目标经代理失败。M1 为占位（M4 的节点剔除接管）。
-func (p *Pool) NoteProxyFailure(target string) {}
+// NoteProxyFailure 记录某目标经代理失败：立刻重随机换节点（PRD §6.7）。
+func (p *Pool) NoteProxyFailure(target string) {
+	p.mu.Lock()
+	// 断开当前传输，下一次 Dial 就会重建到别的节点。
+	for idx, m := range p.muxes {
+		p.noteFailureLocked(idx)
+		m.Close()
+		delete(p.muxes, idx)
+	}
+	p.mu.Unlock()
+}
+
+// noteFailureLocked 是 noteFailure 的加锁版本。
+func (p *Pool) noteFailureLocked(idx int) {
+	p.fails[idx]++
+	if p.fails[idx] >= nodeFailLimit {
+		p.dead[idx] = true
+		p.fails[idx] = 0
+	}
+}
 
 // Verify 建立一次真实的传输层验证（TLS+WS+首帧认证）。部署是否健康，
 // 这一条是最直接的回答。
