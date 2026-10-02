@@ -27,23 +27,58 @@ cd server
 npm ci
 
 # 1) 本地自检（进程内拉起 devserver.mjs + 本地 HTTP 目标）
-#    跑第 1-4 项证明脚本逻辑正确；第 5-8 项如实 SKIP。
-node test/e2e.mjs
+#    跑第 1-4 项证明脚本逻辑正确；第 5-9 项如实 SKIP。
+#    注意 --import 那个 shim：脚本 import 了 src/race.js（拿 KV 键名与中继解析），
+#    而它的依赖链里有 cloudflare:sockets。这是仓库里其它套件同样的做法。
+node --import ./test/shims/register.mjs test/e2e.mjs
 echo "exit=$?"
 
-# 2) 真实部署：全部 8 项
-export NETMASTER_ENDPOINT=wss://netmaster.<account>.workers.dev/
-export NETMASTER_PASSWORD='<worker secret>'
-node test/e2e.mjs
+# 2) 真实部署：全部 9 项
+export NETMASTER_E2E_WORKER=netmaster.<account>.workers.dev
+export NETMASTER_E2E_PASSWORD='<worker secret>'
+node --import ./test/shims/register.mjs test/e2e.mjs
 echo "exit=$?"
 
 # 3) 只跑其中几项 / 调整规模
-node test/e2e.mjs --only=1,2,3
-node test/e2e.mjs --streams=200 --rounds=100 --idle=600
+node --import ./test/shims/register.mjs test/e2e.mjs --only=1,2,3
+node --import ./test/shims/register.mjs test/e2e.mjs --streams=200 --rounds=100 --idle=600
 ```
 
-`NETMASTER_ENDPOINT` 可以只写主机名（`netmaster.<account>.workers.dev`），脚本补
+`NETMASTER_E2E_WORKER` 可以只写主机名（`netmaster.<account>.workers.dev`），脚本补
 `wss://` 并把路径固定成 `/`（`src/index.js` 只在根路径上做 WS 升级）。
+
+### 为什么目标都是 443 + TLS
+
+Workers 的 `connect()` **禁拨 80 端口**（平台返回 "consider using fetch"，m0 探针
+实测），所以验收目标只能是 443。脚本因此在目标端口是 443 时自动套 TLS：
+`streamDuplex` 把一条 mux 流包装成 `stream.Duplex`，再交给 `tls.connect` 做真实
+握手（含证书校验），最后在上面发 HTTP。判断依据是**端口**而不是 mode，所以本地
+也能验这条路径（把一个本地 HTTPS 目标指到 443 即可）。
+
+### 在 CI 里跑（`e2e.yml` 需要的配置）
+
+工作流本身由主会话维护（本文件只记录它需要什么）。脚本侧要求：
+
+| 项 | 值 |
+|---|---|
+| secrets | `PASSWORD`（→ `NETMASTER_E2E_PASSWORD`）、`CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`（第 7 项用；缺则该项 SKIP） |
+| variables | `NETMASTER_WORKER`（可选，worker 主机名）；也可用 `workflow_dispatch` 的 `worker` 输入覆盖 |
+| inputs | `worker`（留空取 variable）、`rounds`、`mode`（`live` / `local`） |
+| 运行命令 | `cd server && npm ci && node --import ./test/shims/register.mjs test/e2e.mjs` |
+
+`mode=local` 不需要任何 secret —— 它拉进程内 devserver 自检脚本逻辑本身，第 5-9 项
+如实 SKIP。**改完脚本先在 CI 里跑一次 local**，再跑 live，能省掉一轮"脚本自己坏了"
+和"部署坏了"的混淆。
+
+### 与 `acceptance.yml` 的分工
+
+| | 验什么 | 实现 | 覆盖 |
+|---|---|---|---|
+| `acceptance.yml` | **用户实际会走的路**：TLS/ECH → WS → Session DO → 出口 → 回程 | 真实 Go 客户端（`client/internal/outbound/live_test.go`） | 直连 200、20 并发、CF-hosted 成功率 |
+| `e2e.yml` | **协议层**：帧与状态码本身 | 本脚本（Node 自己实现协议 v2 客户端） | 鉴权/TS 窗口/流 ID/ATYP、禁连目标、多路复用、预算回收 |
+
+两者互补而非重复：Go 侧证明"能上网"，Node 侧证明"协议按 PRD 回话"。同一个 Worker
+可以被两个工作流同时验收（一个连上跑，另一个也连上跑，互不影响）。
 
 GitHub Actions 里（口令与 token 走 secrets）：
 
@@ -51,25 +86,26 @@ GitHub Actions 里（口令与 token 走 secrets）：
 - name: Protocol-level acceptance
   working-directory: server
   env:
-    NETMASTER_ENDPOINT: ${{ vars.NETMASTER_WORKER }}
-    NETMASTER_PASSWORD: ${{ secrets.PASSWORD }}
+    NETMASTER_E2E_WORKER: ${{ inputs.worker || vars.NETMASTER_WORKER }}
+    NETMASTER_E2E_PASSWORD: ${{ secrets.PASSWORD }}
     CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
   run: |
     npm ci
-    node test/e2e.mjs --rounds=20
+    node --import ./test/shims/register.mjs test/e2e.mjs --rounds=20
 ```
 
 ### 环境变量与开关
 
 | 名称 | 默认 | 说明 |
 |---|---|---|
-| `NETMASTER_ENDPOINT` / `--endpoint` | —（未给则本地模式） | 已部署 Worker 的 `wss://` 地址或裸主机名 |
-| `NETMASTER_PASSWORD` | — | **live 模式必需**，缺失直接退出码 2 |
+| `NETMASTER_E2E_WORKER` | — | **首选**。与 `acceptance.yml` 同名（两个 workflow 指同一个 Worker）。`wss://` 地址或裸主机名 |
+| `NETMASTER_E2E_PASSWORD` | — | **live 模式必需**，缺失直接退出码 2 |
+| `NETMASTER_ENDPOINT` / `NETMASTER_WORKER` | — | 旧名，仍兼容（优先级低于上面两个） |
 | `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` | — | 第 7 项读 KV 用；缺失则该项 SKIP |
 | `NETMASTER_KV_ID` | 自动按 `title=netmaster` 解析 | 钉死 KV namespace id（与 `deploy.yml` 同口径） |
-| `E2E_DIRECT_TARGET` / `--direct` | `example.com:80` | 第 3、4 项的明文 HTTP 目标，**必须是非 CF 托管**的（走 `connect()` 直连） |
-| `E2E_CF_TARGET` / `--cf` | `neverssl.com:80` | 第 5、6 项的 **CF 托管**明文 HTTP 目标（直连必被平台拒，只能走 ProxyIP 竞速） |
+| `E2E_DIRECT_TARGET` / `--direct` | `www.google.com:443` | 第 3、4 项的目标，**必须是非 CF 托管**的（走 `connect()` 直连） |
+| `E2E_CF_TARGET` / `--cf` | `www.cloudflare.com:443` | 第 5、6 项的 **CF 托管**目标（直连必被平台拒，只能走 ProxyIP 竞速） |
 | `E2E_CF_ROUNDS` / `--rounds` | `20` | 第 5 项的轮数 |
 | `E2E_CF_MIN_RATE` / `--minrate` | `99` | 成功率门槛（百分数） |
 | `E2E_MUX_STREAMS` / `--streams` | `100` | 第 4 项的并发流数 |
@@ -84,7 +120,7 @@ GitHub Actions 里（口令与 token 走 secrets）：
 
 - `0`：无 FAIL
 - `1`：至少一项 FAIL
-- `2`：配置错误（live 模式缺 `NETMASTER_PASSWORD`、`--mode` 非法）
+- `2`：配置错误（live 模式缺 `NETMASTER_E2E_PASSWORD`、`--mode` 非法）
 
 ## 验收项与 PRD 对应
 
@@ -100,12 +136,13 @@ GitHub Actions 里（口令与 token 走 secrets）：
 | 2.1 | 私网 `10.0.0.1:80` | `0x02` + 同 id 的 CLOSE 控制帧 | PRD §4.4、`exits.js` `PRIVATE_V4` |
 | 2.2 | TEST-NET-1 `192.0.2.1:80` | `0x02` + CLOSE | 同上（192.0.2.0/24 在保留网段清单里，所以是 0x02 而不是 0x03） |
 | 2.3 | 端口 25 | `0x02` + CLOSE | `exits.js` `isForbidden` 首条判定 |
-| 3.1 | 直连出口 `example.com:80` | 首帧开流 `0x00` → HTTP `200` + 非空 body | **M1「curl 经代理访问 HTTP 成功」**：整条链路 + Session DO + `connect()` 出站 |
-| 4.1 | 一条 WS 上并发 100 条流 | 100 条全 `0x00`，且 100 个请求各自拿到 HTTP 200 | **M2「单 WS 并发 ≥ 100 条流」** |
+| 3.1 | 直连出口（默认 `www.google.com:443`） | 首帧开流 `0x00` → TLS 握手 → HTTP `200` + 非空 body | **M1「经代理访问成功」**：整条链路 + Session DO + `connect()` 出站 |
+| 4.1 | 一条 WS 上并发 N 条流 | N 条全 `0x00`，且 N 个请求各自拿到 HTTP 200。local 默认 100；**live 自动压到 25**（见下） | **M2「单 WS 并发 ≥ 100 条流」** |
 | 5.1 | CF 托管目标 N 轮 | 成功率 ≥ 99%，打印百分比与失败原因分类 | **M3「ProxyIP 成功率 ≥ 99%」** |
 | 6.1 | 同一目标连 3 次（每次新连接） | 第 2/3 轮不再出现 `0x03`，并打印建流耗时 | M3「映射命中后建流更快 / 缓存复用」 |
 | 7.1 | KV `proxyip:top` | key 有值时能解析出 ≥1 条可用中继；**为空则 SKIP**（见下） | M5「评分写入 KV 且下一周期可读到」 |
 | 8.1 | 空闲存活 | 只走 WS 协议层 Ping 静置 5 分钟，连接未断、Pong 持续回来 | **M2「空闲 5 分钟会话存活」** |
+| 9.1 | 预算回收 | 连续开到 35 条流，会话在第 30 次连接后 `close(1000, "budget")`——**必须是优雅关闭** | 免费版 50 子请求/invocation 的续命机制（不是故障） |
 
 ## 判定口径与已知局限
 
@@ -143,3 +180,12 @@ GitHub Actions 里（口令与 token 走 secrets）：
    看，脚本如实说明而不伪造证据。
    要让第 7 项真正参与验收：给仓库配 `CLOUDFLARE_API_TOKEN`（需 KV 读权限）与
    `CLOUDFLARE_ACCOUNT_ID`，并手动 dispatch 一次 `refresh-relays`。
+10. **第 4 项在 live 模式会被压到 25 条流。** 真实 Worker 在第 30 次出站连接后
+    `close(1000, "budget")` 回收会话（见 9.1），所以"一条连接开 100 条流"在真实
+    部署上做不到 —— 这不是脚本的局限，是免费版子请求预算的直接后果。local 模式
+    用 devserver（无预算逻辑），仍按 M2 的 100 条跑满。要验证更多并发就开多条连接。
+11. **第 9 项只在 live 模式跑。** `devserver.mjs` 没有预算逻辑（它不模拟平台的
+    50 子请求上限），local 模式如实 SKIP。判据是**关闭码必须是 1000**：1006 表示
+    传输层突然断了，那才是故障。另一个细节是服务端在发 `STATUS_OK` **之前**就
+    close 了 ws，所以第 30 条流收不到响应帧 —— 脚本容忍这一点，不会把正常的预算
+    回收判成失败。

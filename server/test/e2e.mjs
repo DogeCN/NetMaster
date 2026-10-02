@@ -21,6 +21,8 @@
 
 import process from "node:process";
 import http from "node:http";
+import { Duplex } from "node:stream";
+import tls from "node:tls";
 import { WebSocket } from "ws";
 import { authCode } from "../src/crypto.js";
 import {
@@ -68,8 +70,17 @@ function normalizeEndpoint(raw) {
 
 // ---- 配置 ----
 
-const ENDPOINT_RAW = argOf("endpoint", process.env.NETMASTER_ENDPOINT || process.env.NETMASTER_WORKER || "");
-const PASSWORD = process.env.NETMASTER_PASSWORD || "";
+// 端点变量名：优先 acceptance.yml 用的那一组（NETMASTER_E2E_*），兼容旧的
+// NETMASTER_ENDPOINT / NETMASTER_WORKER —— 两个 workflow 指同一个 Worker，
+// 没必要逼谁改名。
+const ENDPOINT_RAW = argOf(
+  "endpoint",
+  process.env.NETMASTER_E2E_WORKER ||
+    process.env.NETMASTER_ENDPOINT ||
+    process.env.NETMASTER_WORKER ||
+    ""
+);
+const PASSWORD = process.env.NETMASTER_E2E_PASSWORD || process.env.NETMASTER_PASSWORD || "";
 const MODE = argOf("mode", process.env.E2E_MODE || "") || (ENDPOINT_RAW ? "live" : "local");
 const ONLY = argOf("only", process.env.E2E_ONLY || "")
   .split(",")
@@ -81,7 +92,7 @@ if (MODE !== "live" && MODE !== "local") {
   process.exit(2);
 }
 if (MODE === "live" && !PASSWORD) {
-  console.error("e2e: NETMASTER_PASSWORD is required in live mode (the Worker secret; never passed on the command line)");
+  console.error("e2e: NETMASTER_E2E_PASSWORD (or NETMASTER_PASSWORD) is required in live mode (the Worker secret; never passed on the command line)");
   process.exit(2);
 }
 
@@ -96,10 +107,13 @@ const cfg = {
   mode: MODE,
   endpoint: MODE === "live" ? normalizeEndpoint(ENDPOINT_RAW) : "",
   password: PASSWORD,
-  // 直连出口的目标：明文 HTTP 且非 CF 托管（走 connect() 直连路径）。
-  direct: splitTarget(argOf("direct", process.env.E2E_DIRECT_TARGET || "example.com:80")),
-  // CF 托管的明文 HTTP 目标：直连会被平台拒，只能走 ProxyIP 竞速。
-  cf: splitTarget(argOf("cf", process.env.E2E_CF_TARGET || "neverssl.com:80")),
+  // 直连出口的目标。端口一律 443：Workers 的 connect() **禁拨 80**（平台返回
+  // "consider using fetch"，m0 探针实测），所以验收目标只能是 443 + TLS。
+  // 非 CF 托管 → 走 connect() 直连路径（第 3 项验的就是这条）。
+  direct: splitTarget(argOf("direct", process.env.E2E_DIRECT_TARGET || "www.google.com:443")),
+  // CF 托管目标：直连会被平台拒（不能拨 CF 自己的 IP），只能走 ProxyIP 竞速。
+  // 443 + TLS：ClientHello 从 SNI 中继过去，这是真实用户会走的路径。
+  cf: splitTarget(argOf("cf", process.env.E2E_CF_TARGET || "www.cloudflare.com:443")),
   // 端口 25 的目标用固定域名而不是本地目标：devserver 在 denyLoopback=false 时对
   // 127.0.0.1 整条跳过禁连检查（那是测试专用开关），而生产是 exits.js 里
   // port===25 最先判 —— 用域名才能验到同一条路径。
@@ -186,6 +200,7 @@ class Mux {
       const rec = this.rec(be32(b, 5));
       rec.closed = true;
       rec.closeW.splice(0).forEach((w) => w(true));
+      for (const w of rec.closeSubs) w();
       return;
     }
     if (b.length >= 4) {
@@ -195,13 +210,19 @@ class Mux {
       // 响应体上限 256 KiB：验收只看状态码与非空 body，不必无限收。
       if (rec.bytes <= 256 * 1024) rec.chunks.push(Buffer.from(payload));
       else rec.truncated = true;
+      // TLS-over-stream 需要"来一个包就交一个包"：等 close 再一次性给，TLS
+      // 握手根本不会开始（它在等 ServerHello）。
+      //
+      // 这里是**订阅**不是"等待者"：不能像 statusW/closeW 那样 splice 掉，
+      // 否则只有第一个包进得了管道，握手之后的响应全被丢掉。
+      for (const w of rec.dataSubs) w(payload);
     }
   }
 
   rec(id) {
     let r = this.streams.get(id);
     if (!r) {
-      r = { id, status: null, closed: false, bytes: 0, chunks: [], truncated: false, statusW: [], closeW: [] };
+      r = { id, status: null, closed: false, bytes: 0, chunks: [], truncated: false, statusW: [], closeW: [], dataSubs: [], closeSubs: [] };
       this.streams.set(id, r);
     }
     return r;
@@ -332,8 +353,141 @@ class Mux {
   }
 }
 
+// streamDuplex 把一条 mux 流包装成 node:stream 的 Duplex。
+//
+// 存在的理由：验收目标只能是 443 + TLS（Workers 禁拨 80），而 TLS 握手需要
+// 双向流式读写 —— 现成的 httpGet 是"写一次请求、等到 close 收全"，用在这里
+// TLS 根本不会开始。有了 Duplex 就能直接喂给 tls.connect（它接受任意
+// stream.Duplex，不要求 net.Socket）。
+//
+// 背压与关闭语义：
+//   · write → 封成数据帧塞进 WS；
+//   · 收到数据帧 → push 给读侧；
+//   · 收到 CLOSE 控制帧 → push(null)（对端 EOF，读侧自然结束）；
+//   · destroy → 发 CLOSE 控制帧，让服务端回收这条流。
+function streamDuplex(mux, rec, { highWaterMark = 64 * 1024 } = {}) {
+  let ended = false;
+  const endRead = () => {
+    if (ended) return;
+    ended = true;
+    d.push(null);
+  };
+  const d = new Duplex({
+    highWaterMark,
+    read() {
+      // 数据由 onMessage 推过来（push 时已背压），这里不需要主动拉。
+    },
+    write(chunk, _enc, cb) {
+      try {
+        mux.sendData(rec.id, chunk);
+        cb();
+      } catch (e) {
+        cb(e);
+      }
+    },
+    final(cb) {
+      // 半关：TLS 的 close_notify 之后要能只读不写，所以这里只标记、不断流。
+      cb();
+    },
+    destroy(err, cb) {
+      try {
+        mux.sendClose(rec.id);
+      } catch {}
+      cb(err);
+    },
+  });
+  // 推数据：返回 false 表示读侧缓冲区满了，剩下的包等 _read 再来。
+  d._feed = (payload) => {
+    if (ended) return;
+    d.push(Buffer.from(payload));
+  };
+  rec.dataSubs.push((payload) => d._feed(payload));
+  // CLOSE 控制帧 = 对端 EOF：结束读侧，让下游（TLS/HTTP）自然收尾。
+  rec.closeSubs.push(() => endRead());
+  // 流已经在收到 Duplex 之前就关了（小响应很常见）：立刻补一次 EOF。
+  if (rec.closed) endRead();
+  return d;
+}
+
+// tlsOverStream 在一条已建立的 mux 流上做标准 TLS 握手（真实证书校验）。
+function tlsOverStream(mux, rec, serverName, timeoutMs = 20000) {
+  const socket = streamDuplex(mux, rec);
+  // RFC 6066：SNI 必须是域名，给 IP 会被忽略（Node 会打 DEP0123 警告），
+  // 而且真实客户端此时也不发 SNI —— 所以这里按 host 形态决定要不要带。
+  const isIP = /^(\d{1,3}\.){3}\d{1,3}$/.test(serverName) || serverName.includes(":");
+  const opts = { socket };
+  if (!isIP) opts.servername = serverName;
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`tls handshake timeout after ${timeoutMs}ms`)), timeoutMs);
+    const tlsConn = tls.connect(opts, () => {
+      clearTimeout(t);
+      resolve(tlsConn);
+    });
+    tlsConn.on("error", (e) => {
+      clearTimeout(t);
+      reject(e);
+    });
+  });
+}
+
+// httpsGetOverStream 在 TLS 连接上发一次 GET，返回状态码与 body 长度。
+// Connection: close 让目标关连接，服务端随即发 CLOSE 控制帧。
+async function httpsGetOverStream(tlsConn, host, path = "/", timeoutMs = 20000) {
+  const t0 = Date.now();
+  tlsConn.write(
+    `GET ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: netmaster-e2e\r\nAccept: */*\r\nConnection: close\r\n\r\n`,
+    "latin1"
+  );
+  const chunks = [];
+  let text = "";
+  // 独到 header 结束为止（或超时/对端关闭）：握手之后响应可能分几个 TLS 记录
+  // 才到齐，按"chunk 数"提前退出会把 body 之前的响应头丢掉。
+  const deadline = Date.now() + timeoutMs;
+  try {
+    for await (const c of tlsConn) {
+      chunks.push(Buffer.from(c));
+      text = Buffer.concat(chunks).toString("latin1");
+      if (text.includes("\r\n\r\n")) break;
+      if (Date.now() > deadline) break;
+    }
+  } catch {
+    // 目标关连接会抛 ERR_STREAM_PREMATURE_CLOSE，属于正常结束。
+  }
+  const i = text.indexOf("\r\n\r\n");
+  const head = i >= 0 ? text.slice(0, i) : text;
+  const body = i >= 0 ? text.slice(i + 4) : "";
+  const m = /^HTTP\/1\.[01] (\d{3})/.exec(head);
+  return {
+    code: m ? Number(m[1]) : 0,
+    bodyBytes: Buffer.byteLength(body, "latin1"),
+    headerEnd: i >= 0,
+    ms: Date.now() - t0,
+  };
+}
+
+// fetchOverStream 在一条流上取一次 HTTP 响应。
+//
+// 是否套 TLS 由**目标端口**决定而不是由 mode 决定：443 就意味着 TLS。这样
+// local 模式也能验这条路径（把 E2E_DIRECT_TARGET 指向一个本地 HTTPS 目标即可），
+// 不必等到 CI 才发现 TLS 那段根本没跑通过。
+async function fetchOverStream(mux, rec, target, path = "/", timeoutMs = 20000) {
+  if (target.port !== 443) {
+    return httpGet(mux, rec, target, path, timeoutMs);
+  }
+  const tlsConn = await tlsOverStream(mux, rec, target.host, timeoutMs + 5000);
+  try {
+    return await httpsGetOverStream(tlsConn, target.host, path, timeoutMs);
+  } finally {
+    try {
+      tlsConn.destroy();
+    } catch {}
+  }
+}
+
 // httpGet 在一条流上发一次 HTTP/1.1 GET 并收完整响应。Connection: close 让目标
 // 端关闭连接，服务端随即发 CLOSE 控制帧——WS 保序，所以 CLOSE 到达时 body 已收全。
+//
+// 只用于明文目标（local 的本地 HTTP 目标）；443 走 TLS，见 fetchOverStream。
 async function httpGet(mux, rec, target, path = "/", timeoutMs = 20000) {
   const req = `GET ${path} HTTP/1.1\r\nHost: ${target.host}\r\nUser-Agent: netmaster-e2e\r\nAccept: */*\r\nConnection: close\r\n\r\n`;
   const t0 = Date.now();
@@ -355,6 +509,71 @@ async function httpGet(mux, rec, target, path = "/", timeoutMs = 20000) {
 }
 
 const statusName = (s) => `0x0${s}`;
+
+// 真实 Worker 的会话预算：第 CONNECT_BUDGET 次出站连接后 close(1000, "budget")
+// 回收会话（session.js 的 connectCount >= 30，免费版 50 子请求/invocation 的产物）。
+// 客户端应把它当成"优雅关闭 + 重连"，而不是异常断开（code 1006 才是异常）。
+const CONNECT_BUDGET = 30;
+// live 模式多路复用的安全上限：留 5 条余量，别让 4.1 自己把预算打满。
+const BUDGET_SAFE_STREAMS = CONNECT_BUDGET - 5;
+
+// 9 预算回收语义（session.js 的 connectCount >= 30 → close(1000, "budget")）。
+//
+// 为什么单独验：这是"有意的续命机制"，但它长得很像故障 —— 客户端若是把它当
+// 异常断开（1006），重连与等待队列就不会按设计工作。要证明的是**观察到的关闭
+// 是优雅的**：code 1000、reason 带 budget，而不是传输层突然没了。
+//
+// 关键顺序细节：session.js 在**发 STATUS_OK 之前**就 close 了 ws，所以第 30 条
+// 流收不到响应帧。脚本必须容忍这一点 —— 否则会把正常的预算回收判成失败。
+async function item9() {
+  const label = `9.1 budget recycling: close(1000,"budget") after ${CONNECT_BUDGET} connects`;
+  if (cfg.mode !== "live") {
+    return step(label, async () =>
+      skip("local mode: devserver.mjs has no connect-budget logic (only the real Worker recycles sessions)")
+    );
+  }
+  await step(label, async () => {
+    const m = new Mux(cfg.endpoint, cfg.password);
+    await m.open();
+    let opened = 0;
+    let firstCloseAt = null;
+    // 连续开到超过预算为止；每次 dial 都可能因为 ws 已关而拿不到 STATUS。
+    const want = CONNECT_BUDGET + 5;
+    for (let i = 1; i <= want; i++) {
+      if (m.closeEvent) {
+        firstCloseAt = i;
+        break;
+      }
+      try {
+        const r = await m.dial(cfg.direct, { timeoutMs: cfg.streamTimeoutMs });
+        if (r.status === STATUS_OK) opened++;
+      } catch {
+        // 预算打满后 ws 关闭，dial 会超时 —— 这是预期现象，不算失败。
+        break;
+      }
+    }
+    if (!m.closeEvent) {
+      // 等到 close 出现；等不到就是"预算没生效"，那也是要报告的（可能阈值改了）。
+      await m.waitSocketClose(5000);
+    }
+    const ev = m.closeEvent;
+    if (!ev) {
+      await m.close();
+      return fail(`opened ${opened} streams but the session was never recycled (no close event)`);
+    }
+    note(`opened ${opened} stream(s) before close; close arrived at request #${firstCloseAt ?? opened + 1}`);
+    note(`close: code=${ev.code} reason=${JSON.stringify(ev.reason)}`);
+    const graceful = ev.code === 1000;
+    const flagged = /budget/i.test(ev.reason);
+    await m.close();
+    if (!graceful) {
+      return fail(`closed with code ${ev.code} — want 1000 (graceful). 1006 would mean an abnormal transport-level break`);
+    }
+    return flagged
+      ? pass(`graceful close(1000, "budget") after ${opened} successful connects — client can reconnect for a fresh budget`)
+      : pass(`graceful close(1000) but reason is ${JSON.stringify(ev.reason)} (expected "budget") — recycling works, reason string may have changed`);
+  });
+}
 
 // ---- 本地模式：进程内 devserver + 本地 HTTP 目标 ----
 
@@ -534,6 +753,10 @@ async function item2() {
 }
 
 // 3 直连出口成功：证明整条链路 + Session DO + connect() 出站都活着（M1）。
+//
+// live 模式走 443 + TLS（Workers 禁拨 80）；local 模式目标是本地明文 HTTP，
+// 没有 TLS 可用，所以按 mode 分支 —— 但两条分支验的是同一件事："流能开、
+// 目标有 HTTP 响应、body 非空"。
 async function item3() {
   await step("3.1 direct exit: stream 0x00 + HTTP 200 + body", async () => {
     const m = new Mux(cfg.endpoint, cfg.password);
@@ -543,20 +766,37 @@ async function item3() {
       await m.close();
       return fail(`status ${statusName(r.status)}, want 0x00 (direct connect to ${cfg.direct.host}:${cfg.direct.port} failed)`);
     }
-    const resp = await httpGet(m, r.rec, cfg.direct, "/", 20000);
+
+    let resp;
+    try {
+      resp = await fetchOverStream(m, r.rec, cfg.direct, "/", 20000);
+    } catch (e) {
+      await m.close();
+      return fail(`stream opened but the request over it failed: ${e.message}`);
+    }
     await m.close();
-    if (!resp.headerEnd) return fail(`no HTTP status line in ${resp.bytes === 0 ? 0 : r.rec.bytes} bytes (stream open took ${r.ms}ms)`);
+
+    if (!resp.headerEnd) return fail(`no HTTP status line in ${r.rec.bytes} bytes (stream open took ${r.ms}ms)`);
     const ok = resp.code === 200 && resp.bodyBytes > 0;
+    const via = `${cfg.direct.host}:${cfg.direct.port}${cfg.direct.port === 443 ? " over TLS" : ""}`;
     return ok
-      ? pass(`HTTP ${resp.code}, body ${resp.bodyBytes}B, open ${r.ms}ms, request ${resp.ms}ms via ${cfg.direct.host}:${cfg.direct.port}`)
-      : fail(`HTTP ${resp.code}, body ${resp.bodyBytes}B (want 200 with a non-empty body)${resp.closed ? "" : ", response never completed"}`);
+      ? pass(`HTTP ${resp.code}, body ${resp.bodyBytes}B, open ${r.ms}ms, request ${resp.ms}ms via ${via}`)
+      : fail(`HTTP ${resp.code}, body ${resp.bodyBytes}B (want 200 with a non-empty body)`);
   });
 }
 
-// 4 多路复用：一条 WS 上并发开 ≥100 条流（M2 的量化项）。
+// 4 多路复用：一条 WS 上并发开 N 条流（M2 的量化项）。
+//
+// live 模式把 N 压到 BUDGET_SAFE_STREAMS 以下：真实 Worker 在第 30 次出站连接后
+// 会 close(1000, "budget") 回收会话（见 9.1），所以"一条连接开 100 条流"在真实
+// 部署上根本做不到 —— 这不是脚本的局限，是免费版子请求预算的直接后果。
+// local 用 devserver（没有预算逻辑），可以照 M2 的 100 条跑满。
 async function item4() {
-  const n = cfg.streams;
+  const n = cfg.mode === "live" ? Math.min(cfg.streams, BUDGET_SAFE_STREAMS) : cfg.streams;
   await step(`4.1 mux: ${n} concurrent streams on one ws, each completing a request`, async () => {
+    if (cfg.mode === "live" && n < cfg.streams) {
+      note(`live: capped ${cfg.streams} -> ${n} (session recycles at ${CONNECT_BUDGET} connects, see 9.1)`);
+    }
     const m = new Mux(cfg.endpoint, cfg.password);
     await m.open();
     // 首帧先建一条流完成认证，之后 n-1 条开帧一次性全部发出去——这才是"并发"
@@ -586,8 +826,9 @@ async function item4() {
       await m.close();
       return fail(`only ${opened}/${n} streams got 0x00 (${opened} < ${n})`);
     }
-    // 每条流各自完成一次请求。
-    const results = await Promise.all(ids.map((id) => httpGet(m, m.rec(id), cfg.direct, "/", 30000)));
+    // 每条流各自完成一次请求。443 目标会各自做一次 TLS 握手 —— 并发握手是
+    // 真实用户会走的路径，慢一点也值得验。
+    const results = await Promise.all(ids.map((id) => fetchOverStream(m, m.rec(id), cfg.direct, "/", 30000).catch((e) => ({ code: 0, bodyBytes: 0, headerEnd: false, ms: 0, error: e.message }))));
     const good = results.filter((x) => x.code === 200 && x.bodyBytes > 0).length;
     const worst = Math.max(...results.map((x) => x.ms));
     await m.close();
@@ -631,14 +872,14 @@ async function item5() {
       }
       let resp;
       try {
-        resp = await httpGet(m, r.rec, cfg.cf, "/", 20000);
+        resp = await fetchOverStream(m, r.rec, cfg.cf, "/", 20000);
       } catch (e) {
-        bump(`request failed: ${e.message}`);
+        bump(`tunnel died before/at the request: ${e.message}`);
         continue;
       }
       lat.push(r.ms);
       if (!resp.headerEnd) {
-        bump(`no HTTP response (${resp.closed ? "closed early" : "timeout"})`);
+        bump(`no HTTP response (${resp.code === 0 ? "nothing came back" : "incomplete headers"})`);
         continue;
       }
       if (resp.code === 200 || (resp.code >= 200 && resp.code < 400)) ok++;
@@ -681,7 +922,7 @@ async function item6() {
       let row = { round: i, status: null, error: null, openMs: Date.now() - t0, http: null, totalMs: Date.now() - t0 };
       try {
         const r = await m.dial(cfg.cf, { timeoutMs: cfg.streamTimeoutMs });
-        const resp = r.status === STATUS_OK ? await httpGet(m, r.rec, cfg.cf, "/", 20000) : null;
+        const resp = r.status === STATUS_OK ? await fetchOverStream(m, r.rec, cfg.cf, "/", 20000) : null;
         row = {
           round: i,
           status: r.status,
@@ -816,6 +1057,7 @@ try {
   await item6();
   await item7();
   await item8();
+  await item9();
 } finally {
   if (local) {
     local.dev.close();
