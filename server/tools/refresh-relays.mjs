@@ -34,7 +34,7 @@ export const SOURCE_URLS = ["https://ipdb.api.030101.xyz/?type=bestproxy"];
 
 // 探测目标固定为一个轻量 HTTP 端点：中继按 CONNECT 隧道转发到这里，能握手成功就
 // 说明这条隧道真的能载数据（单纯 TCP connect 成功不代表中继可用，很多 accept 后 RST）。
-export const PROBE_TARGET = { host: "cp.cloudflare.com", port: 80 };
+export const PROBE_TARGET = { host: "www.cloudflare.com", port: 443 };
 export const PROBE_TIMEOUT_MS = 3000;
 export const PROBE_CONCURRENCY = 8;
 
@@ -122,39 +122,39 @@ export function filterSelf(pool, workerHost) {
 
 // ---- 探测 ----
 
-// probeRelay 对单个候选做 TCP 连接测试，限时 timeoutMs。
+// probeRelay 对单个候选做真实 TLS 握手探测（servername = 探测目标域名），
+// 限时 timeoutMs。返回 { host, port, ok, ms, error }。
 //
-// 公共中继（CMLiussss/IPDB）是 SNI 路由型：只认客户端 TLS ClientHello，对
-// HTTP CONNECT 回 400（worker 侧实测）。因此"能建立 TCP 连接"就是这套中继
-// 语义下的存活判据 —— 与 worker 里 dialRelay(sni) 的拨号动作严格一致；更强的
-// 端到端验证要真发一次 TLS 握手，留给竞速本身。返回 { host, port, ok, ms, error }。
+// 为什么必须真握手：SNI 型中继里有"真 SNI 路由"和"盲转发"两种。盲转发会把
+// ClientHello 送进 CF 边缘但换掉/丢失 SNI，CF 回一张不含任何名字的兜底证书 ——
+// TCP 能建、握手必炸（worker 侧实测，用这种中继 CF-hosted 成功率 0%）。只有
+// 证书校验通过，才能证明这条中继端到端可用。CMLiussss 域名型是真 SNI 路由
+// （worker 实测 20/20），ipdb 的部分裸 IP 是盲转发。
+import tls from "node:tls";
+
 export function probeRelay(relay, { timeoutMs = PROBE_TIMEOUT_MS, target = PROBE_TARGET } = {}) {
-  void target; // 保留参数位：自建 http-connect 型中继如需 CONNECT 探测在此扩展
   const t0 = Date.now();
   return new Promise((resolve) => {
-    let sock = null;
     let settled = false;
     const finish = (ok, error) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
       try {
         sock?.destroy();
       } catch {}
       resolve({ host: relay.host, port: relay.port, ok, ms: Date.now() - t0, error: error || null });
     };
     const timer = setTimeout(() => finish(false, "timeout"), timeoutMs);
+    let sock;
     try {
-      sock = net.connect({ host: relay.host, port: relay.port });
+      // tls.connect 默认校验证书：目标域名的证书对不上就 rejected —— 正是要的判据
+      sock = tls.connect({ host: relay.host, port: relay.port, servername: target.host });
     } catch (e) {
       finish(false, String(e.message || e));
       return;
     }
-    sock.once("error", (e) => finish(false, e.code || String(e.message)));
-    // close 不一定是失败：SNI 中继 accept 后等 ClientHello，我们探完主动断。
-    // connect 事件先到时已按成功结算，这里的 close 只在没成功时兜底判负。
-    sock.once("close", () => finish(false, "closed"));
-    sock.once("connect", () => finish(true, null));
+    sock.once("error", (e) => finish(false, String(e.message || e.code)));
+    sock.once("secureConnect", () => finish(true, null));
   });
 }
 

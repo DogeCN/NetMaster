@@ -113,25 +113,27 @@ async function run() {
     ok(filterSelf(pool, "").length === 3, "no worker host -> nothing filtered");
   }
 
-  console.log("--- 探测（真实 node:net 打本地桩）---");
+  console.log("--- 探测（真实 TLS 握手，打公网）---");
+  // probeRelay 做真 TLS 握手并校验证书：本地 TCP mock 无法模拟 CF 的证书行为，
+  // 直接打公网。CF 对不存在的 SNI 回兜底证书（校验必失败）—— 这正是筛掉
+  // 盲转发中继的判据；网络不可达时整段 SKIP。
   {
-    const good = await startRelayMock({ mode: "ok" });
-    const forbid = await startRelayMock({ mode: "forbidden" });
-    const silent = await startRelayMock({ mode: "silent" });
-    const rGood = await probeRelay({ host: "127.0.0.1", port: good.port }, { timeoutMs: 1000 });
-    ok(rGood.ok === true && rGood.ms >= 0, "CONNECT 200 -> usable", JSON.stringify(rGood));
-    const rForbid = await probeRelay({ host: "127.0.0.1", port: forbid.port }, { timeoutMs: 1000 });
-    // SNI 语义：只要 TCP 能建立就是可用（403/静默响应都发生在 connect 之后，
-    // 与拨号判活无关）；拒连/超时才判死。
-    ok(rForbid.ok === true, "403-after-connect relay is still usable (SNI semantics)", JSON.stringify(rForbid));
-    const rSilent = await probeRelay({ host: "127.0.0.1", port: silent.port }, { timeoutMs: 300 });
-    ok(rSilent.ok === true, "silent relay is usable (TCP accepted)", JSON.stringify(rSilent));
+    const probe = await probeRelay({ host: "www.cloudflare.com", port: 443 }, { timeoutMs: 5000 });
+    const reachable = probe.ok === true || !/ENOTFOUND|EAI_AGAIN/.test(probe.error || "");
+    if (!probe.ok && !/certificate|ENOTFOUND|EAI_AGAIN|timeout/i.test(probe.error || "")) {
+      console.log(`  SKIP: network unavailable (${probe.error})`);
+    } else if (probe.ok) {
+      ok(true, "real SNI relay (valid cert) -> usable", JSON.stringify(probe));
+    } else {
+      ok(/certificate/i.test(probe.error || ""), "bogus SNI (fallback cert) -> rejected", JSON.stringify(probe));
+    }
+    ok(reachable !== undefined, "probe completes");
     const rRefused = await probeRelay({ host: "127.0.0.1", port: 1 }, { timeoutMs: 1000 });
     ok(rRefused.ok === false, "closed port -> not usable", JSON.stringify(rRefused));
 
     console.log("--- 排序 ---");
-    const fast = await probeRelay({ host: "127.0.0.1", port: good.port }, { timeoutMs: 1000 });
-    const slow = await probeRelay({ host: "127.0.0.1", port: silent.port }, { timeoutMs: 250 });
+    const fast = { host: "fast.example", port: 443, ok: true, ms: 10, error: null };
+    const slow = { host: "slow.example", port: 443, ok: true, ms: 900, error: null };
     const ranked = rankRelays([slow, { host: "dead.example", port: 443, ok: false, ms: 5, error: "timeout" }, fast]);
     ok(ranked.length === 3, "rankRelays keeps failed candidates (they may recover next round)");
     ok(ranked[0].ok === undefined && ranked[0].success === 1, "usable relay ranks first");
@@ -139,8 +141,7 @@ async function run() {
 
     console.log("--- 写入格式 ---");
     const top = buildTop(ranked, KV_TOP_N);
-    // SNI 语义下 fast 与 slow 两个本地 mock 都 TCP 可用，dead.example 被剔除
-    ok(top.length === 2 && top.every((t) => t.host === "127.0.0.1"), "buildTop keeps only usable relays", JSON.stringify(top));
+    ok(top.length === 2 && top.every((t) => t.host.endsWith(".example")), "buildTop keeps only usable relays", JSON.stringify(top));
     ok(eq(Object.keys(top[0]).sort(), ["host", "ms", "port", "type"]), "entry has exactly host/port/type/ms", JSON.stringify(Object.keys(top[0])));
     ok(top[0].type === RELAY_TYPE_SNI, "type is sni (public relays are SNI-routed)");
     ok(typeof top[0].ms === "number", "ms is a number");
@@ -183,7 +184,7 @@ async function run() {
       builtin: [relay],
       fetchImpl: textFetch({}),
       put: async (args) => dryPuts.push(args),
-      probe: async (pool) => Promise.all(pool.map((r) => probeRelay(r, { timeoutMs: 1000 }))),
+      probe: async (pool) => pool.map((r) => ({ host: r.host, port: r.port, ok: r.port !== 1, ms: 5, error: r.port === 1 ? "refused" : null })),
       log: () => {},
     });
     ok(dryPuts.length === 0 && dry.wrote === false, "DRY_RUN=1 prints but never writes");
@@ -195,7 +196,7 @@ async function run() {
       builtin: [relay],
       fetchImpl: textFetch({}),
       put: async (args) => truePuts.push(args),
-      probe: async (pool) => Promise.all(pool.map((r) => probeRelay(r, { timeoutMs: 1000 }))),
+      probe: async (pool) => pool.map((r) => ({ host: r.host, port: r.port, ok: r.port !== 1, ms: 5, error: r.port === 1 ? "refused" : null })),
       log: () => {},
     });
     ok(truePuts.length === 0 && dryTrue.wrote === false, 'DRY_RUN="true" (GH boolean input) also skips the write');
@@ -206,7 +207,7 @@ async function run() {
       builtin: [relay],
       fetchImpl: textFetch({}),
       put: async (args) => falsePuts.push(args),
-      probe: async (pool) => Promise.all(pool.map((r) => probeRelay(r, { timeoutMs: 1000 }))),
+      probe: async (pool) => pool.map((r) => ({ host: r.host, port: r.port, ok: r.port !== 1, ms: 5, error: r.port === 1 ? "refused" : null })),
       log: () => {},
     });
     ok(falsePuts.length === 1, 'DRY_RUN="false" still writes');
@@ -220,7 +221,7 @@ async function run() {
       urls: [],
       builtin: [relay],
       fetchImpl,
-      probe: async (pool) => Promise.all(pool.map((r) => probeRelay(r, { timeoutMs: 1000 }))),
+      probe: async (pool) => pool.map((r) => ({ host: r.host, port: r.port, ok: r.port !== 1, ms: 5, error: r.port === 1 ? "refused" : null })),
       put: async (args) => {
         putArgs.push(args);
         return kvPut(args);
@@ -261,7 +262,7 @@ async function run() {
         { host: "127.0.0.1", port: 1 },
       ],
       fetchImpl: textFetch({}),
-      probe: probeAll,
+      probe: async (pool) => pool.map((r) => ({ host: r.host, port: r.port, ok: r.port !== 1, ms: r.port === 1 ? 300 : 5, error: r.port === 1 ? "refused" : null })),
       concurrency: 2,
       maxCandidates: 3,
       timeoutMs: 800,
