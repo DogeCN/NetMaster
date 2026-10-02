@@ -22,12 +22,12 @@ export function routerShardId(hash) {
 }
 
 const CREATE_ROUTES_SQL =
-  "CREATE TABLE IF NOT EXISTS routes (target_hash TEXT PRIMARY KEY, egress_type TEXT, egress_id TEXT, updated_at INTEGER)";
+  "CREATE TABLE IF NOT EXISTS routes_v2 (target_hash TEXT PRIMARY KEY, egress_type TEXT, egress_id TEXT, updated_at INTEGER)";
 const UPSERT_ROUTE_SQL =
-  "INSERT INTO routes (target_hash, egress_type, egress_id, updated_at) VALUES (?, ?, ?, ?) " +
+  "INSERT INTO routes_v2 (target_hash, egress_type, egress_id, updated_at) VALUES (?, ?, ?, ?) " +
   "ON CONFLICT(target_hash) DO UPDATE SET egress_type = excluded.egress_type, egress_id = excluded.egress_id, updated_at = excluded.updated_at";
-const SELECT_ROUTE_SQL = "SELECT egress_type, egress_id, updated_at FROM routes WHERE target_hash = ?";
-const DELETE_ROUTE_SQL = "DELETE FROM routes WHERE target_hash = ?";
+const SELECT_ROUTE_SQL = "SELECT egress_type, egress_id, updated_at FROM routes_v2 WHERE target_hash = ?";
+const DELETE_ROUTE_SQL = "DELETE FROM routes_v2 WHERE target_hash = ?";
 
 // target_hash = 目标域名（小写）SHA-256 前 16 字节十六进制。
 // 只存哈希不存域名：路由表是缓存，不是访问日志，没必要留可还原的目标名。

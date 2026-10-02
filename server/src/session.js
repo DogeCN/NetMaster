@@ -229,7 +229,11 @@ class SessionDO {
       const r = await dialRelay(hit, host, port);
       if (!r.error) {
         this.rememberEgress(hash, hit);
-        this.learn(hash, hit.type || RELAY_TYPE_SNI, `${hit.host}:${hit.port}`);
+        // http-connect 的 CONNECT 2xx 是端到端验证，可以learn；SNI 型的 TCP
+        // 成功不构成验证（盲转发也能连），其健康由 GH 探测写进 KV，不进 Router。
+        if (hit.type === RELAY_TYPE_HTTP_CONNECT) {
+          this.learn(hash, hit.type, `${hit.host}:${hit.port}`);
+        }
         return { socket: r.socket, hash, relay: hit };
       }
       this.log(`router relay ${hit.host}:${hit.port} failed: ${r.error}`);
@@ -245,7 +249,9 @@ class SessionDO {
     }
     const relay = parseRelay(race.relay);
     this.rememberEgress(hash, relay);
-    this.learn(hash, race.type || RELAY_TYPE_SNI, race.relay);
+    if ((race.type || RELAY_TYPE_SNI) === RELAY_TYPE_HTTP_CONNECT) {
+      this.learn(hash, RELAY_TYPE_HTTP_CONNECT, race.relay);
+    }
     return { socket: race.socket, hash, relay };
   }
 
