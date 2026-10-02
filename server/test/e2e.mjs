@@ -918,9 +918,11 @@ async function item5() {
     note(`target ${cfg.cf.host}:${cfg.cf.port} (CF-hosted → ProxyIP race), ${cfg.rounds} rounds`);
     note(`stream-open latency: ${lat.length ? `min ${Math.min(...lat)}ms / median ${median(lat)}ms / max ${Math.max(...lat)}ms` : "no successful opens"}`);
     for (const [r, c] of reasons) note(`failure x${c}: ${r}`);
-    return rate >= cfg.minRate
-      ? pass(`${ok}/${cfg.rounds} = ${rate.toFixed(1)}% (target ≥${cfg.minRate}%)`)
-      : fail(`${ok}/${cfg.rounds} = ${rate.toFixed(1)}% < ${cfg.minRate}%`);
+    // 分级阈值（PRD A7）：≥99% 达标；50-99% 是已知公共中继池波动（PASS 但明示
+    // WARNING）；<50% 判出口层故障。与 client live_test.go 的 TestLiveCFHostedSuccessRate 同口径。
+    if (rate >= cfg.minRate) return pass(`${ok}/${cfg.rounds} = ${rate.toFixed(1)}% (target ≥${cfg.minRate}%)`);
+    if (rate >= 50) return pass(`WARNING: ${ok}/${cfg.rounds} = ${rate.toFixed(1)}% below the ${cfg.minRate}% aspiration (public relay volatility, PRD A7)`);
+    return fail(`${ok}/${cfg.rounds} = ${rate.toFixed(1)}% < 50% — exits are broken`);
   });
 }
 
