@@ -5,6 +5,7 @@ package outbound
 // 本地跑会被 Skip —— 它要连真实边缘，不是单元测试。
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -47,6 +48,19 @@ func requireLive(t *testing.T) (string, bool) {
 
 // httpOverStream 通过一条逻辑流发一次 HTTP GET 并返回状态码。
 // 目标若是明文 HTTP，隧道里就是裸 HTTP；这是验证链路最直接的方式。
+// tlsOverStream 在一条已建立的隧道流上做标准 TLS 握手（真实证书校验）。
+// Workers 的 connect() 禁拨 80 端口（平台返回 "consider using fetch"，m0 探针
+// 实测），所以所有验收目标一律走 443。
+func tlsOverStream(conn net.Conn, serverName string) (net.Conn, error) {
+	_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
+	tlsConn := tls.Client(conn, &tls.Config{ServerName: serverName})
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, err
+	}
+	_ = tlsConn.SetDeadline(time.Time{})
+	return tlsConn, nil
+}
+
 func httpOverStream(conn net.Conn, host, path string) (int, string, error) {
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: netmaster-acceptance\r\n\r\n", path, host)
 	if _, err := conn.Write([]byte(req)); err != nil {
@@ -76,8 +90,9 @@ func TestLiveDirectExitAndMux(t *testing.T) {
 	m := liveClient(t, worker)
 	defer m.Close()
 
-	// 目标选明文 HTTP 且非 CF 托管：验证 connect() 直连路径（不消耗 ProxyIP 槽位）。
-	const target = "example.com:80"
+	// 目标非 CF 托管：验证 connect() 直连路径（不消耗 ProxyIP 槽位）。
+	// 80 端口被平台禁拨（m0 探针实测），一律走 443 + TLS。
+	const target = "example.com:443"
 
 	t.Run("single stream", func(t *testing.T) {
 		conn, err := m.Open(target)
@@ -85,7 +100,12 @@ func TestLiveDirectExitAndMux(t *testing.T) {
 			t.Fatalf("open %s: %v", target, err)
 		}
 		defer conn.Close()
-		code, body, err := httpOverStream(conn, "example.com", "/")
+		tlsConn, err := tlsOverStream(conn, "example.com")
+		if err != nil {
+			t.Fatalf("tls handshake: %v", err)
+		}
+		defer tlsConn.Close()
+		code, body, err := httpOverStream(tlsConn, "example.com", "/")
 		if err != nil {
 			t.Fatalf("request: %v", err)
 		}
@@ -141,9 +161,9 @@ func TestLiveCFHostedSuccessRate(t *testing.T) {
 		fmt.Sscanf(v, "%d", &rounds)
 	}
 
-	// 明文 HTTP 的 CF 托管目标：可以判状态码而不被 TLS 干扰。
-	// （HTTPS 目标要额外做 TLS 握手，见下方 tlsOverStream。）
-	const target = "neverssl.com:80"
+	// CF 托管目标 + 443 + TLS：直连 CF 网段必被平台拒，这一项验证的就是
+	// ProxyIP 竞速路径的端到端成功率。
+	const target = "www.cloudflare.com:443"
 
 	m := liveClient(t, worker)
 	defer m.Close()
