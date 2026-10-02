@@ -35,7 +35,9 @@ export const SOURCE_URLS = ["https://ipdb.api.030101.xyz/?type=bestproxy"];
 // 探测目标固定为一个轻量 HTTP 端点：中继按 CONNECT 隧道转发到这里，能握手成功就
 // 说明这条隧道真的能载数据（单纯 TCP connect 成功不代表中继可用，很多 accept 后 RST）。
 export const PROBE_TARGET = { host: "www.cloudflare.com", port: 443 };
-export const PROBE_TIMEOUT_MS = 3000;
+// TLS 握手探测的时限：慢中继（尤其跨洋域名型）握手要 2-3s，太短会把好中继
+// 误判成死（worker 实测 CMLiussss 从 GH runner 连接就要 2.4s）。
+export const PROBE_TIMEOUT_MS = 6000;
 export const PROBE_CONCURRENCY = 8;
 
 // KV 契约：键名与 race.js 的 KV_RELAY_KEY 一致，取前 4 条（race.js 读前 RACE_KV_TOP 条）。
