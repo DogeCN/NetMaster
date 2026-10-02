@@ -11,10 +11,10 @@
 // 出口类型名：写进 Router DO 的 egress_type，KV 条目带同一字段（PRD §7.4）。
 
 import { connect } from './socket.js';
-import { resolve4 as dohResolve4 } from './exits.js';
+import { resolve4 } from './exits.js';
 
 // resolver 可注入：测试里把 DoH 换成恒等解析，避免单测打真实网络。
-let resolve4Impl = dohResolve4;
+let resolve4Impl = resolve4;
 export function setResolver(fn) {
   resolve4Impl = fn;
 }
