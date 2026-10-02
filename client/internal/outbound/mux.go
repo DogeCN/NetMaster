@@ -341,6 +341,9 @@ func (s *MuxStream) remoteClose() {
 }
 
 func (s *MuxStream) markDead(cause error) {
+	// dead 必须置位：Read 的循环条件依赖它。只 broadcast 不置位的话，
+	// Wait 醒来发现 rbuf 仍空、dead 仍 false，会继续睡回去 —— 整个流挂死。
+	s.dead.Store(true)
 	s.setErr(cause)
 	s.rcond.Broadcast()
 	s.mux.remove(s.id)

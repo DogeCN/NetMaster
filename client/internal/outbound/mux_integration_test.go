@@ -326,3 +326,38 @@ func TestProtoE2EReconnectAfterKill(t *testing.T) {
 		t.Fatalf("echo mismatch after reconnect: %q", buf)
 	}
 }
+
+// TestProtoE2EStreamUnblockedOnWSKill 服务端整条 WS 死亡时，正阻塞在 Read 的流
+// 必须立刻带错误返回 —— markDead 丢了 dead 置位会让 Read 永久挂死（回归测试）。
+func TestProtoE2EStreamUnblockedOnWSKill(t *testing.T) {
+	dev := startDev(t)
+	echo := echoServer(t)
+
+	m, err := DialMuxPlain(dev.url, devPassword)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	conn, err := m.Open(echo)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 16)
+		conn.SetReadDeadline(time.Time{}) // 明确去掉 deadline：只靠 WS 死亡唤醒
+		_, err := conn.Read(buf)
+		done <- err
+	}()
+	time.Sleep(300 * time.Millisecond) // 让 Read 先沉下去
+	m.Close()                          // 整条 WS 死亡
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Read returned nil after ws kill, want error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Read still blocked 5s after ws kill — dead flag lost?")
+	}
+}
