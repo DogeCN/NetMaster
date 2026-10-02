@@ -47,7 +47,7 @@ jobs:
         # 发布也是绿的。
         run: |
           set -o pipefail
-          for t in crypto protocol integration proxyip race router cron; do
+          for t in crypto protocol integration proxyip race router; do
             printf '%-12s ' "$t"
             node "test/$t.mjs" | tail -1
           done

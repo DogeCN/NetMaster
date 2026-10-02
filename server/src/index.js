@@ -10,7 +10,8 @@
 //   DEBUG     '1' 打开结构化日志（wrangler tail 查看）。
 //   SESSION   Session DO 绑定。
 //   ROUTER    Router DO 绑定（目标 → 出口映射）。缺席时出口层降级为纯直连。
-//   KV        Cron 健康结果（proxyip:top）。缺席时竞速只用内置兜底列表。
+//   KV        出口健康排名（proxyip:top，由 GitHub Actions 的 refresh-relays
+//             定时任务写入）。缺席或为空时竞速只用内置兜底列表。
 
 export default {
   async fetch(request, env) {

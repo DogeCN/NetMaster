@@ -40,5 +40,3 @@ new_sqlite_classes = ["RouterDO"]
 binding = "KV"
 id = "00000000000000000000000000000000"
 
-[triggers]
-crons = ["*/10 * * * *"]

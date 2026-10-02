@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const srcDir = join(here, 'src');
 
-const order = ['socket.js', 'crypto.js', 'protocol.js', 'exits.js', 'proxyip.js', 'race.js', 'router.js', 'cron.js', 'session.js', 'index.js'];
+const order = ['socket.js', 'crypto.js', 'protocol.js', 'exits.js', 'proxyip.js', 'race.js', 'router.js', 'session.js', 'index.js'];
 
 const platformImports = new Set();
 
