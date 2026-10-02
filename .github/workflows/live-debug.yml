@@ -46,6 +46,19 @@ jobs:
           sed -i "s/^id = \"00000000000000000000000000000000\"/id = \"$KV\"/" wrangler.toml
           npx wrangler deploy --var DEBUG:1
 
+      # m0 探针从同一运行时直接测 connect()：example.com:80（本次失败目标）、
+      # 8.8.8.8:443（m0 时代的对照组）。
+      - name: Edge connect() probe via m0
+        run: |
+          BASE="https://netmaster-m0.edge-tunnel.workers.dev"
+          T="${{ secrets.PROBE_TOKEN }}"
+          for hostport in "example.com:80" "8.8.8.8:443" "1.0.0.1:80"; do
+            host="${hostport%:*}"; port="${hostport##*:}"
+            echo "== connect $host:$port =="
+            curl -sS --max-time 20 "$BASE/w/connect?host=$host&port=$port&t=$T" || echo "(probe failed)"
+            echo
+          done
+
       - name: Tail while driving live traffic
         working-directory: client
         env:
@@ -57,7 +70,7 @@ jobs:
           sleep 8
           NETMASTER_E2E_WORKER=netmaster.edge-tunnel.workers.dev \
             go test ./internal/outbound/ -run TestLiveDirectExitAndMux -v -count=1 -timeout 120s || true
-          sleep 3
+          sleep 20
           pkill -f "wrangler tail" || true
           echo "===== tail log ====="
           sed 's/\x1b\[[0-9;]*m//g' /tmp/tail.log | tail -60
