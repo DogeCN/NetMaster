@@ -7,6 +7,15 @@ name: acceptance
 # 不部署、不改 Worker：只消费已部署的 netmaster.edge-tunnel.workers.dev。
 
 on:
+  # push 触发器只为让 GitHub 注册这个工作流（默认分支之外的 workflow_dispatch-only
+  # 文件不会被注册，gh workflow run 会 404），顺带让协议/出口改动自动跑一遍验收。
+  push:
+    branches: [v2]
+    paths:
+      - ".github/workflows/acceptance.yml"
+      - "server/src/**"
+      - "client/internal/outbound/**"
+      - "client/internal/selector/**"
   workflow_dispatch:
     inputs:
       worker:
