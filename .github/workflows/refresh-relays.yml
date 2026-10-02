@@ -9,6 +9,8 @@
 # 注意：GitHub 的 schedule 是"每小时左右"而不是准点（官方说明有几分钟级延迟，
 # 高峰期可能更久）；仓库连续 60 天无活动时定时任务会被自动停用。
 
+name: refresh-relays
+
 on:
   schedule:
     - cron: "0 * * * *"
