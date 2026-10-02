@@ -123,6 +123,7 @@ export async function startRace(ctx = {}, target = {}, routerLookup) {
   return new Promise((resolve) => {
     let settled = false;
     let live = candidates.length;
+    const slotErrors = new Array(candidates.length).fill("pending");
     const timers = [];
     let globalTimer = null;
     const finish = (r) => {
@@ -133,7 +134,10 @@ export async function startRace(ctx = {}, target = {}, routerLookup) {
       resolve(r);
     };
     const allFailed = () => {
-      if (!settled && live === 0) finish({ error: "all proxyip exits failed" });
+      if (!settled && live === 0) {
+        const reasons = slotErrors.map((e, i) => `${candidates[i] ? candidates[i].host : "?"}: ${e}`).join("; ");
+        finish({ error: `all ${candidates.length} proxyip exits failed: ${reasons}` });
+      }
     };
     globalTimer = setTimeout(() => finish({ error: `race timeout ${cfg.globalMs}ms` }), cfg.globalMs);
     candidates.forEach((cand, i) => {
@@ -143,6 +147,7 @@ export async function startRace(ctx = {}, target = {}, routerLookup) {
             .then((r) => {
               live--;
               if (r.error) {
+                slotErrors[i] = r.error;
                 log(`race slot ${i} ${cand.host}:${cand.port} failed: ${r.error}`);
                 allFailed();
                 return;
