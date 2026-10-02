@@ -34,10 +34,12 @@ jobs:
 
       # build.mjs is the real syntax gate: it concatenates src/ into _worker.js and
       # a stray character anywhere in src/ fails here rather than in production.
+      # _worker.js 带 cloudflare:* 平台 import，只能做语法检查（Node 加载不了平台模块，
+      # 那是 Workers 运行时的东西）。
       - name: Build worker bundle
         run: |
           node build.mjs
-          node -e "import('./_worker.js').then(()=>console.log('bundle loads OK'))"
+          node --check _worker.js
 
       - name: Unit tests
         run: |
