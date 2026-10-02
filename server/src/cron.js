@@ -12,6 +12,7 @@
 import { parseRelay, RELAY_TYPE_HTTP_CONNECT } from './proxyip.js';
 import { KV_RELAY_KEY, RACE_KV_TOP } from './race.js';
 
+
 export const CRON_KEY_CURSOR = "cron:cursor";
 export const CRON_KEY_PENDING = "cron:pending"; // 本轮累计的探测结果（未排序）
 export const CRON_KEY_LAST = "cron:lastRun";

@@ -6,6 +6,8 @@
 // 密文——CONNECT 隧道正是为此设计，我们不碰明文。
 //
 // 出口类型名：写进 Router DO 的 egress_type，KV 条目预留同一字段（PRD §7.4）。
+
+
 export const RELAY_TYPE_HTTP_CONNECT = "http-connect";
 
 // 中继语义就是反代 CF 的 443，因此只收 443 的条目（与 v0.1 的解析一致）。

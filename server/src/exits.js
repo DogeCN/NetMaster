@@ -4,6 +4,7 @@
 
 import { parseIPv6, ATYP_IPV4, ATYP_IPV6, ATYP_DOMAIN } from './protocol.js';
 
+
 // ---- 网段匹配 ----
 
 // v4 地址 → uint32。
