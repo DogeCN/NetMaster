@@ -20,7 +20,8 @@ class_name = "SessionDO"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["SessionDO"]
+# 免费版必须用 new_sqlite_classes（new_classes 是旧版 SQLite 迁移，免费计划不接受）
+new_sqlite_classes = ["SessionDO"]
 
 # Router DO：全局单实例（分片接口 idFromName("router:<shard>") 已在代码里预留），
 # 存 目标 → 出口路径 的映射，SQLite + Alarm 异步批量 flush。
