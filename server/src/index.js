@@ -23,11 +23,23 @@ export default {
     return env.SESSION.get(id).fetch(request);
   },
 
-  // Cron 触发器（PRD §9，每小时刷新 KV 健康结果）在 M5 实现。这里只挂住处理器，
-  // 免得 wrangler.toml 里的 triggers 指向一个不存在的 handler。
-  async scheduled(event, env) {
-    if (String(env.DEBUG || "") === "1") {
-      console.log(`[cron] fired at ${event?.scheduledTime ?? "?"} (M5 placeholder)`);
+  // Cron（PRD §9）：每小时刷新 KV 里的出口健康排名。分批探测 + last-good-wins，
+  // 细节见 cron.js。workerHost 用于剔除回指自身的 ProxyIP。
+  async scheduled(event, env, ctx) {
+    if (!env.KV) {
+      console.log("[cron] skipped: KV binding missing");
+      return;
+    }
+    let workerHost = "";
+    try {
+      workerHost = new URL(event?.request?.url || "https://workers.dev/").hostname;
+    } catch {}
+    try {
+      const stats = await runCron(env, ctx, workerHost);
+      console.log(`[cron] ${JSON.stringify(stats)}`);
+    } catch (e) {
+      // Cron 失败不重试：下一轮自然会重来，保留上一轮 KV 结果。
+      console.error(`[cron] failed: ${e.message || e}`);
     }
   },
 };
