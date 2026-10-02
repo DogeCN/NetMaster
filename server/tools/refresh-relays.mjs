@@ -122,14 +122,18 @@ export function filterSelf(pool, workerHost) {
 
 // ---- 探测 ----
 
-// probeRelay 对单个候选做 TCP 连接 + HTTP CONNECT 握手，限时 timeoutMs（覆盖
-// 连接与握手两段，和 cron.js 的语义一致）。返回 { host, port, ok, ms, error }。
+// probeRelay 对单个候选做 TCP 连接测试，限时 timeoutMs。
+//
+// 公共中继（CMLiussss/IPDB）是 SNI 路由型：只认客户端 TLS ClientHello，对
+// HTTP CONNECT 回 400（worker 侧实测）。因此"能建立 TCP 连接"就是这套中继
+// 语义下的存活判据 —— 与 worker 里 dialRelay(sni) 的拨号动作严格一致；更强的
+// 端到端验证要真发一次 TLS 握手，留给竞速本身。返回 { host, port, ok, ms, error }。
 export function probeRelay(relay, { timeoutMs = PROBE_TIMEOUT_MS, target = PROBE_TARGET } = {}) {
+  void target; // 保留参数位：自建 http-connect 型中继如需 CONNECT 探测在此扩展
   const t0 = Date.now();
   return new Promise((resolve) => {
     let sock = null;
     let settled = false;
-    let buf = "";
     const finish = (ok, error) => {
       if (settled) return;
       settled = true;
@@ -147,21 +151,10 @@ export function probeRelay(relay, { timeoutMs = PROBE_TIMEOUT_MS, target = PROBE
       return;
     }
     sock.once("error", (e) => finish(false, e.code || String(e.message)));
-    sock.once("close", () => finish(false, "closed before CONNECT response"));
-    sock.once("connect", () => {
-      sock.write(`CONNECT ${target.host}:${target.port} HTTP/1.1\r\nHost: ${target.host}:${target.port}\r\n\r\n`);
-    });
-    sock.on("data", (chunk) => {
-      buf += chunk.toString("latin1");
-      const i = buf.indexOf("\r\n\r\n");
-      if (i < 0) {
-        if (buf.length > 8192) finish(false, "CONNECT response too large");
-        return;
-      }
-      const status = Number(buf.slice(0, i).split(" ")[1]);
-      if (Number.isFinite(status) && status >= 200 && status <= 299) finish(true, null);
-      else finish(false, `CONNECT status ${Number.isFinite(status) ? status : "?"}`);
-    });
+    // close 不一定是失败：SNI 中继 accept 后等 ClientHello，我们探完主动断。
+    // connect 事件先到时已按成功结算，这里的 close 只在没成功时兜底判负。
+    sock.once("close", () => finish(false, "closed"));
+    sock.once("connect", () => finish(true, null));
   });
 }
 

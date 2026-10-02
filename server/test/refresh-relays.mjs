@@ -121,9 +121,11 @@ async function run() {
     const rGood = await probeRelay({ host: "127.0.0.1", port: good.port }, { timeoutMs: 1000 });
     ok(rGood.ok === true && rGood.ms >= 0, "CONNECT 200 -> usable", JSON.stringify(rGood));
     const rForbid = await probeRelay({ host: "127.0.0.1", port: forbid.port }, { timeoutMs: 1000 });
-    ok(rForbid.ok === false && /status 403/.test(rForbid.error), "CONNECT 403 -> rejected with the status in the reason", JSON.stringify(rForbid));
+    // SNI 语义：只要 TCP 能建立就是可用（403/静默响应都发生在 connect 之后，
+    // 与拨号判活无关）；拒连/超时才判死。
+    ok(rForbid.ok === true, "403-after-connect relay is still usable (SNI semantics)", JSON.stringify(rForbid));
     const rSilent = await probeRelay({ host: "127.0.0.1", port: silent.port }, { timeoutMs: 300 });
-    ok(rSilent.ok === false && rSilent.error === "timeout", "silent relay -> timeout", JSON.stringify(rSilent));
+    ok(rSilent.ok === true, "silent relay is usable (TCP accepted)", JSON.stringify(rSilent));
     const rRefused = await probeRelay({ host: "127.0.0.1", port: 1 }, { timeoutMs: 1000 });
     ok(rRefused.ok === false, "closed port -> not usable", JSON.stringify(rRefused));
 
@@ -137,7 +139,8 @@ async function run() {
 
     console.log("--- 写入格式 ---");
     const top = buildTop(ranked, KV_TOP_N);
-    ok(top.length === 1 && top[0].host === "127.0.0.1", "buildTop keeps only usable relays", JSON.stringify(top));
+    // SNI 语义下 fast 与 slow 两个本地 mock 都 TCP 可用，dead.example 被剔除
+    ok(top.length === 2 && top.every((t) => t.host === "127.0.0.1"), "buildTop keeps only usable relays", JSON.stringify(top));
     ok(eq(Object.keys(top[0]).sort(), ["host", "ms", "port", "type"]), "entry has exactly host/port/type/ms", JSON.stringify(Object.keys(top[0])));
     ok(top[0].type === RELAY_TYPE_SNI, "type is sni (public relays are SNI-routed)");
     ok(typeof top[0].ms === "number", "ms is a number");
