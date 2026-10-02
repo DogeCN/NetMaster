@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/md5"
 	"flag"
 	"fmt"
 	"io"
@@ -22,7 +21,7 @@ import (
 	"netmaster/internal/config"
 	"netmaster/internal/entry"
 	"netmaster/internal/geoip"
-	"netmaster/internal/nodepool"
+	"netmaster/internal/selector"
 	"netmaster/internal/procwait"
 	"netmaster/internal/proxy"
 	"netmaster/internal/route"
@@ -77,8 +76,9 @@ func fatal(msg string) {
 	os.Exit(1)
 }
 
-// requireConn 在缺少 server/password 时给出可操作的报错，返回派生好的鉴权字节。
-func requireConn(serverFlag, passwordFlag string) (string, [16]byte) {
+// requireConn 在缺少 server/password 时给出可操作的报错。
+// v2 鉴权用原始口令在首帧做 HMAC-SHA256（见 internal/proto），口令不出网络。
+func requireConn(serverFlag, passwordFlag string) (string, string) {
 	server := normalizeServer(serverFlag)
 	if server == "" {
 		fatal("no server: pass --server or set it in config.json / NETMASTER_SERVER")
@@ -86,7 +86,7 @@ func requireConn(serverFlag, passwordFlag string) (string, [16]byte) {
 	if passwordFlag == "" {
 		fatal("no password: pass --password or set it in config.json / NETMASTER_PASSWORD")
 	}
-	return server, md5.Sum([]byte(passwordFlag))
+	return server, passwordFlag
 }
 
 // resolveEntries 组装入口候选：服务端域名解析（永远可用）+ 社区优选源
@@ -157,15 +157,12 @@ func cmdNodes(args []string) {
 	target := fs.String("target", "https://www.google.com/", "probe target through proxy")
 	ipcheck := fs.String("ipcheck", "", "if set, fire requests to this URL and print observed egress IPs")
 	fs.Parse(args)
-	host, auth := requireConn(*server, *password)
+	host, pw := requireConn(*server, *password)
 
 	logger := log.New(os.Stdout, "", log.Ltime)
 	nodes, src := resolveEntries(context.Background(), host)
 	logger.Printf("entries: %d (community: %s)", len(nodes), src)
-	// 诊断命令不落盘学到的状态（StateKey 为空）：观察不该污染 serve 的亲和表。
-	pool := nodepool.New(nodepool.Config{Nodes: nodes, SNI: host, Auth: auth[:]})
-	logger.Println("probing entry latency...")
-	pool.SortByLatency()
+	pool := selector.New(selector.Config{Nodes: nodes, SNI: host, Password: pw, UseECH: true, Insecure: true})
 
 	router, err2 := route.LoadDefault(route.Proxy)
 	if err2 != nil {
@@ -215,14 +212,15 @@ func cmdNodes(args []string) {
 	}
 
 	for {
-		if resp, err := client.Get(*target); err == nil {
+		resp, err := client.Get(*target)
+		if err != nil {
+			logger.Printf("request failed: %v", err)
+		} else {
 			io.Copy(io.Discard, resp.Body) //nolint:errcheck
 			resp.Body.Close()
+			logger.Printf("ok %s", resp.Status)
 		}
-		for _, l := range pool.Stats() {
-			logger.Println(l)
-		}
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -244,7 +242,7 @@ func cmdServe(args []string) {
 	manual := fs.Bool("manual", cfg.Manual, "don't take over the system proxy, just print listen addrs (config.json: manual)")
 	rulesFile := fs.String("rules", cfg.Rules, "custom rules file (config.json: rules)")
 	fs.Parse(args)
-	host, auth := requireConn(*server, *password)
+	host, pw := requireConn(*server, *password)
 
 	logger := log.New(os.Stdout, "", log.Ltime)
 	if cfgPath != "" {
@@ -255,14 +253,12 @@ func cmdServe(args []string) {
 	nodes, src := resolveEntries(context.Background(), host)
 	logger.Printf("entries: %d (community: %s)", len(nodes), src)
 
-	pool := nodepool.New(nodepool.Config{
-		Nodes:              nodes,
-		SNI:                host,
-		Auth:               auth[:],
-		UseECH:             true,
-		Insecure:           true,
-		StateKey:           host,
-		LatencyToleranceMs: cfg.LatencyToleranceMs,
+	pool := selector.New(selector.Config{
+		Nodes:    nodes,
+		SNI:      host,
+		Password: pw,
+		UseECH:   true,
+		Insecure: true,
 	})
 	pool.SetDialTimeout(15 * time.Second)
 
@@ -277,30 +273,6 @@ func cmdServe(args []string) {
 		}
 		logger.Printf("[geoip] CN ranges ready: %d (%s)", size, from)
 	})
-
-	// 先用上次的探测结果预置各节点延迟估计与主节点：启动后第一个请求就走对
-	// 节点，不必等本轮探测跑完。
-	if results, ok := nodepool.LoadProbeCache(nodes, nodepool.ProbeCacheTTL); ok {
-		if n := pool.ApplyProbeCache(results); n > 0 {
-			logger.Printf("[probe] preloaded %d/%d entry latencies from cache", n, len(nodes))
-		}
-	}
-
-	// 探测节点延迟。改在后台跑：几十个节点同步探测要数秒，而这段时间代理还
-	// 没起来。延迟估计的收益（首个请求走快节点）也不必在启动前就拿到 ——
-	// 缓存命中时已经预置过，没有缓存时后台探测跑完前用默认顺序即可。
-	// 候选总量被 maxEntries 截住，所以这里无条件全量探测。
-	{
-		handle := func(results []nodepool.ProbeResult) {
-			logger.Printf("[probe] %s", nodepool.Summary(results))
-			if err := nodepool.SaveProbeCache(nodes, results); err != nil {
-				logger.Printf("[probe] WARN save cache: %v", err)
-			}
-		}
-		logger.Println("probing entry latency in background...")
-		done := pool.ProbeAsync()
-		go func() { handle(<-done) }()
-	}
 
 	// 2. 路由
 	var router *route.Router

@@ -21,3 +21,23 @@ class_name = "SessionDO"
 [[migrations]]
 tag = "v1"
 new_classes = ["SessionDO"]
+
+# Router DO：全局单实例（分片接口 idFromName("router:<shard>") 已在代码里预留），
+# 存 目标 → 出口路径 的映射，SQLite + Alarm 异步批量 flush。
+[[durable_objects.bindings]]
+name = "ROUTER"
+class_name = "RouterDO"
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["RouterDO"]
+
+# KV：Cron 每小时写的 ProxyIP 健康结果（key: proxyip:top），last-good-wins。
+# id 是占位符——真实 namespace id 由 deploy 工作流从 CF API 解析后注入，
+# 直接 `wrangler deploy` 本文件会因 id 非法失败（这是有意的：别拿占位符上线）。
+[[kv_namespaces]]
+binding = "KV"
+id = "00000000000000000000000000000000"
+
+[triggers]
+crons = ["0 * * * *"]

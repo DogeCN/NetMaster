@@ -24,6 +24,8 @@ export function startDevserver(opts = {}) {
   const state = {
     password, denyLoopback, connectTimeoutMs, bufferLimit,
     authed: false,
+    authPending: false,
+    pendingFrames: [],
     ws: null,
     streams: new Map(),
     closedIds: new Set(),
@@ -114,6 +116,13 @@ export function startDevserver(opts = {}) {
     const data = new Uint8Array(message);
     if (process.env.DBG) console.log('  srv<-', Buffer.from(data).toString('hex').slice(0, 32), 'authed:', state.authed);
     if (!state.authed) {
+      // 与 session.js 同理：HMAC 是 async，占位必须同步做；认证期间到达的开帧
+      // 排队等结果（客户端发首帧后立刻并发开流是常态）。
+      if (state.authPending) {
+        state.pendingFrames.push(data);
+        return;
+      }
+      state.authPending = true;
       const f = parseFirstFrame(data);
       if (!f || !validStreamId(f.streamId) || !tsWithinWindow(f.ts, Math.floor(Date.now() / 1000))) {
         if (f) send(ws, encodeResponse(f.streamId, STATUS_BAD));
@@ -127,9 +136,21 @@ export function startDevserver(opts = {}) {
         return;
       }
       state.authed = true;
+      state.authPending = false;
       await openStream(f.streamId, f.host, f.port);
+      const queued = state.pendingFrames;
+      state.pendingFrames = [];
+      for (const q of queued) {
+        if (!state.authed) return; // 认证失败/连接已关
+        await handleFrame(ws, q);
+      }
       return;
     }
+    return handleFrame(ws, data);
+  }
+
+  // handleFrame 处理已认证连接上的帧：控制帧 / 数据帧 / 开帧。
+  async function handleFrame(ws, data) {
     if (data.length < 4) return;
     if (isControl(data)) {
       const id = parseCloseControl(data);
@@ -179,6 +200,8 @@ export function startDevserver(opts = {}) {
     state.closedIds.clear();
     state.ws = ws;
     state.authed = false;
+    state.authPending = false;
+    state.pendingFrames = [];
     ws.on("message", (msg, isBinary) => {
       if (!isBinary) { ws.close(1003, ""); return; }
       handleMessage(ws, msg).catch(() => ws.close(1011, ""));
@@ -207,4 +230,17 @@ export function startDevserver(opts = {}) {
       });
     });
   });
+}
+
+// CLI 入口：node test/devserver.mjs [port] [password] [denyLoopback]
+// 专供 Go 集成测试拉起；首行输出 PORT=<实际端口>。
+import process from "node:process";
+if (process.argv[1] && process.argv[1].endsWith("devserver.mjs")) {
+  const port = Number(process.argv[2] || 0);
+  const password = process.argv[3] || "devserver-password";
+  const denyLoopback = process.argv[4] !== "0";
+  const srv = await startDevserver({ password, denyLoopback, connectTimeoutMs: 3000 });
+  console.log(`PORT=${srv.port}`);
+  process.on("SIGTERM", () => { srv.close(); process.exit(0); });
+  // 生命周期由父进程管理（测试用 exec.Kill 收尾）；交互启动用 Ctrl+C。
 }

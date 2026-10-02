@@ -17,15 +17,15 @@ import (
 	"netmaster/internal/tlsutil"
 )
 
-// Client 是连到 NetMaster Worker 的出口客户端：自有协议（见 server/src/protocol.js）
-// over WebSocket over TLS，mux 复用（mux.go）。
+// Client 是连到 NetMaster Worker 的出口客户端：协议 v2（见 internal/proto 与
+// server/src/protocol.js）over WebSocket over TLS，mux 复用（mux.go）。
 //
-// 一条传输连接的建立顺序：TCP+TLS(ECH) → WS 升级 → 发送 16 字节 auth
-// （md5(PASSWORD)，鉴权在连接级一次完成，会话级不再有任何凭据）。
+// 一条传输连接的建立顺序：TCP+TLS(ECH) → WS 升级 → 首帧（AUTH+TS+首个流开帧，
+// 认证在连接级一次完成，后续流零鉴权开销）。
 type Client struct {
 	Node     entry.Node
 	SNI      string // WS 升级与 TLS SNI 用的名字 = 服务端域名
-	Auth     []byte // 16 字节，md5(utf8(PASSWORD))
+	Password string // 首帧 HMAC-SHA256 的密钥，不出网络
 	UseECH   bool
 	Insecure bool
 }
@@ -112,10 +112,8 @@ func (c *Client) dialECH() (net.Conn, error) {
 	return nil, errors.New(strings.Join(errs, "; "))
 }
 
-// DialWS 建立到节点的 TLS+WS 传输并完成鉴权握手。
-//
-// mux 路径与探测共用这一步：先把昂贵的 TCP+TLS(ECH)+WS 握手做完，mux 会话
-// 在其上复用；探测只关心传输建立的耗时。
+// DialWS 建立到节点的 TLS+WS 传输。认证与首个流由 mux 的第一次 Open 一起完成
+// （首帧 = AUTH|TS|STREAM_ID|ADDR，连接级一次认证）。
 func (c *Client) DialWS() (*WSConn, error) {
 	tlsConn, err := c.dialTLS()
 	if err != nil {
@@ -142,34 +140,7 @@ func (c *Client) DialWS() (*WSConn, error) {
 		tlsConn.Close()
 		return nil, err
 	}
-	// 鉴权握手：16 字节 auth，一条独立消息。失败立即断，不留在半打开状态。
-	if err := ws.WriteMessage(websocket.BinaryMessage, c.Auth); err != nil {
-		ws.Close()
-		return nil, fmt.Errorf("send auth: %w", err)
-	}
 	return &WSConn{ws: ws}, nil
-}
-
-// sessionOpen 构造会话开帧 payload：[port u16 BE][addrType][addr]。
-// 与 server/src/protocol.js 的 parseSessionOpen 一一对应。
-func sessionOpen(host string, port uint16) []byte {
-	buf := make([]byte, 3, 3+len(host)+1)
-	buf[0] = byte(port >> 8)
-	buf[1] = byte(port)
-	if ip := net.ParseIP(host); ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			buf[2] = 1 // ADDR_IPV4
-			buf = append(buf, ip4...)
-		} else {
-			buf[2] = 3 // ADDR_IPV6
-			buf = append(buf, ip.To16()...)
-		}
-	} else {
-		buf[2] = 2 // ADDR_DOMAIN
-		buf = append(buf, byte(len(host)))
-		buf = append(buf, host...)
-	}
-	return buf
 }
 
 // WSConn 把 websocket 连接包装成 net.Conn（mux 帧以 binary 消息承载）。

@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const srcDir = join(here, 'src');
 
-const order = ['crypto.js', 'protocol.js', 'exits.js', 'session.js', 'index.js'];
+const order = ['crypto.js', 'protocol.js', 'exits.js', 'proxyip.js', 'race.js', 'router.js', 'session.js', 'index.js'];
 
 const platformImports = new Set();
 
@@ -43,7 +43,7 @@ out += `\n// ===== entry =====\n`;
 for (const imp of platformImports) out += imp + '\n';
 out += `export default __default;\n`;
 // Durable Object classes must be exported from the worker module.
-out += `export { SessionDO };\n`;
+out += `export { SessionDO, RouterDO };\n`;
 
 writeFileSync(join(here, '_worker.js'), out, 'utf8');
 console.log(`built _worker.js (${out.length} bytes) from ${order.length} modules`);

@@ -23,3 +23,9 @@ m0/node_modules/
 m0/.probe-token
 m0/drive-results.json
 m0/drive-output.txt
+
+# 协作会话工作区
+.assist/
+
+# 工具产物
+.zcodeignore

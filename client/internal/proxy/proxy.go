@@ -14,9 +14,18 @@ import (
 	"sync"
 	"time"
 
-	"netmaster/internal/nodepool"
 	"netmaster/internal/route"
 )
+
+// Exiter 是出口选择器需要提供的最小能力面：分流决策（DialAuto 的 direct 返回值）、
+// 代理建连与"直连被阻断后改走代理"。selector.Pool 实现；测试可注入替身。
+type Exiter interface {
+	Len() int
+	DialAuto(host string) (net.Conn, bool, error)
+	Dial(host string) (net.Conn, error)
+	RetryProxy(host string) (net.Conn, error)
+	NoteProxyFailure(host string)
+}
 
 // Config 代理服务配置。
 type Config struct {
@@ -26,8 +35,8 @@ type Config struct {
 	SocksAddr string
 	// Router 分流决策
 	Router *route.Router
-	// Pool 海外出口节点池
-	Pool *nodepool.Pool
+	// Pool 出口选择器（直连/代理决策与建连）。
+	Pool Exiter
 	// DirectFallback 路由未覆盖或节点池为空时是否直连（默认 true）
 	DirectFallback bool
 	// RetryViaProxy 在"尝试性直连"被判定阻断后改用代理重连（见 relayWithReplay）。

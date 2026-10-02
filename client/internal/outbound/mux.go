@@ -1,452 +1,425 @@
 package outbound
 
 import (
-	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"netmaster/internal/proto"
 )
 
-// sleepMicro 短暂自旋等待（WS readLoop 在别处跑，这里只是等 buffer 填充）。
-func sleepMicro(us int) { time.Sleep(time.Duration(us) * time.Microsecond) }
-
-// sessionReadyTimeout 是等待服务端确认会话建立的上限。
-// 必须大于服务端自身的出站连接超时（15s），否则会把"慢"误判成"没确认"。
-const sessionReadyTimeout = 20 * time.Second
-
-// parsePort 从 host:port 解析端口。
-func parsePort(hostport string) (uint16, error) {
-	_, ps, err := net.SplitHostPort(hostport)
-	if err != nil {
-		return 0, err
-	}
-	n, err := strconv.ParseUint(ps, 10, 16)
-	if err != nil {
-		return 0, err
-	}
-	return uint16(n), nil
-}
-
-// MuxConn 是一条复用的 WS 连接，上面可以并发跑多个会话。
-// 协议（与 server/src/protocol.js 对应）：
-//   - 连接级：WS 建立后第一条消息是 16 字节 auth（DialWS/DialMuxPlain 已发送）
-//   - 会话开帧：mux 帧，payload = [port][addrType][addr]
-//   - 之后每帧：[1 字节 idLen][sessionId][payload]
+// MuxConn 是一条协议 v2 的复用 WebSocket 连接（PRD §4）。
+//
+// 帧分发：客户端→服务端的方向上，"未知流上的帧 = 开帧"（客户端在收到该流的
+// STATUS 0x00 之前不发数据，见 protocol.js 头注释）；服务端→客户端方向上，
+// 等待响应的流上第一帧是响应帧（5 字节），已就绪的流上全是数据帧。
+// 控制帧以 0x00000000 前缀独立成类。
 type MuxConn struct {
-	ws *websocket.Conn
+	ws       *websocket.Conn
+	password string
 
-	mu        sync.Mutex
-	sessions  map[string]*MuxSession
-	nextID    uint32
-	closed    bool
-	lastError string // 服务端最近一次回传的错误（控制帧）
+	mu      sync.Mutex
+	streams map[uint32]*MuxStream
+	nextID  uint32
+	closed  bool
 
-	readOnce sync.Once
+	// 首帧必须先于任何开帧抵达服务端：服务端把"未认证时到达的第一帧"当首帧解析，
+	// 一条开帧抢在首帧前面会被判成 HMAC 错误并断开整条连接。写路径统一走
+	// writeOrdered，由它保证首帧只发一次且最先发。
+	writeMu    sync.Mutex
+	firstSent bool
+
+	alive atomic.Bool
+	// ping/pong 判死（PRD §4.6）：30s 一发，连续 2 个周期没 Pong 判死。
+	lastPong atomic.Int64
+	pingOnce sync.Once
 }
 
-// MuxSession 是 MuxConn 上的一个逻辑会话，对上层表现为 net.Conn。
-type MuxSession struct {
-	mux       *MuxConn
-	id        []byte
-	key       string
-	rbuf      []byte
-	rmu       sync.Mutex
-	wmu       sync.Mutex
-	dead      bool
-	err       string      // 服务端投递的失败原因（若有），优先于 EOF 暴露
-	timer     *time.Timer // 会话级 deadline（不作用于共享 WS）
-	cond      *sync.Cond  // 有新数据或会话结束时唤醒 Read
-	ready     chan error  // 缓冲1：nil=服务端确认就绪，非nil=失败原因
-	readyOnce sync.Once
-}
+// streamReadyTimeout 是等待服务端响应帧的上限。
+// 必须大于服务端自身的出站连接超时（15s），否则会把"慢"误判成"没确认"。
+const streamReadyTimeout = 20 * time.Second
 
-// signalReady 通知 Open 该会话已在服务端建立。
-func (s *MuxSession) signalReady() {
-	s.readyOnce.Do(func() { s.ready <- nil })
-}
+var (
+	errMuxClosed = errors.New("mux: connection closed")
+	muxConnSeq   atomic.Uint32
+	muxDebug     bool
+)
 
-// signalErr 通知 Open 该会话建立失败。
-func (s *MuxSession) signalErr(msg string) {
-	s.readyOnce.Do(func() { s.ready <- fmt.Errorf("mux session: %s", msg) })
-}
-
-func (s *MuxSession) setErr(msg string) {
-	s.rmu.Lock()
-	s.err = msg
-	s.rmu.Unlock()
-}
-
-var muxConnCounter atomic.Uint32
-
-// DialMux 建立一条复用的 WS 传输连接（DialWS 内已完成 TLS+WS+auth）。
-func DialMux(c *Client) (*MuxConn, error) {
-	wc, err := c.DialWS()
-	if err != nil {
-		return nil, err
-	}
-	return newMuxConn(wc.Raw()), nil
-}
-
-// DialMuxPlain 建立明文 WS 的 mux 连接并发送 auth（仅用于本地/测试对端，
-// 不加密、不隐 SNI）。
-func DialMuxPlain(wsURL string, auth []byte) (*MuxConn, error) {
-	d := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
-	ws, _, err := d.Dial(wsURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	if err := ws.WriteMessage(websocket.BinaryMessage, auth); err != nil {
-		ws.Close()
-		return nil, fmt.Errorf("send auth: %w", err)
-	}
-	return newMuxConn(ws), nil
-}
-
-func newMuxConn(ws *websocket.Conn) *MuxConn {
-	m := &MuxConn{ws: ws, sessions: make(map[string]*MuxSession)}
-	m.nextID = muxConnCounter.Add(1)
-	go m.readLoop()
-	return m
-}
-
-// readLoop 统一读取 WS，所有会话按 sessionId 分发。
-func (m *MuxConn) readLoop() {
-	for {
-		_, data, err := m.ws.ReadMessage()
-		if err != nil {
-			m.logf("readLoop error: %v", err)
-			m.closeAll(err)
-			return
-		}
-		m.dispatch(data)
-	}
-}
-
-// logf 调试日志（默认静默）。
-var muxDebug bool
-
+// logf 调试日志（默认静默；muxDebug 由测试或 -tags 打开）。
 func (m *MuxConn) logf(format string, args ...interface{}) {
 	if muxDebug {
 		println(fmt.Sprintf("[mux] "+format, args...))
 	}
 }
 
-func (s *MuxSession) logf(format string, args ...interface{}) {
-	s.mux.logf(format, args...)
+// DialMux 建立 TLS+WS 传输并返回 mux 连接。首帧（含认证）由第一次 Open 发出。
+func DialMux(c *Client) (*MuxConn, error) {
+	wc, err := c.DialWS()
+	if err != nil {
+		return nil, err
+	}
+	return NewMuxConn(wc.Raw(), c.Password), nil
 }
 
-func (m *MuxConn) dispatch(data []byte) {
-	if len(data) < 1 {
-		return
+// DialMuxPlain 建立明文 WS 的 mux 连接（本地/测试对端，不加密不隐 SNI）。
+func DialMuxPlain(wsURL, password string) (*MuxConn, error) {
+	d := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	ws, _, err := d.Dial(wsURL, nil)
+	if err != nil {
+		return nil, err
 	}
-	idLen := int(data[0])
-	// idLen == 0 是控制帧：[0x00][sidLen][sessionId][utf-8 错误文本]。
-	// 会话帧的 id 恒为 4 字节且首字节非 0，故 0x00 可作标记。
-	if idLen == 0 {
-		m.handleControl(data)
-		return
-	}
-	if len(data) < 1+idLen {
-		return
-	}
-	key := string(data[1 : 1+idLen])
-	payload := data[1+idLen:]
-
-	m.mu.Lock()
-	s := m.sessions[key]
-	m.mu.Unlock()
-	if s == nil {
-		return
-	}
-	s.deliver(payload)
+	return NewMuxConn(ws, password), nil
 }
 
-func (m *MuxConn) closeAll(err error) {
+// NewMuxConn 包装一条已升级的 WS 连接。
+func NewMuxConn(ws *websocket.Conn, password string) *MuxConn {
+	m := &MuxConn{
+		ws:       ws,
+		password: password,
+		streams:  make(map[uint32]*MuxStream),
+		// 各连接错开起始 ID，降低多连接场景下 ID 撞车的心智负担（0 与
+		// 0xFFFFFFFF 由 allocID 跳过）。
+		nextID: muxConnSeq.Add(1),
+	}
+	m.alive.Store(true)
+	m.lastPong.Store(time.Now().UnixNano())
+	ws.SetPongHandler(func(string) error {
+		m.lastPong.Store(time.Now().UnixNano())
+		return nil
+	})
+	go m.readLoop()
+	m.pingOnce.Do(func() { go m.pingLoop() })
+	return m
+}
+
+func (m *MuxConn) Alive() bool { return m.alive.Load() }
+
+// LiveCount 返回当前活跃流数（诊断用）。
+func (m *MuxConn) LiveCount() int {
 	m.mu.Lock()
-	if m.closed {
+	defer m.mu.Unlock()
+	return len(m.streams)
+}
+
+// pingLoop 每 30s 发一个 WS 协议层 Ping；边缘自动 Pong 且不唤醒 DO（M0 结论：
+// 协议层 Ping 不产生 DO 消息，免费）。连续 2 个周期未收到 Pong 判死。
+func (m *MuxConn) pingLoop() {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		if !m.alive.Load() {
+			return
+		}
+		if time.Since(time.Unix(0, m.lastPong.Load())) > 65*time.Second {
+			m.logf("pong missed for 2 periods, marking dead")
+			m.kill(fmt.Errorf("mux: pong timeout"))
+			return
+		}
+		m.mu.Lock()
+		ws := m.ws
+		closed := m.closed
 		m.mu.Unlock()
-		return
-	}
-	m.closed = true
-	list := make([]*MuxSession, 0, len(m.sessions))
-	for _, s := range m.sessions {
-		list = append(list, s)
-	}
-	m.sessions = make(map[string]*MuxSession)
-	m.mu.Unlock()
-	for _, s := range list {
-		s.markDead(err)
+		if closed {
+			return
+		}
+		_ = ws.WriteControl(websocket.PingMessage, []byte("nm"), time.Now().Add(5*time.Second))
 	}
 }
 
-// Open 新建一个到 target 的会话，复用这条 WS。
+// allocID 严格递增，跳过 0 与 0xFFFFFFFF，到 0xFFFFFFFE 回绕到 1。
+func (m *MuxConn) allocID() uint32 {
+	for {
+		id := m.nextID
+		m.nextID++
+		if m.nextID > proto.StreamIDMax {
+			m.nextID = 1
+		}
+		switch id {
+		case 0, 0xFFFFFFFF:
+			continue
+		}
+		return id
+	}
+}
+
+// Open 打开一条到 target 的逻辑流，等到服务端响应帧才算建立成功。
 func (m *MuxConn) Open(target string) (net.Conn, error) {
-	port, err := parsePort(target)
+	host, port, err := proto.SplitTarget(target)
 	if err != nil {
 		return nil, err
 	}
-	host, _, err := net.SplitHostPort(target)
-	if err != nil {
-		return nil, err
-	}
-
-	// 每个会话一个唯一 id（worker 侧对重复 id 直接拒绝）。
-	m.mu.Lock()
-	m.nextID++
-	next := m.nextID
-	m.mu.Unlock()
-
-	id := make([]byte, 4)
-	binary.BigEndian.PutUint32(id, next)
-	key := string(id)
-
-	s := &MuxSession{mux: m, id: id, key: key, ready: make(chan error, 1)}
-	s.cond = sync.NewCond(&s.rmu)
 
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("mux: connection closed")
+		return nil, errMuxClosed
 	}
-	m.sessions[key] = s
+	id := m.allocID()
+	s := newMuxStream(m, id)
+	m.streams[id] = s
 	m.mu.Unlock()
 
-	// 会话开帧：mux 帧，payload 是目标地址（sessionId 已在帧头，不再重复）。
-	if err := m.writeFrame(id, sessionOpen(host, port)); err != nil {
-		m.removeSession(key)
+	if err := m.writeOrdered(id, host, port); err != nil {
+		m.remove(id)
 		return nil, err
 	}
 
-	// 等服务端确认连接真的建立了。
-	// 这一步决定了上层能否如实回 "200 Connection Established"：若后端连不上，
-	// 我们要能返回连接错误（浏览器显示"代理无法连接"），而不是让浏览器在
-	// TLS 握手时收到空响应、误报"证书不可信"。
-	// 超时视为失败：服务端的出站连接超时（15s）必然先到，20s 还没收到确认
-	// 意味着这条传输已经出了别的问题，乐观返回只会把错误推迟成更难排查的
-	// "连接成功但没有任何数据"。
+	// 等响应帧：这一步决定上层能否如实回 "200 Connection Established"。
 	select {
 	case err := <-s.ready:
 		if err != nil {
-			m.removeSession(key)
+			m.remove(id)
 			return nil, err
 		}
 		return s, nil
-	case <-time.After(sessionReadyTimeout):
-		m.removeSession(key)
-		return nil, fmt.Errorf("mux: no ready signal within %s", sessionReadyTimeout)
+	case <-time.After(streamReadyTimeout):
+		m.remove(id)
+		return nil, fmt.Errorf("mux: no stream response within %s", streamReadyTimeout)
 	}
 }
 
-func (m *MuxConn) removeSession(key string) {
+func (m *MuxConn) remove(id uint32) {
 	m.mu.Lock()
-	delete(m.sessions, key)
+	delete(m.streams, id)
 	m.mu.Unlock()
+}
+
+// writeOrdered 发开帧；若本连接还没发过首帧，则这次发首帧（连接级认证 +
+// 打开该流）。串行化保证并发 Open 时首帧只发一次且排最前。
+func (m *MuxConn) writeOrdered(id uint32, host string, port uint16) error {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	if !m.firstSent {
+		m.firstSent = true
+		return m.writeRaw(proto.FirstFrame(m.password, uint64(time.Now().Unix()), id, host, port))
+	}
+	return m.writeRaw(proto.OpenFrame(id, host, port))
 }
 
 func (m *MuxConn) writeRaw(b []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
-		return fmt.Errorf("mux: connection closed")
+		return errMuxClosed
 	}
 	return m.ws.WriteMessage(websocket.BinaryMessage, b)
 }
 
-func (m *MuxConn) writeFrame(id []byte, payload []byte) error {
-	buf := make([]byte, 0, 1+len(id)+len(payload))
-	buf = append(buf, byte(len(id)))
-	buf = append(buf, id...)
-	buf = append(buf, payload...)
-	return m.writeRaw(buf)
+func (m *MuxConn) readLoop() {
+	for {
+		_, data, err := m.ws.ReadMessage()
+		if err != nil {
+			m.logf("readLoop error: %v", err)
+			m.kill(err)
+			return
+		}
+		if len(data) < 4 {
+			continue
+		}
+		if proto.IsControl(data) {
+			if id := proto.ParseCloseControl(data); id != 0 {
+				m.mu.Lock()
+				s := m.streams[id]
+				m.mu.Unlock()
+				if s != nil {
+					s.remoteClose()
+				}
+			}
+			continue
+		}
+		id := proto.StreamID(data)
+		m.mu.Lock()
+		s := m.streams[id]
+		m.mu.Unlock()
+		if s == nil {
+			continue // 已关流的迟到帧，静默丢弃（与 devserver 语义一致）
+		}
+		if !s.responded.Swap(true) {
+			// 等待中的流：第一帧是响应帧 ID(4)|STATUS(1)
+			status := data[4]
+			if status == proto.StatusOK {
+				s.signalReady(nil)
+			} else {
+				s.signalReady(statusError(status))
+			}
+			continue
+		}
+		s.deliver(data[4:])
+	}
+}
+
+// statusError 把响应帧的 STATUS 翻译成可读错误（英文，客户端输出规范）。
+func statusError(status byte) error {
+	switch status {
+	case proto.StatusBad:
+		return errors.New("server rejected stream: bad request or auth (0x01)")
+	case proto.StatusForbid:
+		return errors.New("server rejected stream: target forbidden (0x02)")
+	case proto.StatusNoExit:
+		return errors.New("server rejected stream: all exits failed (0x03)")
+	default:
+		return fmt.Errorf("server rejected stream: status 0x%02x", status)
+	}
+}
+
+// kill 宣告整条连接死亡：所有流立即关闭，上层重连由 selector 处理
+// （PRD：不做会话恢复，在途流直接关闭）。
+func (m *MuxConn) kill(cause error) {
+	if !m.alive.Swap(false) {
+		return
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	m.closed = true
+	list := make([]*MuxStream, 0, len(m.streams))
+	for _, s := range m.streams {
+		list = append(list, s)
+	}
+	m.streams = make(map[uint32]*MuxStream)
+	m.mu.Unlock()
+	for _, s := range list {
+		s.markDead(cause)
+	}
+	_ = m.ws.Close()
 }
 
 // Close 关闭整条 WS。
 func (m *MuxConn) Close() error {
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return nil
-	}
-	m.mu.Unlock()
-	m.logf("Close() called — closing websocket")
-	return m.ws.Close()
+	m.kill(errors.New("mux: closed by caller"))
+	return nil
 }
 
-// LiveCount 返回当前活跃会话数（诊断用）。
-func (m *MuxConn) LiveCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.sessions)
+// ---- MuxStream：net.Conn ----
+
+type MuxStream struct {
+	mux  *MuxConn
+	id   uint32
+	ready chan error
+	once  sync.Once
+
+	responded atomic.Bool // 已收到响应帧
+	dead      atomic.Bool
+
+	rmu     sync.Mutex
+	rbuf    []byte
+	rcond   *sync.Cond
+	errOnce sync.Once
+	err     error
+
+	wmu sync.Mutex
 }
 
-// ---- MuxSession 实现 net.Conn ----
+func newMuxStream(m *MuxConn, id uint32) *MuxStream {
+	s := &MuxStream{mux: m, id: id, ready: make(chan error, 1)}
+	s.rcond = sync.NewCond(&s.rmu)
+	return s
+}
 
-func (s *MuxSession) deliver(payload []byte) {
+func (s *MuxStream) signalReady(err error) {
+	s.once.Do(func() { s.ready <- err })
+}
+
+func (s *MuxStream) deliver(payload []byte) {
 	s.rmu.Lock()
 	s.rbuf = append(s.rbuf, payload...)
 	s.rmu.Unlock()
-	s.cond.Broadcast()
+	s.rcond.Broadcast()
 }
 
-func (s *MuxSession) markDead(err error) {
-	s.rmu.Lock()
-	if s.dead {
-		s.rmu.Unlock()
-		return
-	}
-	s.dead = true
-	if s.timer != nil {
-		s.timer.Stop()
-		s.timer = nil
-	}
-	s.rmu.Unlock()
-	s.cond.Broadcast()
-	s.mux.removeSession(s.key)
+func (s *MuxStream) remoteClose() {
+	s.setErr(io.EOF)
+	s.markDead(nil)
 }
 
-func (s *MuxSession) Read(b []byte) (int, error) {
+func (s *MuxStream) markDead(cause error) {
+	s.setErr(cause)
+	s.rcond.Broadcast()
+	s.mux.remove(s.id)
+}
+
+func (s *MuxStream) setErr(err error) {
+	if err == nil {
+		err = io.EOF
+	}
+	s.errOnce.Do(func() { s.err = err })
+}
+
+func (s *MuxStream) Read(b []byte) (int, error) {
 	s.rmu.Lock()
 	defer s.rmu.Unlock()
 	for len(s.rbuf) == 0 {
-		if s.dead {
-			// 服务端投递的失败原因优先于 EOF 暴露，便于定位。
-			if s.err != "" {
-				return 0, fmt.Errorf("mux session closed: %s", s.err)
-			}
-			if msg := s.mux.lastErrorText(); msg != "" {
-				return 0, fmt.Errorf("mux session closed: %s", msg)
+		if s.dead.Load() {
+			if s.err != nil {
+				return 0, s.err
 			}
 			return 0, io.EOF
 		}
-		s.cond.Wait()
+		s.rcond.Wait()
 	}
 	n := copy(b, s.rbuf)
 	s.rbuf = s.rbuf[n:]
 	return n, nil
 }
 
-func (m *MuxConn) lastErrorText() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.lastError
-}
-
-// handleControl 处理服务端控制帧：[0x00][sidLen][sessionId][payload]。
-// 空 payload = 会话已就绪；非空 = 失败原因。
-// 就绪信号很重要：没有它，上层代理只能乐观地回 "200 Connection Established"，
-// 之后后端连接失败就会在浏览器里表现为 TLS/证书错误，而不是连接错误。
-func (m *MuxConn) handleControl(data []byte) {
-	if len(data) < 2 {
-		return
+func (s *MuxStream) Write(b []byte) (int, error) {
+	if s.dead.Load() {
+		return 0, errors.New("mux: stream closed")
 	}
-	sidLen := int(data[1])
-	if len(data) < 2+sidLen {
-		return
+	if len(b) > proto.MaxPayload {
+		return 0, fmt.Errorf("mux: payload %d exceeds %d", len(b), proto.MaxPayload)
 	}
-	sid := string(data[2 : 2+sidLen])
-	msg := string(data[2+sidLen:])
-
-	m.mu.Lock()
-	s := m.sessions[sid]
-	m.mu.Unlock()
-	if s == nil {
-		return
-	}
-
-	if msg == "" {
-		m.logf("session %x ready", sid)
-		s.signalReady()
-		return
-	}
-	m.logf("server control sid=%x: %s", sid, msg)
-	m.mu.Lock()
-	m.lastError = msg
-	m.mu.Unlock()
-	s.setErr(msg)
-	s.signalErr(msg)
-	s.markDead(nil)
-}
-
-func (s *MuxSession) Write(b []byte) (int, error) {
-	s.wmu.Lock()
-	defer s.wmu.Unlock()
-	s.rmu.Lock()
-	dead := s.dead
-	s.rmu.Unlock()
-	if dead {
-		return 0, fmt.Errorf("mux: session closed")
-	}
-	if err := s.mux.writeFrame(s.id, b); err != nil {
+	if err := s.mux.writeRaw(proto.DataFrame(s.id, b)); err != nil {
 		return 0, err
 	}
 	return len(b), nil
 }
 
-func (s *MuxSession) Close() error {
-	s.rmu.Lock()
-	if s.dead {
-		s.rmu.Unlock()
+func (s *MuxStream) Close() error {
+	if s.dead.Swap(true) {
 		return nil
 	}
-	s.dead = true
-	if s.timer != nil {
-		s.timer.Stop()
-		s.timer = nil
+	if s.responded.Load() {
+		// 只在流已建立时发 CLOSE；建立失败时服务端本就没开流。
+		_ = s.mux.writeRaw(proto.CloseControl(s.id))
 	}
-	s.rmu.Unlock()
-	s.cond.Broadcast()
-	s.mux.removeSession(s.key)
+	s.mux.remove(s.id)
+	s.rcond.Broadcast()
 	return nil
 }
 
-func (s *MuxSession) LocalAddr() net.Addr  { return s.mux.ws.LocalAddr() }
-func (s *MuxSession) RemoteAddr() net.Addr { return s.mux.ws.RemoteAddr() }
+func (s *MuxStream) LocalAddr() net.Addr  { return s.mux.ws.LocalAddr() }
+func (s *MuxStream) RemoteAddr() net.Addr { return s.mux.ws.RemoteAddr() }
 
-// SetDeadline / SetReadDeadline / SetWriteDeadline are session-scoped.
-//
-// They must NOT be forwarded to the shared WebSocket: a deadline on the socket
-// applies to every session multiplexed over it, so one timing-out session would
-// tear down unrelated connections (this actually happened — a 5s read deadline
-// on one session killed the whole mux connection). Instead we arm a timer that
-// closes only this session when it expires; Read then unblocks with EOF.
-func (s *MuxSession) SetDeadline(t time.Time) error { return s.SetReadDeadline(t) }
-
-func (s *MuxSession) SetReadDeadline(t time.Time) error {
-	s.armTimer(t)
-	return nil
+// SetReadDeadline / SetDeadline 作用于单流（timer 关流），绝不作用于共享 WS
+// —— 一条流的超时不能拆掉复用同一条连接的其他流。
+func (s *MuxStream) SetReadDeadline(t time.Time) error { return s.armTimer(t) }
+func (s *MuxStream) SetDeadline(t time.Time) error     { return s.armTimer(t) }
+func (s *MuxStream) SetWriteDeadline(t time.Time) error {
+	return nil // 写走共享 WS，不做流级门控
 }
 
-func (s *MuxSession) SetWriteDeadline(t time.Time) error {
-	return nil // writes go straight to the socket; no session-level gating
-}
-
-func (s *MuxSession) armTimer(t time.Time) {
-	s.rmu.Lock()
-	if s.timer != nil {
-		s.timer.Stop()
-		s.timer = nil
+func (s *MuxStream) armTimer(t time.Time) error {
+	if t.IsZero() {
+		return nil
 	}
-	deadline := t
-	s.rmu.Unlock()
-
-	if deadline.IsZero() {
-		return
-	}
-	d := time.Until(deadline)
+	d := time.Until(t)
 	if d <= 0 {
-		s.Close()
-		return
+		s.markDead(errors.New("mux: deadline exceeded"))
+		return nil
 	}
-	s.rmu.Lock()
-	s.timer = time.AfterFunc(d, func() {
-		s.logf("session %x deadline exceeded, closing session", s.key)
-		s.Close()
+	time.AfterFunc(d, func() {
+		if !s.dead.Load() {
+			s.markDead(errors.New("mux: i/o timeout"))
+		}
 	})
-	s.rmu.Unlock()
+	return nil
 }
