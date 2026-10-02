@@ -52,7 +52,7 @@ jobs:
         run: |
           BASE="https://netmaster-m0.edge-tunnel.workers.dev"
           T="${{ secrets.PROBE_TOKEN }}"
-          for hostport in "example.com:443" "www.cloudflare.com:443" "8.8.8.8:443" "93.184.216.34:443"; do
+          for hostport in "ProxyIP.HK.CMLiussss.net:443" "8.212.14.90:443" "8.8.8.8:443" "example.com:443"; do
             host="${hostport%:*}"; port="${hostport##*:}"
             echo "== connect $host:$port =="
             curl -sS --max-time 20 "$BASE/w/connect?host=$host&port=$port&t=$T" || echo "(probe failed)"
