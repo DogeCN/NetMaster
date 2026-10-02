@@ -55,6 +55,39 @@ jobs:
       - name: Build worker bundle
         run: node build.mjs
 
+      # KV 命名空间：Cron 每小时写入口健康排名（proxyip:top）。找不到就建一个同名
+      # 的，然后把 wrangler.toml 里的占位 id 就地改写 —— 配置里不留需要用户填的
+      # 东西，代价是 CI 负责把占位符换成真值。
+      - name: Ensure same-name KV namespace exists
+        run: |
+          kv_id() {
+            npx wrangler kv namespace list --json 2>/dev/null | node -e '
+              let d = "";
+              process.stdin.on("data", c => d += c).on("end", () => {
+                try {
+                  const arr = JSON.parse(d.slice(d.indexOf("[")));
+                  const hit = arr.find(x => x.title === "netmaster");
+                  console.log(hit ? hit.id : "");
+                } catch { console.log(""); }
+              });'
+          }
+          KV_ID="$(kv_id)"
+          if [ -z "$KV_ID" ]; then
+            echo "KV namespace 'netmaster' not found — creating"
+            npx wrangler kv namespace create netmaster
+            KV_ID="$(kv_id)"
+          fi
+          if [ -z "$KV_ID" ]; then
+            echo "::error::failed to resolve KV namespace id for 'netmaster'"
+            exit 1
+          fi
+          echo "KV 'netmaster' ready ($KV_ID)"
+
+      - name: Patch wrangler.toml
+        run: |
+          sed -i "s/^id = \"00000000000000000000000000000000\"/id = \"$KV_ID\"/" wrangler.toml
+          grep -A2 kv_namespaces wrangler.toml
+
       - name: Deploy Worker
         run: npx wrangler deploy
 
