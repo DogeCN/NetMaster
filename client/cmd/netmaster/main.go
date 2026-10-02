@@ -21,10 +21,10 @@ import (
 	"netmaster/internal/config"
 	"netmaster/internal/entry"
 	"netmaster/internal/geoip"
-	"netmaster/internal/selector"
 	"netmaster/internal/procwait"
 	"netmaster/internal/proxy"
 	"netmaster/internal/rules"
+	"netmaster/internal/selector"
 	"netmaster/internal/sysproxy"
 )
 

@@ -1,9 +1,14 @@
 name: release
 
 # Tag 触发：构建全部产物并创建 Release。
+#
 # 资产凑齐"直接部署"所需的一切 —— 不克隆仓库的用户下载后照 README 走完即可。
-# Windows 与 Linux 双平台客户端；标签重打时旧 Release 会被删除重建，
-# 保证 vX.Y.Z 的产物永远来自该标签当前指向的提交。
+# 产物清单随 v2 变过：D1 已退役，所以不再发 schema.sql；wrangler.toml 现在带
+# 两个 DO 绑定、两个 migration 和一个 KV 绑定（KV id 是占位符）。
+#
+# 同 tag 重跑会删除旧 Release 再建：vX.Y.Z 的产物永远来自该 tag 当前指向的
+# 提交。tag 本身不动（--cleanup-tag=false）—— 移动 tag 会让已经下载过的人
+# 失去对照。
 on:
   push:
     tags: ['v*']
@@ -38,53 +43,126 @@ jobs:
 
       - name: Run server tests
         working-directory: server
-        run: npm test
+        # pipefail：node 的报错走 stderr，管道会吞掉退出码 —— 不加这个测试挂了
+        # 发布也是绿的。
+        run: |
+          set -o pipefail
+          for t in crypto protocol integration proxyip race router cron; do
+            printf '%-12s ' "$t"
+            node "test/$t.mjs" | tail -1
+          done
 
-      - name: Build client (windows / linux)
+      # 交叉编译前先按目标平台 vet 一遍：go build 只对当前 GOOS 生效，而
+      # sysproxy 是按 build tag 拆的（windows / darwin / linux / other），
+      # 某个平台漏实现一个函数只会在这个平台上编译失败。
+      - name: Vet client for each target platform
+        working-directory: client
+        run: |
+          for target in windows/amd64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            GOOS=${target%/*} GOARCH=${target#*/} go vet ./...
+            echo "vet ok: $target"
+          done
+
+      - name: Build client (all platforms)
         working-directory: client
         run: |
           GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o netmaster-windows-amd64.exe ./cmd/netmaster
           GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o netmaster-linux-amd64 ./cmd/netmaster
           GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o netmaster-linux-arm64 ./cmd/netmaster
+          GOOS=darwin  GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o netmaster-darwin-amd64 ./cmd/netmaster
+          GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o netmaster-darwin-arm64 ./cmd/netmaster
+
+      # 产物自检：体积异常小说明构建被截断或链接错文件，直接发出去不如不发。
+      - name: Verify artifacts
+        working-directory: client
+        run: |
+          set -eu
+          for f in netmaster-windows-amd64.exe netmaster-linux-amd64 netmaster-linux-arm64 \
+                   netmaster-darwin-amd64 netmaster-darwin-arm64; do
+            [ -f "$f" ] || { echo "::error::missing artifact $f"; exit 1; }
+            sz=$(wc -c < "$f")
+            if [ "$sz" -lt 1000000 ]; then
+              echo "::error::$f is only $sz bytes — build looks broken"
+              exit 1
+            fi
+            printf '%-32s %10d bytes\n' "$f" "$sz"
+          done
 
       - name: Run client tests
         working-directory: client
-        run: go test ./...
+        run: go test ./... -count=1
 
       - name: Write release notes
         run: |
-          cat > notes.md <<'EOF'
+          cat > notes.md <<EOF
+          NetMaster $GITHUB_REF_NAME — commit \`${GITHUB_SHA::7}\`
+
+          协议 v2。服务端是 Cloudflare Worker（Session DO + Router DO + KV），客户端是
+          这里的二进制。客户端用 PASSWORD 在首帧做 HMAC-SHA256 签名，口令不出网络。
+
           ## 文件说明
 
           | 文件 | 用途 |
           |---|---|
-          | `_worker.js` | Worker 脚本。部署到 Cloudflare Workers（配合 `wrangler.toml` 与 `schema.sql`，步骤见 README「快速开始」） |
-          | `wrangler.toml` | Worker 部署配置。`database_id` 是占位符，`wrangler d1 create` 后填入真实值 |
-          | `schema.sql` | D1 表结构（仅一张表：中继亲和）。部署前执行一次 |
-          | `netmaster-windows-amd64.exe` | Windows 客户端（x86_64）。双击即 serve；首次双击会生成 config.json 模板 |
-          | `netmaster-linux-amd64` | Linux 客户端（x86_64） |
-          | `netmaster-linux-arm64` | Linux 客户端（ARM64，如树莓派 / ARM 服务器） |
+          | \`_worker.js\` | Worker 脚本（由 \`server/build.mjs\` 从 \`src/\` 生成，不要手改）。部署时配合 \`wrangler.toml\` |
+          | \`wrangler.toml\` | Worker 部署配置：SESSION / ROUTER 两个 DO 绑定、两个 migration、KV 绑定 |
+          | \`netmaster-windows-amd64.exe\` | Windows 客户端（x86_64）。双击即 serve；首次双击会生成 config.json 模板 |
+          | \`netmaster-linux-amd64\` | Linux 客户端（x86_64） |
+          | \`netmaster-linux-arm64\` | Linux 客户端（ARM64，如树莓派 / ARM 服务器） |
+          | \`netmaster-darwin-amd64\` | macOS 客户端（Intel） |
+          | \`netmaster-darwin-arm64\` | macOS 客户端（Apple Silicon） |
 
-          客户端最小配置（`config.json`，放可执行文件旁边）：
+          macOS 未签名：首次运行会被 Gatekeeper 拦住（"无法打开，因为它来自身份不明的
+          开发者"）。右键 → 打开，或 \`xattr -d com.apple.quarantine <文件名>\` 后即可正常运行。
 
-          ```json
+          ## 部署
+
+          **\`wrangler.toml\` 里的 KV \`id\` 是占位符**（32 个 0），直接 \`wrangler deploy\`
+          会失败 —— 这是有意的，别拿占位符上线。两种走法：
+
+          - **走 GitHub Actions 的 deploy 工作流**（推荐）：它会用 CF API 解析/创建同名
+            KV namespace 并把真 id 就地写回 \`wrangler.toml\`。需要配三个 Secret：
+            \`PASSWORD\`、\`CLOUDFLARE_API_TOKEN\`、\`CLOUDFLARE_ACCOUNT_ID\`。
+          - **手动部署**：先 \`npx wrangler kv namespace create netmaster\`，把输出的 id
+            填进 \`wrangler.toml\` 的 \`[[kv_namespaces]]\`，再 \`npx wrangler deploy\`。
+            不需要 KV 时把 \`[[kv_namespaces]]\` 整段删掉即可：缺 KV 绑定时竞速只用
+            内置兜底列表，功能不残。
+
+          口令：\`npx wrangler secret put PASSWORD\`，与客户端 config.json 里的
+          \`password\` 一致。
+
+          客户端最小配置（\`config.json\`，放可执行文件旁边）：
+
+          \`\`\`json
           { "server": "<你的 Worker 域名>", "password": "<部署时设置的 PASSWORD>" }
-          ```
+          \`\`\`
 
-          完整步骤见 README「快速开始」。
+          然后 \`netmaster serve\`（Windows 双击 exe 等价）。启动后日志里的
+          \`tunnel established via node <addr>\` 就是部署是否健康的直接回答 ——
+          Worker 没有任何 HTTP 诊断端点；要看服务端日志，给 Worker 加变量
+          \`DEBUG=1\` 再 \`npx wrangler tail\`。
+
+          NAT64 出口已移除（Workers \`connect()\` 无 IPv6 出站），CF 承载目标的出口
+          走 ProxyIP 中继竞速。完整的限制与配额实测见仓库内 \`docs/limitations.md\`。
+
+          详细步骤见仓库 README「快速开始」。
           EOF
 
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          # 同 tag 重跑：删掉旧 Release 再建，保证产物来自该 tag 当前指向的提交。
+          # 不删 tag 本身（--cleanup-tag=false）—— 移动 tag 会让已下载的人失去对照。
           gh release delete "$GITHUB_REF_NAME" --yes --cleanup-tag=false 2>/dev/null || true
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --notes-file notes.md \
             server/_worker.js \
             server/wrangler.toml \
-            server/schema.sql \
             client/netmaster-windows-amd64.exe \
             client/netmaster-linux-amd64 \
-            client/netmaster-linux-arm64
+            client/netmaster-linux-arm64 \
+            client/netmaster-darwin-amd64 \
+            client/netmaster-darwin-arm64

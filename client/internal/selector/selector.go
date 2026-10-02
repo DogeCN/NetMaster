@@ -158,7 +158,7 @@ func (p *Pool) noteSuccess(idx int) {
 	p.mu.Unlock()
 }
 
-func (p *Pool) SetGeo(g GeoResolver)    { p.geo = g }
+func (p *Pool) SetGeo(g GeoResolver) { p.geo = g }
 func (p *Pool) SetDialTimeout(d time.Duration) {
 	if d > 0 {
 		p.dialTimeout = d

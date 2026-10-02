@@ -32,7 +32,7 @@ type MuxConn struct {
 	// 首帧必须先于任何开帧抵达服务端：服务端把"未认证时到达的第一帧"当首帧解析，
 	// 一条开帧抢在首帧前面会被判成 HMAC 错误并断开整条连接。写路径统一走
 	// writeOrdered，由它保证首帧只发一次且最先发。
-	writeMu    sync.Mutex
+	writeMu   sync.Mutex
 	firstSent bool
 
 	alive atomic.Bool
@@ -301,8 +301,8 @@ func (m *MuxConn) Close() error {
 // ---- MuxStream：net.Conn ----
 
 type MuxStream struct {
-	mux  *MuxConn
-	id   uint32
+	mux   *MuxConn
+	id    uint32
 	ready chan error
 	once  sync.Once
 

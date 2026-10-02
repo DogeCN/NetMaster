@@ -100,6 +100,10 @@ const cfg = {
   direct: splitTarget(argOf("direct", process.env.E2E_DIRECT_TARGET || "example.com:80")),
   // CF 托管的明文 HTTP 目标：直连会被平台拒，只能走 ProxyIP 竞速。
   cf: splitTarget(argOf("cf", process.env.E2E_CF_TARGET || "neverssl.com:80")),
+  // 端口 25 的目标用固定域名而不是本地目标：devserver 在 denyLoopback=false 时对
+  // 127.0.0.1 整条跳过禁连检查（那是测试专用开关），而生产是 exits.js 里
+  // port===25 最先判 —— 用域名才能验到同一条路径。
+  smtp: splitTarget(argOf("smtp", process.env.E2E_SMTP_TARGET || "example.com:25")),
   streams: numEnv(argOf("streams", process.env.E2E_MUX_STREAMS), 100),
   rounds: numEnv(argOf("rounds", process.env.E2E_CF_ROUNDS), 20),
   minRate: Number(argOf("minrate", process.env.E2E_CF_MIN_RATE) || 99),
@@ -160,6 +164,10 @@ class Mux {
       try {
         this.ws.pong();
       } catch {}
+    });
+    // Pong 由边缘自动应答，脚本自己数：M2 的判活证据就是"ping 有多少、pong 回多少"。
+    this.ws.on("pong", () => {
+      this.pongs++;
     });
   }
 
@@ -505,7 +513,7 @@ async function item2() {
   const cases = [
     { label: "2.1 private IP 10.0.0.1:80 -> 0x02 + CLOSE", target: { host: "10.0.0.1", port: 80 } },
     { label: "2.2 TEST-NET-1 192.0.2.1:80 -> 0x02 + CLOSE", target: { host: "192.0.2.1", port: 80 } },
-    { label: "2.3 port 25 -> 0x02 + CLOSE", target: { host: cfg.direct.host, port: 25 } },
+    { label: "2.3 port 25 -> 0x02 + CLOSE", target: cfg.smtp },
   ];
   for (const c of cases) {
     await step(c.label, async () => {
@@ -670,30 +678,34 @@ async function item6() {
       const m = new Mux(cfg.endpoint, cfg.password);
       await m.open();
       const t0 = Date.now();
-      let row = { round: i, status: "connect-error", openMs: -1 };
+      let row = { round: i, status: null, error: null, openMs: Date.now() - t0, http: null, totalMs: Date.now() - t0 };
       try {
         const r = await m.dial(cfg.cf, { timeoutMs: cfg.streamTimeoutMs });
         const resp = r.status === STATUS_OK ? await httpGet(m, r.rec, cfg.cf, "/", 20000) : null;
         row = {
           round: i,
-          status: statusName(r.status),
+          status: r.status,
+          error: null,
           openMs: Date.now() - t0,
           http: resp ? resp.code : null,
           totalMs: Date.now() - t0,
         };
       } catch (e) {
-        row = { round: i, status: `error: ${e.message}`, openMs: Date.now() - t0 };
+        row = { round: i, status: null, error: e.message, openMs: Date.now() - t0, http: null, totalMs: Date.now() - t0 };
       }
       await m.close();
       rows.push(row);
-      note(`round ${i}: status ${row.status}, open ${row.openMs}ms, total ${row.totalMs}ms${row.http ? `, HTTP ${row.http}` : ""}`);
+      note(
+        `round ${i}: ${row.error ? `error: ${row.error}` : `status ${statusName(row.status)}`}, ` +
+          `open ${row.openMs}ms, total ${row.totalMs}ms${row.http ? `, HTTP ${row.http}` : ""}`
+      );
       if (i < 3) await sleep(6000); // 等 Router DO Alarm flush（FLUSH_DELAY_MS = 5000）
     }
     note("Router DO storage is not readable through any public Cloudflare API, so this is a");
     note("black-box observation (no 0x03 from round 2 on + latency), not proof of a DO hit.");
     const bad = rows.filter((r, i) => i > 0 && r.status !== STATUS_OK);
     if (bad.length) return fail(`round(s) ${bad.map((r) => r.round).join(", ")} did not get 0x00 → cached route not reused`);
-    return pass(`round 1 ${rows[0].status} (${rows[0].openMs}ms), rounds 2-3 ${statusName(STATUS_OK)} (${rows[1].openMs}ms / ${rows[2].openMs}ms) with no 0x03`);
+    return pass(`round 1 ${statusName(rows[0].status)} (${rows[0].openMs}ms), rounds 2-3 ${statusName(STATUS_OK)} (${rows[1].openMs}ms / ${rows[2].openMs}ms) with no 0x03`);
   });
 }
 

@@ -27,10 +27,10 @@ const (
 )
 
 var (
-	errPendingFull   = errors.New("selector: pending queue full")
+	errPendingFull    = errors.New("selector: pending queue full")
 	errPendingTimeout = errors.New("selector: timed out waiting for tunnel")
-	errNoUsableExit  = errors.New("selector: no usable exit")
-	errStopped       = errors.New("selector: stopped")
+	errNoUsableExit   = errors.New("selector: no usable exit")
+	errStopped        = errors.New("selector: stopped")
 )
 
 // backoffFor 返回第 attempt 次失败后的退避时长（attempt 从 1 起），带 ±20% 抖动。
@@ -66,8 +66,8 @@ type dialPending struct {
 
 	mu       sync.Mutex
 	queue    []*pendingReq
-	attempt  int     // 连续失败次数，决定退避时长
-	retrying bool    // 是否已有重连 goroutine 在跑
+	attempt  int  // 连续失败次数，决定退避时长
+	retrying bool // 是否已有重连 goroutine 在跑
 	stopped  bool
 }
 

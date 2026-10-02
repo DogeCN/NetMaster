@@ -24,4 +24,3 @@ func CleanupStale() (bool, error) { return false, nil }
 
 // StatePath 无状态文件。
 func StatePath() string { return "" }
-

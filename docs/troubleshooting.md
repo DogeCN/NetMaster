@@ -1,105 +1,183 @@
 # 排障
 
-## 客户端
+服务端**没有任何 HTTP 诊断端点**——没有 `/health`、没有 `/stats`。浏览器打开 Worker 域名
+只会得到 404 空 body，这是预期行为，不代表部署坏了。
 
-### 启动慢 / 启动日志
-
-启动日志带自报耗时，**以它为准**：
+判断部署是否健康的唯一直接信号是客户端 `ready in …` 之后补的这一行：
 
 ```
-ready in 188ms. browse normally; Ctrl+C to stop and restore system proxy.
+tunnel established via node 104.16.x.x
 ```
 
-`[geoip] CN ranges ready: 2980 (cache)` 之后如果长时间没有 `[proxy] ... on`，看
-`[sys] cleanup stale system proxy` 那一行——上次异常退出留下的状态需要清理。
+它是一次真实的 TLS + WebSocket + 首帧认证建流（目标 `example.com:80`）。失败了会打
+`tunnel failed: <原因>`。
 
-> **测量提示**：用 bash 的 `netstat` / `/dev/tcp` 轮询测启动耗时，开销可达 500ms 级，会严重
-> 高估（曾测出 590ms 而实际 11ms）。用应用自报的 `ready in`。
->
-> **Go 测试会缓存结果**：重复测量同一测试必须加 `-count=1`，否则多次输出完全一致。
+## 连不上：先看这三件事
 
-### 上网慢，但只有某些站点慢
+### 1. 口令不一致
 
-先分流对不对：
+`no password` / `tunnel failed` 里带 auth 字样时，先确认两端是同一个 PASSWORD：
 
 ```bash
-netmaster nodes --target https://<站点>   # 观察该站点走哪条出口
+npx wrangler secret list          # 看 Worker 上有没有 PASSWORD
+printf '%s' '你的口令' | npx wrangler secret put PASSWORD
 ```
 
-再对比直连基线（不经代理）：
+口令只在首帧里以 HMAC-SHA256 的形式出现，网络上没有明文——所以**服务端看不到你的口令，
+也没法告诉你哪里错了**。认证失败的帧回 `0x01`，与格式错误、TS 超窗不可区分。
+
+### 2. 系统时钟
+
+首帧带 Unix 秒时间戳，服务端校验 **±300 秒**。客户端机器时钟偏了 5 分钟以上，所有连接都
+会以 `0x01` 被拒——症状和"密码错了"一模一样。先对表。
+
+### 3. 域名有没有绑上
+
+Worker 只部署到 `workers.dev`，**custom domain 要你自己绑**。没绑域名时客户端的
+`--server` 无解可解析，启动会直接报
+`no entries: server domain unresolvable and community sources unreachable`。
+
+## 看服务端日志
 
 ```bash
-curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" https://<站点>
+npx wrangler tail                  # 实时日志
+npx wrangler tail --format json    # JSON 格式
 ```
 
-差 4 倍以上通常是**国内站被误判成代理**。检查规则：未列出的域名走 `auto`，由 IP 归属决定；
-`netmaster nodes` 可以确认入口候选正常。
-
-### 日志里的 `[route]` 行
+日志默认静默。要打开：在 Cloudflare 控制台给 Worker 加变量 `DEBUG=1`（或
+`wrangler.toml` 的 `[vars]` 里写 `DEBUG = "1"`），再 `wrangler deploy`。日志前缀：
 
 ```
-[route] <host> direct unusable (<原因>) — switched to proxy and replayed
-[route] <host> direct unusable (<原因>), proxy retry failed: <错误>
+[session] authenticated; stream 1 -> example.com:80
+[session] direct exit failed (…); trying proxyip
+[session] race slot 0 ProxyIP.HK.CMLiussss.net:443 failed: relay connect timeout (1502ms)
+[session] stream 7 no first byte in 3000ms, forgetting route
+[session] stream 7 connect failed: …; all proxyip exits failed
+[router] flush dropped 3 rows: …
+[cron] {"batch":48,"total":120,"done":false,"source":"fetched"}
 ```
 
-表示 CONNECT 隧道建立后直连没能把客户端的首段数据送达，于是改走代理并重放。
-**注意别一律当成防火墙阻断** —— 上游 worker 出站失败（目标是 Cloudflare 承载、worker 连不了
-CF 自身 IP）也会走这条路径。括号里是真实原因。
+注意：`DEBUG` 是变量不是 Secret，改完要重新部署才生效。**Cron 的统计行不受 `DEBUG` 限制**——
+它每轮都打，方便确认健康检查有没有真的跑。
 
-同一站点反复出现这两行，说明它在两条路之间反复横跳。客户端有 30 分钟的直连禁用冷却来阻止
-级联；如果还在出现，说明两侧都确实不通。
+## 症状对照
 
-### 节点全部超时
+| 现象 | 含义 | 怎么办 |
+|---|---|---|
+| `no server: pass --server or set it in config.json / NETMASTER_SERVER` | 没给域名 | 填 config.json 或加 `--server` |
+| `no password: pass --password or set it in config.json / NETMASTER_PASSWORD` | 没给口令 | 同上 |
+| `no entries: server domain unresolvable and community sources unreachable` | 域名解析不出来 **且** 三个社区源也全挂 | 先查域名绑定和本机 DNS |
+| `entries: N (community: none)` | 社区源全挂且无缓存，只剩域名 DNS 解析出的候选 | 能连就不要紧；N=0 才致命 |
+| `entries: N (community: cache)` | 社区源这次没拉到，用了上次缓存 | 正常，网络恢复后自动改用 `net` |
+| `tunnel failed: …` | 传输层建不起来 | 看上面"连不上"三件事 |
+| `server rejected stream: target forbidden (0x02)` | 目标是私网 / CF 网段 / 端口 25 | 设计如此；私网应走客户端直连规则 |
+| `server rejected stream: all exits failed (0x03)` | 直连失败且中继全挂 | 看服务端 tail 里的 race slot 失败原因 |
+| `[route] <host> direct unusable (…) — switched to proxy and replayed` | 直连被判定不可用，已改走代理 | 正常自愈；该域名 30 分钟内不再试直连 |
+| `[route] <host> proxy tunnel dead (…) — switched exit and replayed` | 隧道建立但零字节即断，已换出口 | 正常自愈；Worker 侧也会把坏中继忘掉 |
 
-`[probe] 0/N reachable` 且探测耗时接近 4s 的整数倍 → 是 TCP 连不上（不是 ECH、不是应用层）。
-中继或边缘 IP 不可达，等一会儿重试；`netmaster nodes` 可以看每个节点的实时健康度。
+## ECH 回退
 
-### 端口冲突 / 系统代理指向不存在的端口
+ECH 的作用是隐藏 SNI，属于锦上添花，**它失败不该拖累正常连接**。客户端的兜底链：
+
+1. 尝试 ECH（2 秒预算，走优选 IP；失败再试域名直连）；
+2. 超预算或握手失败 → 退普通 TLS（明文 SNI），并触发 60 秒短路；
+3. 60 秒后重新尝试 ECH——它随时可能恢复可用。
+
+日志里看到 `tls: … (ech also failed — …)` 不必惊慌：那是两条路都失败时把 ECH 的原因一并
+带出来，方便排查。只要连接本身成功了，说明至少普通 TLS 走通了。
+
+个别站点既无 ECH 又被 IP + SNI 双拦，客户端无法本地绕过。
+
+## 节点全挂
+
+客户端在节点池里随机起点轮询（`selector.Pool.Dial`），每个节点一条复用的 mux；节点 mux
+失效时重拨一次；整池失败返回最后一个错误。
+
+- 流被拒（`0x01`–`0x03`）是服务端裁决，换节点也是同一裁决，**不再轮询**——这是有意的，
+  避免把一次失败放大成 N 次。
+- 传输断开后自动重连：退避 1s → 2s → … → 32s（每次 ±20% 抖动）。断开期间新流进等待队列
+  （上限 128 条、单条等 10 秒），重连后批量发起；超时或队列满则直接向调用方返回失败。
+  不做会话恢复，在途流直接关闭，上层应用自行重试。
+- 启动时的入口候选是 DNS 解析 + 社区源合并的结果，最多 64 个，再经延迟优选取最快 16 个
+  进池。全挂退磁盘缓存，缓存也没有就只剩域名解析结果。
+- 想观察实际选路效果：
 
 ```bash
-netmaster restore     # 手动还原
+netmaster nodes                                  # 持续发请求，看延迟/成功率
+netmaster nodes --ipcheck https://api.ipify.org  # 统计观察到的出口 IP 分布
 ```
 
-强杀过 netmaster 时看门狗通常会兜底，但看门狗本身被杀就兜不了了。
+## 系统代理残留
 
-### ECH 相关
+`serve` 被强杀（任务管理器结束进程、断电）时来不及还原系统代理。三层保护：
 
-日志出现 `exceeded 2s budget` 表示 ECH 尝试超预算，已自动改走普通 TLS。ECH 在部分网络下会
-间歇失败（服务端返回 outer 名证书），属预期行为，有 60s 短路兜底，不影响可用性。
+1. **看门狗**：serve 成功接管系统代理后会派生一个脱离的 `netmaster watchdog` 子进程，它等
+   owner 进程退出后自动还原（owner pid 走 `NETMASTER_OWNER_PID` 环境变量传递）；
+2. **启动自愈**：下次启动先 `sysproxy.CleanupStale()`，日志会打
+   `[sys] cleaned up stale system proxy from a previous unclean exit`；
+3. **手动兜底**：
 
-## 服务端
+```bash
+netmaster restore
+```
 
-### 判断 403 归因
+Windows 上的实现细节：旧值存在 `%TEMP%/netmaster_sysproxy.json`，
+`Enable()` 是"先落盘旧值、再逐项写注册表"。中途失败会回滚——不回滚的话注册表可能已被改了
+一部分（比如 `ProxyEnable` 已置 1），系统代理会一直悬着指向本机端口。
 
-Worker 没有 HTTP 端点，从日志看：`DEBUG=1` 部署后 `wrangler tail`，中继选择会打
-`<host>: relay <relay> answers <status>` 或 `no relay answered cleanly [...]`。
+三个平台各有实现，行为不同：
 
-| 日志 | 含义 |
-|---|---|
-| 部分中继 2xx/3xx | 探测能挑到好的，D1 会记住 |
-| 某站全部 403 | **该站拒绝所有这些出口 IP**，换公共中继没用，自建中继 |
-| 全部 0 | 中继连不上 |
+| 平台 | 实现 | 接管范围 | 状态文件 |
+|---|---|---|---|
+| Windows | 注册表 `Internet Settings` + WinINET 通知 | HTTP | `%TEMP%/netmaster_sysproxy.json` |
+| macOS | `networksetup`（`-webproxy` / `-securewebproxy`） | HTTP/HTTPS，**不设 SOCKS** | `$TMPDIR/netmaster_sysproxy_darwin.json` |
+| Linux | `gsettings`（`org.gnome.system.proxy.*`） | HTTP/HTTPS，**不设 SOCKS** | `$TMPDIR/netmaster_sysproxy_linux.json` |
+| 其他（BSD 等） | 不支持 | — | 无（请用 `--manual`） |
 
-### 首次请求慢几秒
+差别要点：
 
-正常：那一轮在探测中继（最多 4 个候选，总预算 3s）。D1 里学到结果后就不会再探。
+- **macOS 只走 `networksetup`**，不碰 SystemConfiguration 私有 API（后者跨版本会碎）。服务名
+  取 `networksetup -listallnetworkservices` 的全部条目；多网卡/有线环境若有异常，用
+  `--manual` 自己填。
+- **Linux 只走 `gsettings`**，覆盖 GNOME / Unity / Cinnamon 与 KDE Plasma 的 gsettings 后端。
+  Xfce / MATE 等用别的 schema——最诚实的做法是明确告诉用户改用 `--manual`，而不是留一个
+  半生效的设置。
+- 两侧都不设 SOCKS：系统代理本身不转发 UDP，且多数应用的 SOCKS 支持要单独勾选，用户预期
+  与实际差距大。
+- 其他平台 `Enable()` 直接返回
+  `sysproxy: system proxy takeover not supported on this platform (use --manual)`。
 
-### 控制帧与客户端报错
+其他平台用 `--manual`，自己把 `http://127.0.0.1:<port>` 填进系统设置。
 
-客户端可能看到 `nodepool: all N nodes failed`。这是客户端侧的汇总错误；服务端在出站失败时
-会通过控制帧带上真实原因（这正是 `test/control.mjs` 保证的行为）。把 `DEBUG=1` 打开看服务端
-日志能拿到具体原因。
+## 端口
 
-## 已知限制
+默认先试 8080（HTTP）/ 1080（SOCKS5），被占则顺延（`pickPort` 最多试 100 个）。系统代理
+自动指向选定值，所以你通常不需要知道端口号。`--manual` 下端口只用来打印：
 
-| 现象 | 原因 |
-|---|---|
-| 某个 CF 站稳定 403 | 它拉黑了公共中继的出口 IP。自建中继是唯一根治手段 |
-| 某站直连超时、走代理才通 | 站点的地域/bot 策略，不是墙；分流会自动学到 |
-| 首次访问某 CF 站点很慢 | 中继选择 + 探测预算，命中 D1 后恢复正常 |
+```
+manual mode. HTTP proxy: http://127.0.0.1:8080   SOCKS5: socks5://127.0.0.1:1080
+```
 
-## 深入
+## 开发期排障
 
-- 分流依据与优先级 → [routing.md](routing.md)
-- 中继机制、403 诊断、自建 → [relay.md](relay.md)
-- 架构与跳数 → [architecture.md](architecture.md)
+```bash
+# 服务端单测（真实退出码在最后一行）
+cd server && node build.mjs && node test/crypto.mjs && node test/protocol.mjs && node test/integration.mjs
+
+# 端到端：Go 客户端 ↔ Node devserver（同协议对端）
+cd server && node test/devserver.mjs 0 devserver-password 0 &
+cd client && go test ./internal/outbound -run TestProtoE2E -v
+
+# devserver 单独调试：DBG=1 打印每帧
+DBG=1 node test/devserver.mjs 0 devserver-password 0
+```
+
+`devserver.mjs` 的 CLI 是 `node test/devserver.mjs [port] [password] [denyLoopback]`，
+第三参数传 `0` 放开回环目标（生产禁回环，测试要连本地 echo 服务器）。它启动后首行输出
+`PORT=<实际端口>`。
+
+## 相关
+
+- 架构与出口选路：[architecture.md](architecture.md)
+- 配额：[limitations.md](limitations.md)
+- 部署运维：[operations.md](operations.md)

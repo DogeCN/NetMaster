@@ -1,0 +1,86 @@
+name: e2e
+
+# 真实部署验收：对"已部署的 Worker"跑一遍协议层端到端。
+#
+# 与 acceptance.yml 互补：这里验 Node 侧的协议与状态码（错误口令、禁连目标、
+# 多路复用、ProxyIP 竞速成功率…），acceptance.yml 验真实 Go 客户端走通 TLS/ECH
+# → WS → Session DO → 出口 → 回程。
+#
+# 本工作流**不部署**、不改 Worker 状态：只消费一个已存在的部署。所以它在
+# deploy.yml 之后才有意义，且需要干净的网络出口 —— 本地/受限网络里大部分
+# 验收项会因连不上而 SKIP 或 FAIL。
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker:
+        description: "deployed worker hostname (no scheme, e.g. netmaster.<subdomain>.workers.dev). Empty = Secret NETMASTER_WORKER"
+        required: false
+        default: ""
+      rounds:
+        description: "repeated requests for the CF-hosted success-rate check (E2E_CF_ROUNDS)"
+        required: false
+        default: "20"
+      mode:
+        description: "live = the deployed worker; local = in-process devserver self-check (no deployment needed)"
+        required: false
+        default: "live"
+        type: choice
+        options: [live, local]
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # 环境变量名以脚本为准（server/test/e2e.mjs 顶部）：NETMASTER_WORKER 是裸
+      # 主机名或完整 URL 都认，NETMASTER_PASSWORD 只从环境读（脚本不接受口令
+      # 走命令行，免得进 shell 历史）。local 模式不需要任何 Secret —— 它拉起
+      # 进程内 devserver 自检脚本逻辑本身，第 5-8 项会如实 SKIP。
+      - name: Run e2e
+        id: e2e
+        env:
+          NETMASTER_WORKER: ${{ inputs.worker || secrets.NETMASTER_WORKER }}
+          NETMASTER_PASSWORD: ${{ secrets.PASSWORD }}
+          E2E_CF_ROUNDS: ${{ inputs.rounds }}
+          E2E_MODE: ${{ inputs.mode }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          NETMASTER_KV_ID: ${{ secrets.NETMASTER_KV_ID }}
+        run: |
+          set -o pipefail   # 脚本的报错走 stderr，tee 会吞掉退出码
+          node test/e2e.mjs 2>&1 | tee e2e-output.txt
+          echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      # 输出即验收依据：无论成败都留档，失败时不用重跑就能看是哪一项挂了。
+      - name: Upload e2e output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-output-${{ github.run_id }}
+          path: server/e2e-output.txt
+          if-no-files-found: warn
+
+      - name: Fail on script failure
+        if: steps.e2e.outputs.exit != '0'
+        run: |
+          echo "::error::e2e failed (exit ${{ steps.e2e.outputs.exit }}) — see the artifact"
+          exit 1

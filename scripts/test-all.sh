@@ -8,7 +8,7 @@ echo "== 服务端 =="
 cd "$here/../server"
 [ -d node_modules ] || npm install --no-audit --no-fund
 node build.mjs
-for t in crypto protocol integration control relay; do
+for t in crypto protocol integration proxyip race router cron; do
   printf '  %-12s ' "$t"
   node "test/$t.mjs" | tail -1
 done

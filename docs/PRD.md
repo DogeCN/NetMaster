@@ -467,3 +467,64 @@ M6 文档与部署脚本 一键部署脚本在全新账号跑通；README 快速
 ---
 
 本文档为冻结基线，M0 完成并回写结论后可直接作为 M1 开发依据。实现细节变更记入代码仓库文档，PRD 仅在协议或架构变更时递增版本。
+
+---
+
+# 附录：v2 实施修订记录
+
+日期：2026-10-02。本文正文（v1.1）保持冻结，不做改动；以下条目是 M0 平台核验之后定稿的
+架构修订，**覆盖正文对应章节**。实现细节以
+`docs/architecture.md` / `docs/relay.md` / `docs/limitations.md` 与 v2 分支代码为准。
+
+## A1. 砍掉 NAT64 出口（覆盖 §2、§3.3、§7.1、§7.3、§7.4、§8.1、§8.2、§9、§14-M3、§15）
+
+- 依据：M0 E3 实测。Workers `connect()` **不支持 IPv6 出站**——IPv6 字面量与 NAT64 合成
+  地址一律 <2ms 立即失败，连拨号都没发生；level66 `2001:67c:2960:6464::/96`、well-known
+  `64:ff9b::/96`、Trex `2001:67c:2b::/96`、nat64.net `2a00:1098:2b::/96` 四个前缀全部如此，
+  IPv4 对照组 4ms 成功。不是前缀选择问题，是运行时能力缺失。
+- 修订：NAT64 出口从架构中移除。Cloudflare 承载目标的出口**只剩 ProxyIP 中继一类**
+  （`connect()` → 中继 → HTTP CONNECT）。
+- 连带修订：竞速槽位不再是"NAT64 / ProxyIP 交错"，而是**全部为 ProxyIP 候选**，参数
+  （6 槽 / 1.5s / 3s / 120ms）不变；Cron 不再维护 NAT64 前缀池，只维护 ProxyIP 池
+  （`proxyip:top`）；"剔除回指条目"逻辑保留。
+
+## A2. WS 消息按 ≈1:1 计费（覆盖 §10）
+
+- 依据：M0 E1 实测。客户端向 Hibernation DO 发精确数量的消息，与 GraphQL analytics 对照：
+  13:00–14:00 UTC 整点桶 **829 requests**。若 20:1 折算成立，该数字应在 ~75。未观察到
+  任何折算。
+- 修订：**WS 消息按 ≈1:1（或更差）计入免费版每日 10 万请求**。多路复用省下的只是 WS 建连
+  成本，每帧仍是一条请求；"mux 摊薄请求量"的叙事不成立。
+- 协议层约束（已实现，写进 §10）：数据帧尽量满帧（单帧上限 64 KB）；心跳只走 WebSocket
+  **协议层 Ping**（边缘自动应答，不产生 DO 消息、不唤醒 DO，不计请求）；废除逐帧 ACK 与
+  应用层心跳控制帧（`CTRL_TYPE 0x00` 保留但未使用）；认证是连接级一次，后续流零鉴权开销。
+
+## A3. D1 删除，中继亲和改用 Router DO（覆盖 §3.3、§7.5）
+
+- 修订：**D1 已从架构中删除**。目标 → 出口路径的跨会话复用由 Router DO 承载：SQLite 表
+  `routes(target_hash, egress_type, egress_id, updated_at)` + Alarm 异步批量 flush（攒 5 秒
+  或 50 条，同一 hash 只留最新一条）。
+- 连带修订：部署不再需要 `wrangler d1 create` 与 `schema.sql`；Release 产物不再包含
+  `schema.sql`（release.yml 已同步）。
+- 不变：条目 TTL 1 小时、flush 失败重试 1 次后丢弃、进程驱逐丢失未 flush 数据可接受、
+  分片接口 `idFromName("router:<shard>")` 与 16 片阈值保留。
+
+## A4. 无 HTTP 诊断端点，调试走 DEBUG + wrangler tail（确认 §12）
+
+- 正文已写明"无任何 HTTP 诊断端点"，实施再次确认：Worker 入口只认 `pathname === "/"` 且
+  `Upgrade: websocket`，其余一律 404 空 body、无额外头（避免指纹）。
+- 调试路径：Worker 变量 `DEBUG=1` + `npx wrangler tail`，日志前缀 `[session]` /
+  `[router]` / `[cron]`。部署是否健康由"客户端能不能连上"直接回答；客户端 serve 启动后在
+  后台做一次真实建流（目标 `example.com:80`），结果补一行
+  `tunnel established via node <addr>`。
+- CI 无部署后验证：runner 在美国、用户在大陆，runner 能通不代表用户能通。
+
+## A5. 其余按 M0 结论保留的部分
+
+- 并发出站连接（M0 E2：单 DO 12 条并发 `connect()` 全部成功）——6 槽竞速保留为**预算控制**
+  而非性能天花板。
+- DO 休眠语义（M0 E4）：**有出站 socket 的 DO 不休眠**，socket 关闭后才可休眠；空闲 socket
+  由对端在数十秒内关闭。正文 §4.6"休眠期间流保活"的对象不存在，无需对抗：零流的空闲 WS
+  走 Hibernation 不驻留内存，每流死亡走 CLOSE 正常处理。
+- 出口层其余参数、Router DO、Cron 健康检查、KV last-good-wins、EWMA（α=0.3，
+  延迟:成功率 = 7:3）全部保留。
