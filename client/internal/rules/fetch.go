@@ -49,6 +49,10 @@ type Overrides struct {
 	Proxy   string
 	Private string
 	GFW     string
+	// Custom 是调用方已解析好的自定义规则（--rules 指向本地文件）。
+	// 非空时内置源整个不拉：用户显式指定了规则集，再叠一层内置源只会让
+	// "为什么这个域名走了代理"变得没法回答。
+	Custom []Rule
 }
 
 // Sources 在默认源上套用用户覆盖。
@@ -105,6 +109,9 @@ type rulesetCache struct {
 // cachePath 是这份规则集在 cache 包里的标识（留空用 "default"）；geo 用于
 // GeoIP 阶段，传 nil 则该阶段不参与。
 func LoadRules(ctx context.Context, files Overrides, cachePath string, geo GeoResolver) (*Router, error) {
+	if len(files.Custom) > 0 {
+		return New(files.Custom, Proxy, geo), nil
+	}
 	return loadRules(ctx, files.Sources(), cachePath, geo, Proxy)
 }
 

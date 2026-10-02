@@ -119,23 +119,22 @@ func (r *Router) add(rule Rule) {
 		return
 	}
 	value := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(rule.Value)), ".")
+	// 空值只在 geoip-cn 上合法（它不看 Value），其余一律算坏规则。
+	if value == "" && rule.Kind != KindGeoIPCN {
+		r.skipped++
+		return
+	}
 	switch rule.Kind {
 	case KindExact:
-		if value != "" {
-			if _, dup := r.exact[value]; !dup {
-				r.exact[value] = rule.Action
-			}
+		if _, dup := r.exact[value]; !dup {
+			r.exact[value] = rule.Action
 		}
 	case KindSuffix:
-		if value != "" {
-			if _, dup := r.suffix[value]; !dup {
-				r.suffix[value] = rule.Action
-			}
+		if _, dup := r.suffix[value]; !dup {
+			r.suffix[value] = rule.Action
 		}
 	case KindKeyword:
-		if value != "" {
-			r.keyword = append(r.keyword, kwRule{value: value, action: rule.Action})
-		}
+		r.keyword = append(r.keyword, kwRule{value: value, action: rule.Action})
 	case KindCIDR:
 		if c, ok := parseCIDR(value); ok {
 			c.action = rule.Action

@@ -24,7 +24,7 @@ import (
 	"netmaster/internal/selector"
 	"netmaster/internal/procwait"
 	"netmaster/internal/proxy"
-	"netmaster/internal/route"
+	"netmaster/internal/rules"
 	"netmaster/internal/sysproxy"
 )
 
@@ -87,6 +87,31 @@ func requireConn(serverFlag, passwordFlag string) (string, string) {
 		fatal("no password: pass --password or set it in config.json / NETMASTER_PASSWORD")
 	}
 	return server, passwordFlag
+}
+
+// rulesOverridesFromFile 把 --rules 指向的本地规则文件转成"自定义源"。
+// 空路径返回空 Overrides = 用内置源。文件格式与 Clash RULE-SET 一致，
+// 动作按文件名后缀推断（*.direct / *.proxy），推断不出就按 proxy（安全侧）。
+func rulesOverridesFromFile(path string) rules.Overrides {
+	if strings.TrimSpace(path) == "" {
+		return rules.Overrides{}
+	}
+	action := rules.Proxy
+	lower := strings.ToLower(path)
+	if strings.Contains(lower, "direct") {
+		action = rules.Direct
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		// 用户给了坏路径不该静默按内置源跑：看得见的失败比看不见的降级好
+		fatal("read rules file: " + err.Error())
+	}
+	parsed, _ := rules.ParseClashRuleset("custom", string(body), action)
+	if len(parsed) == 0 {
+		fatal("rules file " + path + " has no usable entries")
+	}
+	// 自定义源优先级最高：直接构造 Router，内置源不再拉取。
+	return rules.Overrides{Custom: parsed}
 }
 
 // resolveEntries 组装入口候选：服务端域名解析（永远可用）+ 社区优选源
@@ -164,10 +189,11 @@ func cmdNodes(args []string) {
 	logger.Printf("entries: %d (community: %s)", len(nodes), src)
 	pool := selector.New(selector.Config{Nodes: nodes, SNI: host, Password: pw, UseECH: true, Insecure: true})
 
-	router, err2 := route.LoadDefault(route.Proxy)
-	if err2 != nil {
-		logger.Fatal("rules: ", err2)
+	router, rerr := rules.LoadRules(context.Background(), rules.Overrides{}, "", nil)
+	if rerr != nil {
+		logger.Fatal("rules: ", rerr)
 	}
+	logger.Printf("rules: %d (%s)", router.Size(), router.Source())
 	httpAddr := "127.0.0.1:18081"
 	srv := proxy.New(proxy.Config{HTTPAddr: httpAddr, Router: router, Pool: pool, Logger: logger, DialTimeout: 15 * time.Second})
 	if err := srv.Start(); err != nil {
@@ -250,8 +276,13 @@ func cmdServe(args []string) {
 	}
 
 	// 1. 入口候选（每次启动都尝试刷新社区源；有界等待，失败退缓存）
-	nodes, src := resolveEntries(context.Background(), host)
-	logger.Printf("entries: %d (community: %s)", len(nodes), src)
+	all, src := resolveEntries(context.Background(), host)
+	logger.Printf("entries: %d (community: %s)", len(all), src)
+
+	// 2. IP 优选（PRD §6.6）：并发测延迟，取最快 16 个进池。全流程 ≤ 10s，
+	//    超预算就用已到手的结果 —— 优选是优化，不是能不能用的前提。
+	nodes, took := selector.Optimize(context.Background(), all)
+	logger.Printf("[probe] %d entries -> %d nodes in %s", len(all), len(nodes), took.Round(time.Millisecond))
 
 	pool := selector.New(selector.Config{
 		Nodes:    nodes,
@@ -274,18 +305,15 @@ func cmdServe(args []string) {
 		logger.Printf("[geoip] CN ranges ready: %d (%s)", size, from)
 	})
 
-	// 2. 路由
-	var router *route.Router
-	if *rulesFile != "" {
-		router, err = route.Load(*rulesFile, route.Proxy)
-	} else {
-		router, err = route.LoadDefault(route.Proxy)
-	}
+	// 3. 分流规则：并行拉取内置 Clash 规则集，失败退缓存、再退内置兜底集。
+	//    --rules 只在用户明确指定自己的规则文件时生效（覆盖内置源）。
+	router, err := rules.LoadRules(context.Background(), rulesOverridesFromFile(*rulesFile), "default", geo)
 	if err != nil {
 		fatal("load rules: " + err.Error())
 	}
+	logger.Printf("rules: %d entries (%s, skipped %d lines)", router.Size(), router.Source(), router.SkippedLines())
 
-	// 3. 监听端口自动选择：先试 8080/1080，被占则顺延。用户通常不需要知道
+	// 4. 监听端口自动选择：先试 8080/1080，被占则顺延。用户通常不需要知道
 	// 端口号 —— 系统代理自动指向选定值；--manual 下端口只用来打印。
 	httpPort, err := pickPort(8080)
 	if err != nil {
@@ -311,7 +339,7 @@ func cmdServe(args []string) {
 		fatal("start proxy: " + err.Error())
 	}
 
-	// 4. 系统代理：只在接管时设置并拉起看门狗；--manual 只打印地址。
+	// 6. 系统代理：只在接管时设置并拉起看门狗；--manual 只打印地址。
 	// 顺序是刻意的，见 docs/operations.md —— 先自愈残留，再监听、再接管。
 	if cleaned, err := sysproxy.CleanupStale(); err != nil {
 		logger.Printf("WARN cleanup stale system proxy: %v", err)
