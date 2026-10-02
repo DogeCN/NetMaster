@@ -110,14 +110,17 @@ async function e2() {
 }
 
 // ---- E3: IPv6 字面量 / NAT64 合成 / DoH ----
-// 注意目标全避开 Cloudflare 自有 IP：connect() 禁连 CF 网段（这也是要测的结论之一）。
+// 判读：对 CF IPv6（2606:4700:4700::1111）若报"HTTP-based service"（CF 网段拒绝特有
+// 错误），说明 IPv6 拨号本身是通的、只是 CF 网段拦截；若报"cannot connect"（通用
+// 失败），说明 IPv6 出站根本没拨出去。
 async function e3() {
-  const v6 = await http("/do/p/connect?host=" + encodeURIComponent("2001:4860:4860::8888") + "&port=443");
-  // 2a00:1098:2b::/96 (nat64.net) + 8.8.8.8 -> 2a00:1098:2b::808:808
-  const nat64tcp = await http("/do/p/connect?host=" + encodeURIComponent("2a00:1098:2b::808:808") + "&port=443");
+  const v6google443 = await http("/do/p/connect?host=" + encodeURIComponent("2001:4860:4860::8888") + "&port=443");
+  const v6google853 = await http("/do/p/connect?host=" + encodeURIComponent("2001:4860:4860::8888") + "&port=853");
+  const v6cf = await http("/do/p/connect?host=" + encodeURIComponent("2606:4700:4700::1111") + "&port=443");
   const nat64tcp53 = await http("/do/p/connect?host=" + encodeURIComponent("2a00:1098:2b::808:808") + "&port=53");
+  const v4google = await http("/do/p/connect?host=8.8.8.8&port=443");
   const doh = await http("/w/doh?name=cloudflare.com");
-  report("E3", { ipv6_443: v6, nat64_443_tcp: nat64tcp, nat64_53_tcp: nat64tcp53, doh });
+  report("E3", { v4_google_443: v4google, v6_google_443: v6google443, v6_google_853: v6google853, v6_cf_443: v6cf, nat64_53_tcp: nat64tcp53, doh });
 }
 
 // ---- E4: 出站 socket 跨休眠存活 ----
@@ -141,11 +144,34 @@ async function e4() {
   report("E4-result", { meta2, check, write, persisted: count });
 }
 
+// ---- E5: 出站 socket 跨 DO 驱逐（无 WS 客户端）后的存活 ----
+// 流程：开 socket -> 验证 echo 目标可用 -> 客户端断开 WS -> 等待 DO 被驱逐 ->
+// 新 WS 连回同一 DO -> 看 isolateBorn / instanceSockets / globalSockets，
+// 再 check/write 全局表里的 socket。
+async function e5() {
+  const c1 = await wsConnect("e5");
+  const opened = await c1.req("open:E5:tcpbin.com:4242", 15000);
+  const write1 = await c1.req("write:E5:" + b64("ping-e5\n"), 15000);
+  c1.close();
+  console.log("E5: ws closed; idling 45s to let the DO be evicted ...");
+  await sleep(45000);
+  const c2 = await wsConnect("e5");
+  const meta = await c2.req("meta");
+  const check = await c2.req("check:E5");
+  let write2 = null;
+  if (check.where !== "none") {
+    write2 = await c2.req("write:E5:" + b64("ping-e5-after\n"), 15000);
+  }
+  c2.close();
+  report("E5-result", { opened, write1, meta, check, write2 });
+}
+
 (async () => {
   await e1();
   await e2();
   await e3();
   await e4();
+  await e5();
   writeFileSync("drive-results.json", JSON.stringify(out, null, 2));
   console.log("\nwrote drive-results.json");
 })().catch((e) => {
