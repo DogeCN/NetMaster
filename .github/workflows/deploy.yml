@@ -58,35 +58,33 @@ jobs:
       # KV 命名空间：Cron 每小时写入口健康排名（proxyip:top）。找不到就建一个同名
       # 的，然后把 wrangler.toml 里的占位 id 就地改写 —— 配置里不留需要用户填的
       # 东西，代价是 CI 负责把占位符换成真值。
+      #
+      # 走 REST API 而不是 `wrangler kv namespace list --json`：wrangler 4.146 的
+      # 这个子命令没有 --json flag（会打印帮助页并退出 0），解析它只能靠正则扒
+      # 人类可读的表格。API 的 JSON 是稳定的。
       - name: Ensure same-name KV namespace exists
+        id: kv
+        env:
+          KV_ID: ${{ steps.kv.outputs.id }}
         run: |
-          kv_id() {
-            npx wrangler kv namespace list --json 2>/dev/null | node -e '
-              let d = "";
-              process.stdin.on("data", c => d += c).on("end", () => {
-                try {
-                  const arr = JSON.parse(d.slice(d.indexOf("[")));
-                  const hit = arr.find(x => x.title === "netmaster");
-                  console.log(hit ? hit.id : "");
-                } catch { console.log(""); }
-              });'
-          }
-          KV_ID="$(kv_id)"
-          if [ -z "$KV_ID" ]; then
+          id=$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const j=JSON.parse(d);const n=(j.result||[]).find(x=>x.title==="netmaster");console.log(n?n.id:"");})')
+          if [ -z "$id" ]; then
             echo "KV namespace 'netmaster' not found — creating"
-            npx wrangler kv namespace create netmaster
-            KV_ID="$(kv_id)"
+            id=$(curl -sS -X POST -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json" -d '{"title":"netmaster"}' "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{console.log(JSON.parse(d).result.id);})')
           fi
-          if [ -z "$KV_ID" ]; then
+          if [ -z "$id" ]; then
             echo "::error::failed to resolve KV namespace id for 'netmaster'"
             exit 1
           fi
-          echo "KV 'netmaster' ready ($KV_ID)"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "KV 'netmaster' ready ($id)"
 
       - name: Patch wrangler.toml
+        env:
+          KV_ID: ${{ steps.kv.outputs.id }}
         run: |
           sed -i "s/^id = \"00000000000000000000000000000000\"/id = \"$KV_ID\"/" wrangler.toml
-          grep -A2 kv_namespaces wrangler.toml
+          grep -A3 kv_namespaces wrangler.toml
 
       - name: Deploy Worker
         run: npx wrangler deploy
