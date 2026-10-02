@@ -14,9 +14,9 @@ on:
   workflow_dispatch:
     inputs:
       worker:
-        description: "deployed worker hostname (no scheme, e.g. netmaster.<subdomain>.workers.dev). Empty = Secret NETMASTER_WORKER"
+        description: "deployed worker hostname (no scheme). Empty falls back to Secret NETMASTER_WORKER, then to the repo's own deployment"
         required: false
-        default: ""
+        default: "netmaster.edge-tunnel.workers.dev"
       rounds:
         description: "repeated requests for the CF-hosted success-rate check (E2E_CF_ROUNDS)"
         required: false
