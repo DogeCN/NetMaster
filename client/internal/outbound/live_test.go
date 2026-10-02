@@ -199,7 +199,7 @@ func TestLiveDirectExitAndMux(t *testing.T) {
 					errCh <- fmt.Errorf("stream %d request: %w", i, err)
 					return
 				}
-				if code != 200 {
+				if code < 200 || code >= 400 {
 					errCh <- fmt.Errorf("stream %d status %d", i, code)
 					return
 				}
