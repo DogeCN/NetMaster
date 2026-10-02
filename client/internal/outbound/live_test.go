@@ -176,15 +176,21 @@ func TestLiveCFHostedSuccessRate(t *testing.T) {
 			reasons[trimErr(err.Error())]++
 			continue
 		}
-		code, _, err := httpOverStream(conn, "neverssl.com", "/")
-		conn.Close()
+		tlsConn, err := tlsOverStream(conn, "www.cloudflare.com")
+		if err != nil {
+			reasons[trimErr("tls: "+err.Error())]++
+			conn.Close()
+			continue
+		}
+		code, body, err := httpOverStream(tlsConn, "www.cloudflare.com", "/")
+		tlsConn.Close()
 		switch {
 		case err != nil:
 			reasons[trimErr(err.Error())]++
 		case code >= 200 && code < 400:
 			okCount++
 		default:
-			reasons[fmt.Sprintf("http %d", code)]++
+			reasons[fmt.Sprintf("http %d: %q", code, body[:min(120, len(body))])]++
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
