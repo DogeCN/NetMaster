@@ -7,7 +7,7 @@
 
 import { startRelayMock } from "./proxyip.mjs";
 import { parseRelayEntries } from "../src/race.js";
-import { RELAY_TYPE_HTTP_CONNECT } from "../src/proxyip.js";
+import { RELAY_TYPE_SNI } from "../src/proxyip.js";
 import {
   parseRelayList,
   fetchRelayPool,
@@ -139,7 +139,7 @@ async function run() {
     const top = buildTop(ranked, KV_TOP_N);
     ok(top.length === 1 && top[0].host === "127.0.0.1", "buildTop keeps only usable relays", JSON.stringify(top));
     ok(eq(Object.keys(top[0]).sort(), ["host", "ms", "port", "type"]), "entry has exactly host/port/type/ms", JSON.stringify(Object.keys(top[0])));
-    ok(top[0].type === RELAY_TYPE_HTTP_CONNECT, "type is http-connect");
+    ok(top[0].type === RELAY_TYPE_SNI, "type is sni (public relays are SNI-routed)");
     ok(typeof top[0].ms === "number", "ms is a number");
     // 与消费端逐字段对齐：写进去的东西 race.js 必须能原样读出来
     const roundTrip = parseRelayEntries(JSON.stringify(top));

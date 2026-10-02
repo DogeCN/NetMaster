@@ -526,5 +526,32 @@ M6 文档与部署脚本 一键部署脚本在全新账号跑通；README 快速
 - DO 休眠语义（M0 E4）：**有出站 socket 的 DO 不休眠**，socket 关闭后才可休眠；空闲 socket
   由对端在数十秒内关闭。正文 §4.6"休眠期间流保活"的对象不存在，无需对抗：零流的空闲 WS
   走 Hibernation 不驻留内存，每流死亡走 CLOSE 正常处理。
-- 出口层其余参数、Router DO、Cron 健康检查、KV last-good-wins、EWMA（α=0.3，
-  延迟:成功率 = 7:3）全部保留。
+- 出口层其余参数、Router DO、KV last-good-wins 全部保留。（健康检查的形态与 EWMA
+  评分见 A6：已随 Cron 一起移出 Worker。）
+
+## A6. 移除 Worker Cron，中继池刷新改由 GitHub Actions 定时任务承担
+（覆盖 §2、§3.3、§7.1、§8.2、§9、§10、§14-M5、§15）
+
+- 日期：2026-10-02。
+- 依据：免费版 Cron 触发**不可靠**——实测只有整点触发，且整点也可能漏发。而 KV 里的
+  `proxyip:top` 决定 CF 承载目标的出口质量，池子该更新时没更新，用户看到的就是"时好时坏"。
+  同时免费版 Cron 触发每次运行只有 50 次外部子请求，逼得探测必须分批游标续跑（正文 §9
+  的分批流程即由此而来）。
+- 修订：Worker 侧 Cron 整体移除 —— 删除 `server/src/cron.js`、`index.js` 的 `scheduled`
+  handler、`wrangler.toml` 的 `[triggers] crons`。替代是 `.github/workflows/
+  refresh-relays.yml`：`schedule` 每小时一次 + `workflow_dispatch`，跑
+  `server/tools/refresh-relays.mjs`（拉源 → 并发探测 → 排序 → 写 KV `proxyip:top`）。
+- 排序口径变化：**不再做 EWMA**（α=0.3、延迟:成功率 = 7:3）。runner 每轮都是全新观测、
+  没有历史可平滑，EWMA 在这里没有可平滑的对象；改为"成功率 desc → 平均延迟 asc"。
+  last-good-wins 保留（本轮全败不写、保留上一轮、退出码 0）。
+- 影响面（M5 里程碑的形态变化）：M5 从"Worker 内每小时健康检查"变成"仓库侧定时任务"。
+  - 验收口径随之改变：不再有 `[cron]` 服务端日志可查，排障现场是 Actions 的 run 页面；
+    `cron:lastRun` / `cron:cursor` / `cron:pending` 三个 KV 键不再存在（探测在 runner 上
+    一次跑完，没有分批续跑的中间状态），KV 只剩 `proxyip:top` 一个键。
+  - **`schedule` 是"每小时左右"不是准点**（GitHub 官方说明有几分钟级延迟，高峰期可能更久）；
+    仓库连续 60 天无活动时 GH 会**自动停用**定时任务。两者都是预期行为，不是故障。
+  - 约束方从 Cloudflare 免费版的 50 次/轮子请求，换成 GitHub 托管 runner 的分钟数
+    （私有仓库 2000 分钟/月；每轮约 1 分钟，每小时一轮 ≈ 720 分钟/月）。
+- 连带订正：A4 里"日志前缀 `[session]` / `[router]` / `[cron]`"一句中的 `[cron]`
+  已失效——Cron 移除后服务端只剩前两个前缀。A4 其余内容（无 HTTP 诊断端点、
+  `DEBUG=1` + `wrangler tail`、部署健康由客户端建流回答）不受影响。

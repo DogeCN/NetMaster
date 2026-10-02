@@ -8,9 +8,14 @@ echo "== 服务端 =="
 cd "$here/../server"
 [ -d node_modules ] || npm install --no-audit --no-fund
 node build.mjs
-for t in crypto protocol integration proxyip race router cron; do
+# crypto/protocol 是纯逻辑；其余套件经 socket.js 摸平台模块，要挂 Node shim
+for t in crypto protocol; do
   printf '  %-12s ' "$t"
   node "test/$t.mjs" | tail -1
+done
+for t in integration proxyip race router refresh-relays; do
+  printf '  %-12s ' "$t"
+  NODE_OPTIONS="--import ./test/shims/register.mjs" node "test/$t.mjs" | tail -1
 done
 
 echo "== 客户端 =="

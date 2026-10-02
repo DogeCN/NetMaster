@@ -71,8 +71,7 @@ npx wrangler deploy
 
 `wrangler.toml` 里的 KV `id` 是占位符 `00000000000000000000000000000000`，直接
 `wrangler deploy` 会因 id 非法而失败——**这是有意的：别拿占位符上线**。不需要 KV 时把
-`[[kv_namespaces]]` 整段删掉即可：缺少 KV 绑定时竞速只用内置兜底列表、Cron 直接跳过，
-功能不残。
+`[[kv_namespaces]]` 整段删掉即可：缺少 KV 绑定时竞速只用内置兜底列表，功能不残。
 
 `keep_vars = false` 是显式写出的：部署时删除 Worker 上已存在、但本文件里没有的变量。一份
 不描述现实的配置文件比没有配置文件更糟。
@@ -80,7 +79,7 @@ npx wrangler deploy
 ## 部署产物
 
 `_worker.js` 由 `server/build.mjs` 把 `src/` 下 9 个模块拼接成一个文件
-（crypto → protocol → exits → proxyip → race → router → cron → session → index）。
+（crypto → protocol → exits → proxyip → race → router → session → index）。
 它是**生成物**，改 `src/` 之后重新 `node build.mjs`。
 
 `build.mjs` 同时是 CI 的语法门：`src/` 里任何一个走错字符都会在这里失败，而不是在生产里。
@@ -90,7 +89,7 @@ npx wrangler deploy
 | 变量 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `PASSWORD` | Secret | — | 首帧 HMAC 密钥。必需 |
-| `DEBUG` | var | 空 | `'1'` 打开 `[session]` / `[router]` 日志，配合 `wrangler tail`。Cron 的统计行不受它控制，每轮都打 |
+| `DEBUG` | var | 空 | `'1'` 打开 `[session]` / `[router]` 日志，配合 `wrangler tail` |
 | `RACE_SLOTS` | var | 6 | 竞速槽位数 |
 | `RACE_SLOT_TIMEOUT_MS` | var | 1500 | 单槽超时 |
 | `RACE_GLOBAL_TIMEOUT_MS` | var | 3000 | 竞速全局超时 |
@@ -107,7 +106,7 @@ npx wrangler deploy
 |---|---|---|---|
 | `SESSION` | Durable Object（内存） | `v1` | 每条 WS 一个实例，不落盘 |
 | `ROUTER` | Durable Object（SQLite） | `v2` | 全局单实例，存目标 → 出口映射 |
-| `KV` | KV namespace | — | Cron 写 `proxyip:top` |
+| `KV` | KV namespace | — | 订阅更新任务写 `proxyip:top`（见下节） |
 
 Migration 随 `wrangler deploy` 自动应用，不需要额外步骤。
 
@@ -118,30 +117,62 @@ Router DO 的写入是"先返回、后落盘"：攒 5 秒或 50 条 flush 一次
 `forget` 不排队，立即生效：映射被证伪时必须马上删，不能跟着队列一起等 5 秒，否则下一条流
 会踩同一脚。
 
-## Cron
+## 中继池刷新（GitHub Actions 定时任务，可选）
 
-`wrangler.toml` 里 `crons = ["0 * * * *"]`，每小时一次。`index.js` 的 `scheduled` 转交
-`cron.js` 的 `runCron`。完整流程见 [architecture.md](architecture.md) 第 7 节，这里只记运维
-关心的部分。
+`proxyip:top` 是竞速用的"当前最健康的 4 个中继"。它由
+`.github/workflows/refresh-relays.yml` 刷新：**每小时左右**跑一次
+`server/tools/refresh-relays.mjs`，拉社区源 + 内置兜底 → 并发探测（CONNECT
+握手，3s 超时）→ 按成功率/延迟排序 → 取前 4 写进 KV，last-good-wins（本轮全败
+就不写，保留上一轮）。
 
-它做的：拉内置中继源（失败用 6 条内置兜底）→ 剔除回指本 Worker 地址的条目 → 分批探测
-（每轮 ≤48，游标断点续跑）→ 按 EWMA（α=0.3，延迟:成功率 = 7:3）排序 → 取前 4 写进 KV 的
-`proxyip:top`，last-good-wins。
+### 默认不开，也不影响使用
 
-用到的 KV 键：
+这一点值得说清：
+
+- **不启用这个定时任务，代理照样能用。** KV 为空时竞速只用内置兜底列表
+  （`proxyip.js` 的 9 条 CMLiussss），功能不残，只是候选质量差一些、命中率
+  低一些。
+- **启用之后**，KV 里有新鲜的健康排名，竞速把 KV top4 排在候选最前，
+  CF 承载目标的出口质量明显更好。
+- **GitHub 的 `schedule` 是"每小时左右"而不是准点**（官方说明有几分钟级延迟，
+  高峰期可能更久）。看到 KV 时间戳比整点晚几分钟是**正常的**，不是故障。
+  另外仓库连续 60 天无活动时 GH 会自动停用定时任务——长期不用的 fork 别指望它。
+
+启用：给仓库配两个 Secret（`CLOUDFLARE_API_TOKEN` 需 **KV 写**权限、
+`CLOUDFLARE_ACCOUNT_ID`），然后手动 `workflow_dispatch` 跑一次看输出；
+建议先勾 `dry_run=true` 确认它会写什么。
+
+### 用到的 KV 键
 
 | 键 | 内容 |
 |---|---|
 | `proxyip:top` | 前 4 名中继（竞速读它） |
-| `cron:cursor` | 分批游标 |
-| `cron:pending` | 本轮累计的探测结果（未排序） |
-| `cron:lastRun` | 上一轮完成时间 |
 
-约束：Cron 触发每次运行最多 50 次外部子请求（免费版），预算取 48（留 2 个给 KV 读写），
-节点超预算时用游标分多轮跑完。
+只有这一个键，没有游标、没有 pending：探测是在 runner 上一次性跑完的，不存在
+"分批续跑"的中间状态。
 
-排障：Cron 每轮结束会打一行结构化日志 `[cron] {"batch":…,"total":…,"done":…,"source":…,"written":…}`。
-`KV` 绑定缺席时打 `[cron] skipped: KV binding missing`；Cron 失败不重试，下一轮自然会重来。
+### 排障
+
+run 页面就是唯一的排障现场，日志里逐条打印每个候选的成败与原因：
+
+```
+source https://ipdb.api.030101.xyz/?type=bestproxy: 10 entries
+source builtin:cmliussss: 9 entries
+probing 19 relays (concurrency 8, timeout 3000ms, target cp.cloudflare.com:80)
+probes: 3/19 usable
+  ok   ProxyIP.HK.CMLiussss.net:443 182ms
+  fail 8.218.70.238:443 46ms (CONNECT status 405)
+last-good-wins: no usable relay this round (19 probed) — keeping the previous proxyip:top
+```
+
+**绿灯不等于池子被刷新过**：本轮全败时也退出 0（定时任务红了会让人习惯性忽略），
+所以要认 `last-good-wins: …` 这一行，而不是只看 run 是不是绿的。
+
+本地干跑（真拉源 + 真探测，不写 KV）：
+
+```bash
+cd server && DRY_RUN=1 node tools/refresh-relays.mjs
+```
 
 ## 构建与测试
 
@@ -155,7 +186,7 @@ node test/integration.mjs
 node test/proxyip.mjs  # 中继 CONNECT、兜底列表、健康记忆
 node test/race.mjs     # 竞速与候选组装
 node test/router.mjs   # Router DO 队列与 flush
-node test/cron.mjs
+node test/refresh-relays.mjs  # 中继池刷新脚本（替代 Worker Cron）
 
 cd client && go vet ./... && go test ./...           # 客户端
 
@@ -167,8 +198,12 @@ cd client && go test ./internal/outbound -run TestProtoE2E -v
 注意：`scripts/test-all.sh` 当前仍按 `for t in crypto protocol integration control relay`
 遍历，而 `control.mjs` / `relay.mjs` 在 `server/test/` 下已不存在（`control` 的内容现在在
 `proxyip.mjs` / `race.mjs`），真实存在的是
-`cron / crypto / devserver / integration / protocol / proxyip / race / router`。也就是说
-**本地全量脚本当前跑不通**（`.github/workflows/ci.yml` 已经更新为 v2 列表，只是它没跟上）。
+`crypto / devserver / integration / protocol / proxyip / race / refresh-relays / router`。
+也就是说 **本地全量脚本当前跑不通**（`.github/workflows/ci.yml` 已经更新为 v2 列表，只是
+它没跟上）。
+
+（`test/cron.mjs` 曾在这个列表里，随 Worker Cron 一起删除了——Cron 的替代品
+`refresh-relays.mjs` 有自己的单测。）
 
 `scripts/test-all.sh` 用 `set -o pipefail`——node 的报错走 stderr，`tail` 会吞掉退出码，不
 加这个测试挂了 CI 也是绿的。

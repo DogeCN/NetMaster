@@ -51,11 +51,10 @@
 | 竞速槽位 / 单槽 / 全局 / 交错 | 6 / 1500 ms / 3000 ms / 120 ms | `race.js`（`RACE_*` 环境变量可覆盖） |
 | KV 取前 N 个中继 | 4 | `race.js` `RACE_KV_TOP` |
 | 中继健康记忆 TTL / 上限 | 10 分钟 / 256 条 | `proxyip.js` |
-| Router DO 条目 TTL | 1 小时（与 Cron 周期对齐） | `router.js` `ROUTE_TTL_MS` |
+| Router DO 条目 TTL | 1 小时 | `router.js` `ROUTE_TTL_MS` |
 | Router DO flush | 攒 5 秒或 50 条 | `router.js` |
-| Cron 子请求预算 | 48 次/轮（免费版上限 50） | `cron.js` `SUBREQUEST_BUDGET` |
-| Cron 单次探测超时 | 3 秒 | `cron.js` `PROBE_TIMEOUT_MS` |
-| Cron 评分 | EWMA α=0.3，延迟:成功率 = 7:3 | `cron.js` |
+| 中继池刷新周期 | 每小时左右（GH Actions `schedule`） | `refresh-relays.yml` |
+| 中继池探测：并发 / 超时 / 候选上限 | 8 / 3 秒 / 60 | `tools/refresh-relays.mjs` |
 | 客户端入口候选上限 | 64 | `main.go` `maxEntries` |
 | 客户端社区源等待上限 | 3 秒 | `main.go` `resolveEntries` |
 | IP 优选：并发 / 单次超时 / 全流程预算 / 取前 N | 12 / 4 秒 / 10 秒 / 16 | `probe.go` |
@@ -65,7 +64,7 @@
 | ECH 尝试预算 / 短路 | 2 秒 / 60 秒 | `client.go` / `ech.go` |
 | 直连阻断冷却 | 30 分钟 | `selector.go` `directBlockedTTL` |
 | geoip 表 TTL | 7 天 | `geoip.go` `DefaultTTL` |
-| Cron 周期 | 每小时（`0 * * * *`） | `wrangler.toml` |
+| 中继池刷新周期 | 每小时左右（GH Actions `schedule`） | `refresh-relays.yml` |
 
 ## 存储配额
 
@@ -74,7 +73,13 @@
 | SQLite 行写（免费版） | 100k 行/日 | 主要来源是 Router DO flush：同一 target 只留最新一条（`RouteQueue` 按 hash 去重），个人规模无压力 |
 | SQLite 行读（免费版） | 5M 行/日 | 每未命中流 1 读，会话级缓存摊薄 |
 | SQLite 存储 | 单 DO 10 GB；账户总计免费版 5 GB | 只存目标哈希（不含域名），用量 < 1 MB |
-| KV 读 | ~10 ms、最终一致 | 竞速读 `proxyip:top`；Cron 读写 `cron:*` 游标键。都不在每条流的路径上 |
+| KV 读 | ~10 ms、最终一致 | 竞速读 `proxyip:top`（每未命中流一次，不在每条流的路径上）；写入侧是 GH Actions 每小时一次，不占 Worker 配额 |
+| GH Actions 托管 runner | 私有仓库 2000 分钟/月（免费版），公开仓库免费 | 中继池刷新每轮约 1 分钟（含 checkout/setup-node），每小时一轮 ≈ 720 分钟/月 |
+
+最后一行是这次把中继池刷新从 Worker Cron 搬到 GitHub Actions 换来的账：**约束方从
+Cloudflare 免费版的 50 次/轮子请求，换成了 GitHub 的 runner 分钟数。** 前者是硬天花板
+（所以要分批游标、要留 2 个给 KV 读写），后者对个人仓库宽裕得多——代价是触发时刻不再
+准点（GH `schedule` 有几分钟级延迟），且仓库连续 60 天无活动时定时任务会被自动停用。
 
 `target_hash` 只存目标域名（小写）SHA-256 前 16 字节十六进制，不存域名——路由表是缓存，
 不是访问日志，没必要留可还原的目标名。

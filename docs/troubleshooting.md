@@ -54,11 +54,13 @@ npx wrangler tail --format json    # JSON 格式
 [session] stream 7 no first byte in 3000ms, forgetting route
 [session] stream 7 connect failed: …; all proxyip exits failed
 [router] flush dropped 3 rows: …
-[cron] {"batch":48,"total":120,"done":false,"source":"fetched"}
 ```
 
-注意：`DEBUG` 是变量不是 Secret，改完要重新部署才生效。**Cron 的统计行不受 `DEBUG` 限制**——
-它每轮都打，方便确认健康检查有没有真的跑。
+注意：`DEBUG` 是变量不是 Secret，改完要重新部署才生效。
+
+中继池刷新（`refresh-relays` 定时任务）**没有服务端日志**——它跑在 GitHub Actions 的
+runner 上，不在 Worker 里。要看它的输出去 Actions 的 run 页面：那里逐条打印每个候选中继
+的成败与原因（`ok … 182ms` / `fail … (CONNECT status 405)`）。
 
 ## 症状对照
 

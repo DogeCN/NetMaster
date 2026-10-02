@@ -1,8 +1,11 @@
 # NetMaster
 
 自建代理客户端 + Cloudflare Worker 服务端。服务端跑在 Workers **免费版**：一个
-Worker、两个 Durable Object、一个 KV 命名空间、一个每小时一次的 Cron。客户端是
-Go 写的本地 HTTP + SOCKS5 代理，负责分流、入口候选与 ECH 出站。
+Worker、两个 Durable Object、一个 KV 命名空间。客户端是 Go 写的本地 HTTP + SOCKS5
+代理，负责分流、入口候选与 ECH 出站。
+
+KV 里那份中继健康排名由一个可选的 GitHub Actions 定时任务刷新（每小时左右）——
+不开它也能用，见[架构](#架构)。
 
 两端同属本仓库，协议也是自己的：WebSocket 之上的多路复用帧，连接级一次
 HMAC 认证。没有用户标识符要生成、没有数据库 ID 要复制、没有订阅地址要粘贴，
@@ -32,6 +35,10 @@ HMAC 认证。没有用户标识符要生成、没有数据库 ID 要复制、�
 Cloudflare 承载的站点时，Workers 的 `connect()` 不能拨 CF 自己的 IP，只能借第三方
 中继，四跳。**NAT64 出口已砍**——M0 实测 Workers `connect()` 不支持 IPv6 出站
 （见 [docs/m0-findings.md](docs/m0-findings.md)）。
+
+KV 里的中继健康排名（`proxyip:top`）由 GitHub Actions 的 `refresh-relays` 定时任务刷新，
+**默认不开也不影响使用**——不开时竞速只用内置兜底列表。启用方式与排障见
+[docs/operations.md](docs/operations.md)。
 
 ## 快速开始
 
@@ -80,8 +87,7 @@ npx wrangler deploy
 
 注意：`wrangler.toml` 里的 KV `id` 是占位符（`0000…0000`），直接 `wrangler deploy`
 会因 id 非法而失败——这是有意的，别拿占位符上线。无需 KV 时可以把
-`[[kv_namespaces]]` 整段删掉：缺少 KV 绑定时竞速只用内置兜底列表、Cron 直接跳过，
-功能不残。
+`[[kv_namespaces]]` 整段删掉：缺少 KV 绑定时竞速只用内置兜底列表，功能不残。
 
 ### 2. 客户端
 
@@ -207,7 +213,8 @@ cd client && go build ./... && go vet ./... && go test ./...
 # 服务端
 cd server && npm ci && node build.mjs && npm test
 
-# 单个服务端测试（真实存在的：cron / crypto / integration / protocol / proxyip / race / router）
+# 单个服务端测试（真实存在的：crypto / integration / protocol / proxyip / race /
+# refresh-relays / router）
 cd server && node test/router.mjs
 
 # 端到端（Go 客户端 ↔ Node devserver，同协议对端）
