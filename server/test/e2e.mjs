@@ -872,6 +872,8 @@ async function item5() {
       skip("local mode: devserver has no ProxyIP/RACING path, and CF-hosted targets are unreachable from this network")
     );
   }
+  // 步预算按参数算：池子半黑时每轮 dial 可能吃满 streamTimeoutMs（是"慢"不是
+  // "挂"），固定 90s 会把合法的慢轮次错杀成超时。
   await step("5.1 ProxyIP exit to CF-hosted target: N-round success rate", async () => {
     const m = new Mux(cfg.endpoint, cfg.password);
     await m.open();
@@ -923,7 +925,7 @@ async function item5() {
     if (rate >= cfg.minRate) return pass(`${ok}/${cfg.rounds} = ${rate.toFixed(1)}% (target ≥${cfg.minRate}%)`);
     if (rate >= 50) return pass(`WARNING: ${ok}/${cfg.rounds} = ${rate.toFixed(1)}% below the ${cfg.minRate}% aspiration (public relay volatility, PRD A7)`);
     return fail(`${ok}/${cfg.rounds} = ${rate.toFixed(1)}% < 50% — exits are broken`);
-  });
+  }, cfg.rounds * (cfg.streamTimeoutMs + 300) + 90_000);
 }
 
 function median(a) {
