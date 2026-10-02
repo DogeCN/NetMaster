@@ -1,0 +1,19 @@
+{
+  "name": "netmaster-m0",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "M0 platform probe for the NetMaster v2 design; deployed temporarily and then deleted",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "drive": "node drive.mjs"
+  },
+  "devDependencies": {
+    "https-proxy-agent": "^9.1.0",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

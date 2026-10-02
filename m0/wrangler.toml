@@ -1,0 +1,19 @@
+# M0 平台核验探针。临时部署（netmaster-m0），测完即删，不入 Release。
+# 部署：CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID 取自仓库根 .env，
+#   cd m0 && npx wrangler deploy && npx wrangler secret put PROBE_TOKEN
+# 所有端点要求 ?t=<PROBE_TOKEN>，不匹配一律 404 空 body。
+
+name = "netmaster-m0"
+main = "src/worker.js"
+compatibility_date = "2025-11-04"
+
+[[durable_objects.bindings]]
+name = "PROBE"
+class_name = "ProbeDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ProbeDO"]
+
+[observability]
+enabled = true

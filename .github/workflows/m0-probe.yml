@@ -1,0 +1,70 @@
+name: m0-probe
+
+# M0 平台核验：把探针 worker 部署到真实账号，跑完 E1-E4 实验后回收产物。
+# 用 GitHub runner 而不是本地跑驱动，因为 workers.dev 在部分地区被 SNI 阻断，
+# 而 runner 的网络是干净的。临时流程，M0 结论落档后整个 m0/ 与本文件一并删除。
+
+on:
+  workflow_dispatch:
+    inputs:
+      teardown:
+        description: "Delete the probe worker after the run"
+        type: boolean
+        default: false
+  push:
+    branches: [v2]
+    paths: ["m0/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: m0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy probe worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx wrangler deploy
+          TOKEN="$(openssl rand -hex 16)"
+          echo "PROBE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          printf '%s' "$TOKEN" | npx wrangler secret put PROBE_TOKEN
+
+      - name: Wait for propagation
+        run: sleep 20
+
+      # E1-E4 总时长约 3 分钟（E1 与 E4 各含一段静置等待）。
+      - name: Run experiments
+        run: node drive.mjs https://netmaster-m0.edge-tunnel.workers.dev "$PROBE_TOKEN" 2>&1 | tee drive-output.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: m0-drive-results
+          path: |
+            m0/drive-results.json
+            m0/drive-output.txt
+          if-no-files-found: warn
+
+      - name: Teardown
+        if: github.event_name == 'workflow_dispatch' && inputs.teardown
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler delete --name netmaster-m0 --force

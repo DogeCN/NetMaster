@@ -17,3 +17,8 @@ config.json
 .idea/
 Thumbs.db
 .DS_Store
+
+# M0 探针的本地产物与依赖
+m0/node_modules/
+m0/.probe-token
+m0/drive-results.json
