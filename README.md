@@ -1,58 +1,105 @@
 # NetMaster
 
-自建代理客户端 + Cloudflare Worker 服务端。目标：把"分流选路"和"最后一跳的连通性"
-这两件一直靠手调的事变成自动的。
+自建代理客户端 + Cloudflare Worker 服务端。服务端跑在 Workers **免费版**：一个
+Worker、两个 Durable Object、一个 KV 命名空间。客户端是 Go 写的本地 HTTP + SOCKS5
+代理，负责分流、入口候选与 ECH 出站。
+
+KV 里那份中继健康排名由一个可选的 GitHub Actions 定时任务刷新（每小时左右）——
+不开它也能用，见[架构](#架构)。
+
+两端同属本仓库，协议也是自己的：WebSocket 之上的多路复用帧，连接级一次
+HMAC 认证。没有用户标识符要生成、没有数据库 ID 要复制、没有订阅地址要粘贴，
+也没有任何 HTTP 端点——口令两端各自本地派生成 16 字节签名，网络上不出现明文。
+
+## 架构
 
 ```
-浏览器 ──▶ netmaster (127.0.0.1:8080 / :1080)
-              │
-              ├─ 国内站 ──────────────▶ 目标站            直连，2 跳
-              │
-              └─ 境外站 ──▶ 内部协议 over WS ──▶ Cloudflare 边缘(worker) ──▶ 目标站
-                                                            └──▶ [中继] ──▶ 目标站   4 跳
+浏览器 / 任意 TCP 应用
+        │  SOCKS5 (127.0.0.1:1080)  ──  HTTP CONNECT (127.0.0.1:8080)
+        ▼
+  netmaster（本机 Go 客户端）
+        │  分流：Clash 规则集 → geoip → 兜底；入口并发优选
+        ├──────────────── 直连 ────────────────────────────▶ 目标站        2 跳
+        │
+        │  wss://  TLS(ECH) + WebSocket + 协议 v2 mux 帧
+        ▼
+  Cloudflare 边缘 Worker ──▶ Session DO（每连接一个，Hibernation）
+                                  │  出口选路
+                                  ├── 直连 connect() ───────────────────▶ 目标站   3 跳
+                                  │
+                                  └── ProxyIP 中继（HTTP CONNECT）──────▶ 目标站   4 跳
+                                        候选：会话缓存 → Router DO → 竞速(KV top4 + 内置兜底)
 ```
 
-## 组成
+跳数说明：直连是"客户端 → 目标"两跳；走服务端非 CF 托管目标是三跳；目标是
+Cloudflare 承载的站点时，Workers 的 `connect()` 不能拨 CF 自己的 IP，只能借第三方
+中继，四跳。**NAT64 出口已砍**——M0 实测 Workers `connect()` 不支持 IPv6 出站
+（见 [docs/m0-findings.md](docs/m0-findings.md)）。
 
-| 目录 | 内容 |
-|---|---|
-| `client/` | Go 客户端：本地 HTTP/SOCKS5 代理、分流、入口候选池、ECH |
-| `server/` | Cloudflare Worker：自有协议 mux 转发、中继动态获取与亲和 |
-| `docs/` | 架构、分流、中继、运维、排障 |
-| `scripts/` | 构建脚本 |
+KV 里的中继健康排名（`proxyip:top`）由 GitHub Actions 的 `refresh-relays` 定时任务刷新，
+**默认不开也不影响使用**——不开时竞速只用内置兜底列表。启用方式与排障见
+[docs/operations.md](docs/operations.md)。
 
 ## 快速开始
 
-前提：一个 Cloudflare 账号、一个托管在 CF 的域名（客户端要连它）。全程只涉及
-一个口令（PASSWORD）和一个域名，没有别的。
+前提：一个 Cloudflare 账号、一个托管在 Cloudflare 的域名（客户端要连它）。全程只
+涉及一个口令（PASSWORD）和一个域名，没有别的。
 
-### 1. 服务端
+### 1. 部署服务端
 
-**首选：不克隆仓库，直接部署。** 从 [Release](../../releases/latest) 下载
-`_worker.js`、`wrangler.toml`、`schema.sql` 放进同一目录，然后：
+**方式 A：fork 后走 CI（推荐）。**
+
+1. fork 本仓库；
+2. 在仓库 Settings → Secrets 里配三个 Secret：
+   - `PASSWORD`——你定的口令，客户端要用同一个；
+   - `CLOUDFLARE_API_TOKEN`——有 Workers 编辑权限的 API Token；
+   - `CLOUDFLARE_ACCOUNT_ID`——账号 ID（控制台右侧可复制）；
+3. push 到 `main`，`.github/workflows/deploy.yml` 自动完成：构建 → 解析/创建 KV
+   namespace 并写进 `wrangler.toml` 的占位 id → `wrangler deploy`（DO migration 随
+   部署自动应用）→ 把 `PASSWORD` 透传成 Worker Secret；
+4. 在 Cloudflare 控制台给这个 Worker 绑定 custom domain。这一步同时建 DNS 记录和
+   路由，是客户端能连上它的**全部前提**——Worker 只部署到 `workers.dev`，域名不归
+   项目管。
+
+**方式 B：本地一键脚本（推荐给不用 CI 的人）。**
 
 ```bash
+cd <仓库根>
+export PASSWORD='<你定的口令>'
+scripts/deploy.sh              # 先加 --dry-run 可以只看它要执行什么
+```
+
+脚本做完整流程：`npm ci` → `node build.mjs` → 校验产物可加载 → 找/建 KV namespace
+→ 生成临时配置 `wrangler.deploy.toml`（**不动入库的 `wrangler.toml`**）→
+`wrangler deploy` → 透传 `PASSWORD`。它不会替你绑域名，最后一步仍要自己在控制台做。
+
+**方式 C：手动 wrangler 部署。**
+
+```bash
+cd server
+npm ci
+node build.mjs                       # 生成 _worker.js（不要手改它，改 src/）
 npx wrangler login
-npx wrangler d1 create netmaster                          # 把输出的 database_id 填进 wrangler.toml
-npx wrangler d1 execute netmaster --remote --file=schema.sql
-npx wrangler secret put PASSWORD                          # 你定的口令，客户端要用同一个
+npx wrangler kv namespace create netmaster   # 把输出的 id 填进 wrangler.toml 的 [[kv_namespaces]]
+npx wrangler secret put PASSWORD
 npx wrangler deploy
 ```
 
-最后在 Cloudflare 控制台给这个 Worker 绑定你的域名（custom domain）——
-这一步同时建 DNS 和路由，是客户端能连上它的全部前提。
-
-**或者：克隆仓库走 CI。** 给仓库配三个 Secret（`CLOUDFLARE_API_TOKEN`、
-`CLOUDFLARE_ACCOUNT_ID`、`PASSWORD`，用 `gh secret set` 或仓库设置页），push
-到 main，CI 自动完成建库、schema、部署、透传 PASSWORD。打 `v*` tag 会额外
-构建 Release 产物。
+注意：`wrangler.toml` 里的 KV `id` 是占位符（`0000…0000`），直接 `wrangler deploy`
+会因 id 非法而失败——这是有意的，别拿占位符上线。无需 KV 时可以把
+`[[kv_namespaces]]` 整段删掉：缺少 KV 绑定时竞速只用内置兜底列表，功能不残。
 
 ### 2. 客户端
 
 从 [Release](../../releases/latest) 下载对应平台的客户端
-（`netmaster-windows-amd64.exe` / `netmaster-linux-amd64` / `netmaster-linux-arm64`，
-或克隆仓库自己 `go build`）。写一份 `config.json` 放在可执行文件旁边
-（或 `%AppData%/netmaster/config.json`）：
+（`netmaster-windows-amd64.exe` / `netmaster-linux-amd64` / `netmaster-linux-arm64`），
+或者自己构建：
+
+```bash
+cd client && go build -o netmaster.exe ./cmd/netmaster
+```
+
+写一份 `config.json` 放在可执行文件旁边（或 `%AppData%/netmaster/config.json`）：
 
 ```json
 { "server": "<你的域名>", "password": "<PASSWORD>" }
@@ -61,47 +108,101 @@ npx wrangler deploy
 然后：
 
 ```bash
-./netmaster serve             # Windows: 双击 netmaster-windows-amd64.exe，等价
+./netmaster serve          # Windows 双击 netmaster-windows-amd64.exe 等价
 ```
 
-双击启动的细节：首次双击若没有 config.json，会在 exe 旁边生成一个模板，填好
+双击启动的细节：首次双击若没有任何 config.json，会在 exe 旁边生成一份模板，填好
 两个值再点一次即可；任何启动错误都会等一次回车再关窗口，原因不会一闪而过。
 
-启动后监听端口自动选择（先试 8080/1080，被占则顺延），系统代理自动指向选定
-端口，退出时自动还原；直接关闭窗口等于强杀进程，由看门狗兜底还原。ready 日志
-之后会补一行 "tunnel established via node x"—— 部署是否健康，这一行就是最直接
-的回答。
+启动后监听端口自动选择（先试 8080 / 1080，被占则顺延），HTTP 入站监听
+`127.0.0.1:8080`、SOCKS5 监听 `127.0.0.1:1080`。系统代理自动指向选定端口，退出时
+自动还原；直接关闭窗口等于强杀进程，由看门狗子进程兜底还原。`ready in …` 日志之后
+会补一行 `tunnel established via node <addr>`——**部署是否健康，这一行就是最直接的
+回答**（服务端没有任何 HTTP 诊断端点）。
 
-客户端配置就这两个值。没有 UUID 要生成、没有数据库 ID 要复制、没有订阅地址要
-复制粘贴 —— 口令两端各自本地派生成 16 字节 auth，网络上不出现明文。
+## 三个子命令
 
-## 关键设计
+```
+usage: netmaster <serve|nodes|restore> [flags]
+  serve   - run the local HTTP+SOCKS5 proxy and take over the system proxy
+  nodes   - keep firing requests and watch adaptive exit selection live
+  restore - restore the system proxy (after serve was killed uncleanly)
+```
 
-这几条是踩过坑之后定下来的，改动前先读 [docs/](docs/) 里对应章节。
+| 子命令 | 作用 | 主要 flag |
+|---|---|---|
+| `serve` | 起本地代理、接管系统代理、退出还原 | `--server` `--password` `--manual` `--rules` |
+| `nodes` | 持续发请求，实时观察自适应选路 | `--server` `--password` `--target` `--ipcheck` |
+| `restore` | 手动还原系统代理（serve 被强杀后用） | 无 |
 
-- **两端都是我们的，协议也是。** WS 之上只有一种帧：mux 帧（一条连接跑多个
-  会话）+ 控制帧（告知失败原因）。鉴权是连接级的一次 16 字节比对，会话级零
-  开销。没有 VLESS、没有 UUID、没有任何 HTTP 端点。
-- **分流不靠域名穷举。** 规则表只强制指定"必须代理"和"必须直连"，其余交给 IP
-  归属判断（`internal/geoip`）。
-- **出口选择是学出来的，不是猜出来的。** 每个域名第一次连接后记住走哪条出口，
-  之后粘住；只在明确失败时才改选。学到的绑定**落盘**，重启不丢。
-- **"TCP 连通"不等于"这个站能直连"。** CONNECT 隧道把选择推迟到首个数据包
-  回来之后再定，被阻断就改走代理并重放（`internal/proxy/replay.go`）。
-- **中继的出口 IP 决定 Cloudflare 站给 200 还是 403。** 中继列表从社区源动态
-  获取（硬编的是"从哪拿列表"而不是列表本身），服务端主动问候选中继"这个域名
-  经你会返回什么"，学到的绑定存 D1，新 isolate 直接继承。
-- **入口候选两个来源。** 服务端域名自己的 DNS 解析（永远可用）+ 社区优选 IP
-  源（每次启动更新、逐源容错）。快慢由客户端本机探测决定，别人测的不算数。
-- **启动即就绪。** 探测后台跑；社区源拉取有界等待（3 秒），失败退缓存。
+`serve` 的 flag：`--server <domain>`、`--password <pw>`、`--manual`（不接管系统代理，
+只打印监听地址）、`--rules <file>`（自定义分流规则文件）。
 
-## 已知限制
+`nodes` 的 flag：`--target <url>`（默认 `https://www.google.com/`）、
+`--ipcheck <url>`（发请求到该 URL 并统计观察到的出口 IP 分布）。
 
-- 公共中继的出口 IP 被 Cloudflare 系站点拉黑是常态，动态列表 + 逐主机探测 +
-  亲和持久化是自愈机制，不是根治；要根治只能自建中继（见 [docs/relay.md](docs/relay.md)）。
-- ECH 在部分网络下会间歇失败（服务端返回 outer 名证书），客户端有 60s 短路 +
-  2s 尝试预算兜底。个别站点既无 ECH 又被 IP+SNI 双拦，客户端无法本地绕过。
-- geoip 的 CN 网段表只有 IPv4；纯 IPv6 站点一律按非 CN 处理（走代理）。
+配置优先级：**命令行 flag > config.json > 环境变量**。环境变量兜底用
+`NETMASTER_SERVER` 与 `NETMASTER_PASSWORD`（后者为空时再退到 `PASSWORD`）。
+加 `-h` 到任意子命令可看它自己的 flag。
+
+## 配置说明
+
+`config.json` 的字段与 `serve` 的 flag 一一对应（名字去掉 `--`）：
+
+```json
+{
+  "server": "<你的 Worker 域名>",
+  "password": "<部署时设置的 PASSWORD>",
+  "manual": false,
+  "rules": ""
+}
+```
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `server` | string | Worker 域名。写成 `https://nm.example.com/` 也会被剥掉 scheme 与路径 |
+| `password` | string | 首帧 HMAC-SHA256 的密钥，不出网络 |
+| `manual` | bool | true 时不接管系统代理，只打印监听地址 |
+| `rules` | string | 自定义分流规则文件路径（Clash RULE-SET 格式，动作按文件名推断）；留空用内置规则集 |
+| `latencyToleranceMs` | int | 出口优选容差（当前版本仅供配置解析，出口选择逻辑尚未消费） |
+
+查找顺序：`./config.json`，然后 `%AppData%/netmaster/config.json`（Linux/macOS 为
+`os.UserConfigDir()`）。两个位置都没有不是错误——全部配置也可以由 flag 给出。文件
+存在但 JSON 损坏是错误：静默忽略一份读不出来的配置，会让人以为它生效了。
+
+## 限制与合规
+
+- **WS 消息 ≈1:1 计入免费版每日 10 万请求**。M0 实测未观察到 20:1 折算，多路复用
+  只省建连成本、不省消息量。协议层的对策：数据帧尽量满帧（单帧上限 64 KB）、
+  心跳走 WebSocket 协议层 Ping（边缘自动应答，不计消息、不唤醒 DO）、没有逐帧 ACK。
+- **Workers `connect()` 不支持 IPv6 出站**，NAT64 出口已从架构中移除；CF 承载目标的
+  出口只剩 ProxyIP 中继一类。
+- **公共中继的出口 IP 被 Cloudflare 系站点拉黑是常态**，动态列表 + 竞速 + 亲和记忆
+  是自愈机制，不是根治。
+- ECH 在部分网络下间歇失败（服务端返回 outer 名证书），客户端有 2s 尝试预算与
+  60s 短路兜底。
+- geoip 的 CN 网段表只有 IPv4，纯 IPv6 站点一律按"非 CN"处理。
+- 系统代理不转发 UDP：QUIC 不会被代理，建议在浏览器里禁用 QUIC
+  （`chrome://flags/#enable-quic`），强制回落 TCP。
+
+完整限额表与实测数据见 [docs/limitations.md](docs/limitations.md)。
+
+> **合规提示**：在 Workers 上运行通用代理游走在 Cloudflare 服务条款边缘，账号可能
+> 被封。请**个人使用、低流量**，用**小号部署**并做账号隔离、绑定自定义域名。本项目
+> 仅供个人技术学习用途。
+
+## 深入文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/PRD.md](docs/PRD.md) | 产品需求文档（v1.1 冻结基线，文末附 v2 实施修订记录） |
+| [docs/architecture.md](docs/architecture.md) | v2 架构、组件职责、协议帧格式、出口选路 |
+| [docs/relay.md](docs/relay.md) | ProxyIP 中继：为什么需要、候选来源、竞速、自建指引 |
+| [docs/routing.md](docs/routing.md) | 客户端分流规则与优先级 |
+| [docs/limitations.md](docs/limitations.md) | 免费版限额表与实测数据 |
+| [docs/operations.md](docs/operations.md) | 部署、运维、日志与 DEBUG |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | 排障：连不上、ECH 回退、节点全挂、系统代理残留 |
+| [docs/m0-findings.md](docs/m0-findings.md) | M0 平台核验结论（1:1 计费、IPv6 出站等实测） |
 
 ## 开发
 
@@ -110,12 +211,22 @@ npx wrangler deploy
 cd client && go build ./... && go vet ./... && go test ./...
 
 # 服务端
-cd server && npm install && node build.mjs && npm test
+cd server && npm ci && node build.mjs && npm test
 
-# 端到端（Go 客户端 ↔ 真实 forward.js）
-cd server && node test/devserver.mjs 8799 &
-cd client && go test ./internal/outbound -run TestMuxE2E -v
+# 单个服务端测试（真实存在的：crypto / integration / protocol / proxyip / race /
+# refresh-relays / router）
+cd server && node test/router.mjs
 
-# 发版：打 tag 即构建全部 Release 产物（.github/workflows/release.yml）
-git tag v0.1.0 && git push --tags
+# 端到端（Go 客户端 ↔ Node devserver，同协议对端）
+cd server && node test/devserver.mjs 0 devserver-password 0 &
+cd client && go test ./internal/outbound -run TestProtoE2E -v
+
+# 端到端验收脚本（本地自检；给真实部署加 NETMASTER_ENDPOINT / NETMASTER_PASSWORD 即跑全量）
+cd server && node test/e2e.mjs
 ```
+
+注意：`scripts/test-all.sh` 的测试清单仍指向已不存在的 `control` / `relay`
+（`.github/workflows/ci.yml` 已更新为 v2 列表），本地全量脚本跑不通——见
+[docs/operations.md](docs/operations.md)。
+
+发版：打 `v*` tag 即构建全部 Release 产物（`.github/workflows/release.yml`）。

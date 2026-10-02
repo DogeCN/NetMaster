@@ -5,10 +5,15 @@ client/netmaster
 server/node_modules/
 .wrangler/
 
+# scripts/deploy.sh 生成的临时部署配置（wrangler.toml 的副本 + 真实 KV id）。
+# 不入库的理由：它是本机一次部署的产物，含真实 namespace id；wrangler.toml
+# 本身是入库文件，脚本刻意只写这份副本。
+server/wrangler.deploy.toml
+
 # 客户端配置可能含口令，不进版本库
 config.json
 
-# 凭据。wrangler.toml 要进版本库 —— 里面只有占位符，真实 database_id 由
+# 凭据。wrangler.toml 要进版本库 —— 里面只有占位符，真实 KV namespace id 由
 # deploy 工作流解析后改写；真正的秘密走 GitHub Secrets 与 `wrangler secret put`。
 .env
 
@@ -17,3 +22,8 @@ config.json
 .idea/
 Thumbs.db
 .DS_Store
+
+
+# 协作会话工作区
+.assist/
+

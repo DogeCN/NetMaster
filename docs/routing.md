@@ -1,97 +1,127 @@
-# 分流：依据、优先级与跳数
+# 分流
 
-## 分流依据是什么
+分流在客户端，`client/internal/rules`。规则集是第三方每日构建的 Clash RULE-SET，
+我们只决定"这份列表是直连类还是代理类"，**匹配顺序写死在 `Router.Match` 里**，不让
+规则自带优先级互相覆盖。
 
-**只看域名字符串 + 解析后的 IP 归属，不做任何嗅探。**
+## 匹配顺序
 
-`internal/route` 的规则是**两个动作**（`direct` / `proxy`）配**三种匹配**
-（`domain` / `suffix` / `cidr`），**顺序匹配、首条命中即返回**：
-
-| 顺序 | 段 | 动作 |
-|---|---|---|
-| ① | 强制代理名单（google、github、twitter、openai…约 50 条） | `proxy` |
-| ② | 国内直连名单（`.cn` 等后缀 + 约 50 个硬编码域名） | `direct` |
-| ③ | 局域网 CIDR + `localhost` | `direct` |
-| ④ | **兜底** | `auto` |
-
-> `auto` **只能写在兜底**（`default auto`），不能当作某条规则的动作 —— 它的意思正是
-> "没有规则命中时怎么办"。写成一条规则等于给某个域名单独声明"按默认处理"，没有意义。
-> 代码里会直接拒绝这种写法并报错。
->
-### 为什么兜底是 `auto` 而不是 `proxy`
-
-如果兜底按后缀穷举（`proxy domain com/net/org/io/co`），**任何以这些后缀结尾、又不在名单
-里的域名一律送去代理**。域名列表无法穷举，代价是一大批国内 IP、没被墙的站点被绕到海外
-再绕回来，显著变慢。IP 归属判断（见下）覆盖了这类站点，所以兜底交给出口层。
-
-规则文件在 `client/internal/route/rules_default.txt`（用 `//go:embed` 打进二进制，自定义用
-`--rules <file>`）。
-
-## `auto` 怎么决定
-
-`auto` 交给出口层（`internal/nodepool/exit.go`），优先级从高到低：
+`Router.Match(host, port)` 的顺序（PRD §6.3）：
 
 ```
-1. 已学习的绑定          —— 该域名之前走通了哪条出口
-2. 直连禁用冷却中        —— 之前判定直连不可用（见下）
-3. IP 归属：CN 网段 → 直连
-4. 其余 → 代理（自适应挑节点）
+① 私网/回环/保留网段（privateCIDRs）      → direct，优先于一切规则
+② 域名精确   exact                        host == value
+③ 域名后缀   suffix                       host 以 .value 结尾（含自身）
+④ 关键字     keyword                      host 含 value 子串
+⑤ GeoIP(CN)                               解析后落在 CN 网段 → geoAction（默认 direct）
+⑥ 端口       port                         "25" 或 "1000-2000"
+⑦ 兜底       fallback                     默认 proxy
 ```
 
-**已绑定排在最前，是刻意的。** 直连的出口是本机宽带 IP，代理的出口是 CF 边缘或中继 IP；
-同一个域名在两者之间来回切，等于换 IP，按 IP 判定的登录态会立刻失效。所以绑定一旦建立就
-粘住，只在**明确失败**时解除重选。
+要点：
 
-### IP 归属判断
+- **第 ① 段最高优先级**：服务端 `connect()` 禁连私网，送过去必然失败。`localhost` 也在这
+  一段（按回环处理）。IPv6 的 `::1/128`、`fc00::/7`、`fe80::/10` 在内。
+- **IP 字面量与域名走不同的分支**：CIDR 只对"输入本来就是 IP 字面量"生效。域名不做预解析
+  （域名原样传给服务端），归属判断交给 GeoIP 阶段。
+- **后缀匹配只切在 `.` 边界上**：`notexample.com` 不会命中 `example.com`。
+- **端口规则在 `port == 0` 时不参与**（调用方没解析出端口，例如 SOCKS5 的某些情形）。
+- **GeoIP 阶段的动作可由规则改**：`geoip-cn` 规则只用来改 `geoAction`（末条生效），默认
+  CN → direct。
 
-`internal/geoip` 解析域名后查 CN 网段表：
+## 动作只有两个
 
-- 表来源 `https://ispip.clang.cn/all_cn.txt`（4303 条 CIDR，合并成 2980 个区间）
-- 落盘缓存 7 天，启动只读缓存、后台刷新
-- **没有表时 `IsCNHost` 返回 `known=false`，调用方退回"一律偏代理"** —— 拉取失败不影响可用性
-- 解析失败**不缓存**：一次网络抖动不该被记成"不是国内"
-- 表里只有 IPv4；纯 IPv6 一律判为非 CN
+`direct` / `proxy`，**没有 `auto`**。主机不在任何列表里时由 GeoIP 判断归属，判断不出来就
+走兜底动作（默认 `proxy`）——不需要第三种状态。
 
-被墙域名在中国会被 DNS 污染，解析结果通常不是 CN 网段 → 判为代理，正好符合预期。
+## 规则集来源
 
-## CONNECT 层的失败重放
+内置四份 Loyalsoldier/clash-rules（`release` 分支，每日构建），各自对应一个动作：
 
-**"TCP 连通"不等于"这个站能直连"。** GFW 常常放行 TCP 握手，直到看见 TLS ClientHello 里的
-明文 SNI 才发 RST。而 CONNECT 一旦回了 `200` 就等于提交了选择，之后只能看到浏览器的连接
-失败，拿不到任何"该回退"的信号。
+| 列表 | 动作 |
+|---|---|
+| `private.txt` | direct |
+| `direct.txt` | direct |
+| `proxy.txt` | proxy |
+| `gfw.txt` | proxy |
 
-`internal/proxy/replay.go` 把判定推迟到首个数据包回来之后：
+装载顺序（`rules.LoadRules`）：并行拉取（总预算 3 秒，单源超时 3 秒）→ 解析合并 → 成功则写
+磁盘缓存 → 全失败读缓存 → 缓存也没有就用内置兜底集。来源由 `Router.Source()` 给出：
+`fetched` / `cache` / `builtin`。
+
+- 部分源挂掉时，缺的那几份用缓存补——不因为一次抖动丢掉一整类规则。
+- 预算到期就用已到手的部分：一个慢源不该让启动卡住。
+- 源偶发返回 HTML 错误页时按内容再判一次（`looksLikeRuleset`），不会把一页 HTML 当规则集
+  塞进缓存——那样"成功"了却一条规则都没有。
+- 第三方列表里混着 GEOSITE、PROCESS-NAME、MATCH 等不支持的类型是常态，认不出来的行跳过并
+  计数，数量由 `SkippedLines()` 暴露在启动日志里。因为一行不认识就起不来是不可接受的。
+
+内置兜底集只有 `private` + `gfw` 两份，故意做小：它是"完全没网络时的最低可用"，不是完整
+列表。
+
+## 自定义规则
+
+```bash
+netmaster serve --rules /path/to/rules.txt
+```
+
+或在 config.json 里写 `"rules": "/path/to/rules.txt"`。
+
+格式是 **Clash RULE-SET**（不是 netmaster 原生格式）：
 
 ```
-① 浏览器 CONNECT → 回 200，但先不提交走哪条路
-② 浏览器发 ClientHello → 缓存住它，同时转发给直连目标
-③ 看目标有无回应
-     有回应        → 直连成立，丢弃缓存，正常转发
-     超时无回应    → 目标只是慢，认账（不误伤正常站点）
-     零字节即断开  → 判定直连被阻断
-④ 改走代理隧道，把缓存的 ClientHello 重放进去
+DOMAIN,example.com
+DOMAIN-SUFFIX,google.com
+DOMAIN-KEYWORD,google
+IP-CIDR,10.0.0.0/8
+IP-CIDR6,::1/128
 ```
+
+认这几种：`DOMAIN`（精确）、`DOMAIN-SUFFIX`（后缀）、`DOMAIN-KEYWORD`（关键字）、
+`IP-CIDR` / `IP-CIDR6`（网段，`no-resolve` 尾注忽略）。
+
+动作按**文件名**推断：路径含 `direct` 视为直连，否则按 `proxy`（安全侧）。给了坏路径或空
+列表会直接报错退出——用户明确指定了自己的规则集，静默降级成内置源比看得见的失败更糟。
+
+`--rules` 非空时**内置源整个不拉**：再叠一层只会让"为什么这个域名走了代理"变得没法回答。
+
+## GeoIP
+
+CN 网段表从 `https://ispip.clang.cn/all_cn.txt` 拉取并落盘缓存（约 4300 条 CIDR，TTL 7 天），
+后台加载不阻塞启动。**没有表时一律返回 `known=false`**，调用方退回兜底动作，不会因为拉取
+失败影响可用性。
+
+表只有 IPv4，纯 IPv6 站点一律按"非 CN"处理。
+
+## "TCP 能连"不等于"这个站能直连"
+
+规则说 direct 就直连，但**规则说 proxy 之外的判定总有出错的可能**：GFW 常常放行 TCP 握手，
+直到看见 TLS ClientHello 里的明文 SNI 才发 RST。而 CONNECT 一旦回了 200 就等于提交了选择，
+浏览器随后只会报连接失败，我们却拿不到任何"该回退"的信号。
+
+所以 `internal/proxy/replay.go` 把判定推迟到第一个数据包回来之后：
+
+1. 收下客户端的首个飞行段（ClientHello，上限 16 KiB）并转发；
+2. 看上游有没有任何回应——
+   - 有回应 → 判定成立，转入普通转发；
+   - **超时无回应** → 目标只是慢，认账（不误伤正常站点）；
+   - **零字节就被断开** → 判定这条路径不可用；
+3. 判定时改走另一条路，把缓存的首段数据重放进去。
 
 浏览器全程无感，只看到握手慢了一点。
 
-三条约束：
+代理侧有一半对称的逻辑（`relayWithProxyReplay`）：隧道建立 ≠ 这跳真能用。Worker 首次见到
+一个 CF 承载的目标时要内联选中继，可能先踩到"TCP 能通但不干活"的中继；此时 200 已经回了，
+TLS 握手期隧道死亡，浏览器只能看到一个莫名的安全错误。做法同样是缓存首段 + 零字节即断时
+换出口重放一次。
 
-- **只对 443 启用。** HTTPS 首段（ClientHello）自包含，且 SNI 阻断正发生在这里；其他协议
-  可能"客户端先发一半再等回应"，探测窗口会白等 3 秒。
-- **超时不算被阻断。** 只有"零字节即断开"才判定 —— 仅仅慢不该被误判成墙。
-- **直连失败记 30 分钟冷却**（`nodepool.directBlocked`）。否则会级联：代理失败 → 回退直连 →
-  直连也失败 → 再回代理，每轮白付一次直连。
+两侧都只对 **443** 启用：HTTPS 首段（ClientHello）自包含、且 SNI 阻断正发生在这里；其他
+协议可能"客户端先发一半再等回应"，探测窗口会白白多等 3 秒。
 
-日志里会写明真实原因（`direct unusable (<原因>)`），不要一律当成防火墙阻断——**上游
-worker 的出站连接失败**（比如目标是 Cloudflare 承载、worker 连不了 CF 自身 IP）也会走到
-这条路径。
+注意措辞：能确定的只是"这条路径没能把这段数据送出去"，原因可能是 RST、连接被关闭，也可能
+是 Worker 侧出站连接失败。日志不会一律归为 "blocked by RST"。
 
-## 跳数小结
+## 相关
 
-| 路径 | 跳数 |
-|---|---|
-| 国内直连 | 2 |
-| 境外代理，非 Cloudflare 目标 | 3 |
-| 境外代理，Cloudflare 承载目标（多一跳中继） | 4 |
-
-详见 [architecture.md](architecture.md#数据的跳数)。
+- 服务端出口选路：[architecture.md](architecture.md)
+- 排障：[troubleshooting.md](troubleshooting.md)

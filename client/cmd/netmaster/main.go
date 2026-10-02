@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/md5"
 	"flag"
 	"fmt"
 	"io"
@@ -22,10 +21,10 @@ import (
 	"netmaster/internal/config"
 	"netmaster/internal/entry"
 	"netmaster/internal/geoip"
-	"netmaster/internal/nodepool"
 	"netmaster/internal/procwait"
 	"netmaster/internal/proxy"
-	"netmaster/internal/route"
+	"netmaster/internal/rules"
+	"netmaster/internal/selector"
 	"netmaster/internal/sysproxy"
 )
 
@@ -77,8 +76,9 @@ func fatal(msg string) {
 	os.Exit(1)
 }
 
-// requireConn 在缺少 server/password 时给出可操作的报错，返回派生好的鉴权字节。
-func requireConn(serverFlag, passwordFlag string) (string, [16]byte) {
+// requireConn 在缺少 server/password 时给出可操作的报错。
+// v2 鉴权用原始口令在首帧做 HMAC-SHA256（见 internal/proto），口令不出网络。
+func requireConn(serverFlag, passwordFlag string) (string, string) {
 	server := normalizeServer(serverFlag)
 	if server == "" {
 		fatal("no server: pass --server or set it in config.json / NETMASTER_SERVER")
@@ -86,13 +86,65 @@ func requireConn(serverFlag, passwordFlag string) (string, [16]byte) {
 	if passwordFlag == "" {
 		fatal("no password: pass --password or set it in config.json / NETMASTER_PASSWORD")
 	}
-	return server, md5.Sum([]byte(passwordFlag))
+	return server, passwordFlag
+}
+
+// rulesActionFromFile 按文件名后缀判定整份列表的动作。第二个返回值是"认出来了没有"。
+//
+// 抽成纯函数是为了能测：rulesOverridesFromFile 自己会 fatal 退出，测不了。
+func rulesActionFromFile(path string) (rules.Action, bool) {
+	lower := strings.ToLower(path)
+	switch {
+	case strings.HasSuffix(lower, ".direct"):
+		return rules.Direct, true
+	case strings.HasSuffix(lower, ".proxy"):
+		return rules.Proxy, true
+	}
+	return "", false
+}
+
+// rulesOverridesFromFile 把 --rules 指向的本地规则文件转成"自定义源"。
+// 空路径返回空 Overrides = 用内置源。
+//
+// 格式与 Clash RULE-SET 一致，动作由**文件名后缀**显式给出：
+// `xxx.direct` → 整份列表直连，`xxx.proxy` → 整份列表代理。
+//
+// 推断不出就报错退出，不再"猜一个默认值"：先前的实现按文件名里含不含
+// "direct" 来判断，`myrules.list` 这种正常名字会被静默当成 proxy，而用户
+// 完全看不出自己的文件被当成什么处理了。看得见的失败比看不见的降级好。
+func rulesOverridesFromFile(path string) rules.Overrides {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return rules.Overrides{}
+	}
+	action, ok := rulesActionFromFile(path)
+	if !ok {
+		fatal("--rules file must end with .direct or .proxy (got: " + path + ")\n" +
+			"  name it like 'mylist.direct' so every entry in it has a known action")
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		// 用户给了坏路径不该静默按内置源跑：看得见的失败比看不见的降级好
+		fatal("read rules file: " + err.Error())
+	}
+	parsed, _ := rules.ParseClashRuleset("custom", string(body), action)
+	if len(parsed) == 0 {
+		fatal("rules file " + path + " has no usable entries")
+	}
+	// 自定义源优先级最高：直接构造 Router，内置源不再拉取。
+	return rules.Overrides{Custom: parsed}
 }
 
 // resolveEntries 组装入口候选：服务端域名解析（永远可用）+ 社区优选源
 // （每次启动都尝试更新，全挂退缓存）。有界等待 —— 网络全断时最多等 3 秒。
+//
 // maxEntries 是入口候选的总上限。DNS 源排在最前所以必然保留；社区源超过
-// 部分直接截断 —— 64 个候选以 12 并发探测一轮在秒级完成，再多只是浪费预算。
+// 部分直接截断。
+//
+// 64 而不是"优选后保留的 16"：这两个数字管的是不同阶段。Optimize 之后只有
+// 16 个进节点池，但如果候选一开始就只有 16 个，那么探测时一旦发现几个不可达
+// 或延迟异常（单源抖动很常见），池子就被填不满。多备几倍是给探测留冗余 ——
+// 12 并发探测 64 个仍在秒级完成，代价可接受。
 const maxEntries = 64
 
 func resolveEntries(ctx context.Context, server string) ([]entry.Node, string) {
@@ -144,8 +196,11 @@ func connFlags(fs *flag.FlagSet, cfg config.Config) (server, password *string) {
 	return server, password
 }
 
-// cmdNodes 持续发请求，实时打印各节点的健康度/延迟/成功率，观察自适应选路的
-// 实际效果。--ipcheck 统计出口 IP 分布。
+// cmdNodes 持续通过本地代理发请求，实时看这条链路能不能通、通得多快。
+//
+// 名字里的 "nodes" 是历史遗留（它曾经逐节点打印延迟/成功率/健康度）。v2 里
+// 节点池在启动时就优选好了，运行时也不再逐节点打分 —— 现在它老实做一件事：
+// 反复请求 --target 并把结果打出来。想看出口 IP 分布用 --ipcheck。
 func cmdNodes(args []string) {
 	cfg, _, err := config.Load()
 	if err != nil {
@@ -154,30 +209,28 @@ func cmdNodes(args []string) {
 	}
 	fs := flag.NewFlagSet("nodes", flag.ExitOnError)
 	server, password := connFlags(fs, cfg)
-	target := fs.String("target", "https://www.google.com/", "probe target through proxy")
-	ipcheck := fs.String("ipcheck", "", "if set, fire requests to this URL and print observed egress IPs")
+	target := fs.String("target", "https://www.google.com/", "URL to fetch through the proxy, repeatedly")
+	ipcheck := fs.String("ipcheck", "", "if set, fetch this URL and print the observed egress IP distribution")
 	fs.Parse(args)
-	host, auth := requireConn(*server, *password)
+	host, pw := requireConn(*server, *password)
 
 	logger := log.New(os.Stdout, "", log.Ltime)
 	nodes, src := resolveEntries(context.Background(), host)
 	logger.Printf("entries: %d (community: %s)", len(nodes), src)
-	// 诊断命令不落盘学到的状态（StateKey 为空）：观察不该污染 serve 的亲和表。
-	pool := nodepool.New(nodepool.Config{Nodes: nodes, SNI: host, Auth: auth[:]})
-	logger.Println("probing entry latency...")
-	pool.SortByLatency()
+	pool := selector.New(selector.Config{Nodes: nodes, SNI: host, Password: pw, UseECH: true, Insecure: true})
 
-	router, err2 := route.LoadDefault(route.Proxy)
-	if err2 != nil {
-		logger.Fatal("rules: ", err2)
+	router, rerr := rules.LoadRules(context.Background(), rules.Overrides{}, "", nil)
+	if rerr != nil {
+		logger.Fatal("rules: ", rerr)
 	}
+	logger.Printf("rules: %d (%s)", router.Size(), router.Source())
 	httpAddr := "127.0.0.1:18081"
 	srv := proxy.New(proxy.Config{HTTPAddr: httpAddr, Router: router, Pool: pool, Logger: logger, DialTimeout: 15 * time.Second})
 	if err := srv.Start(); err != nil {
 		logger.Fatal("start: ", err)
 	}
 	defer srv.Close()
-	logger.Printf("proxy on %s, probing %s (Ctrl+C to stop)", httpAddr, *target)
+	logger.Printf("proxy on %s, fetching %s every 2s (Ctrl+C to stop)", httpAddr, *target)
 
 	client := &http.Client{
 		Transport: &http.Transport{Proxy: func(*http.Request) (*url.URL, error) {
@@ -215,14 +268,15 @@ func cmdNodes(args []string) {
 	}
 
 	for {
-		if resp, err := client.Get(*target); err == nil {
+		resp, err := client.Get(*target)
+		if err != nil {
+			logger.Printf("request failed: %v", err)
+		} else {
 			io.Copy(io.Discard, resp.Body) //nolint:errcheck
 			resp.Body.Close()
+			logger.Printf("ok %s", resp.Status)
 		}
-		for _, l := range pool.Stats() {
-			logger.Println(l)
-		}
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -244,7 +298,7 @@ func cmdServe(args []string) {
 	manual := fs.Bool("manual", cfg.Manual, "don't take over the system proxy, just print listen addrs (config.json: manual)")
 	rulesFile := fs.String("rules", cfg.Rules, "custom rules file (config.json: rules)")
 	fs.Parse(args)
-	host, auth := requireConn(*server, *password)
+	host, pw := requireConn(*server, *password)
 
 	logger := log.New(os.Stdout, "", log.Ltime)
 	if cfgPath != "" {
@@ -252,17 +306,20 @@ func cmdServe(args []string) {
 	}
 
 	// 1. 入口候选（每次启动都尝试刷新社区源；有界等待，失败退缓存）
-	nodes, src := resolveEntries(context.Background(), host)
-	logger.Printf("entries: %d (community: %s)", len(nodes), src)
+	all, src := resolveEntries(context.Background(), host)
+	logger.Printf("entries: %d (community: %s)", len(all), src)
 
-	pool := nodepool.New(nodepool.Config{
-		Nodes:              nodes,
-		SNI:                host,
-		Auth:               auth[:],
-		UseECH:             true,
-		Insecure:           true,
-		StateKey:           host,
-		LatencyToleranceMs: cfg.LatencyToleranceMs,
+	// 2. IP 优选（PRD §6.6）：并发测延迟，取最快 16 个进池。全流程 ≤ 10s，
+	//    超预算就用已到手的结果 —— 优选是优化，不是能不能用的前提。
+	nodes, took := selector.Optimize(context.Background(), all)
+	logger.Printf("[probe] %d entries -> %d nodes in %s", len(all), len(nodes), took.Round(time.Millisecond))
+
+	pool := selector.New(selector.Config{
+		Nodes:    nodes,
+		SNI:      host,
+		Password: pw,
+		UseECH:   true,
+		Insecure: true,
 	})
 	pool.SetDialTimeout(15 * time.Second)
 
@@ -278,43 +335,16 @@ func cmdServe(args []string) {
 		logger.Printf("[geoip] CN ranges ready: %d (%s)", size, from)
 	})
 
-	// 先用上次的探测结果预置各节点延迟估计与主节点：启动后第一个请求就走对
-	// 节点，不必等本轮探测跑完。
-	if results, ok := nodepool.LoadProbeCache(nodes, nodepool.ProbeCacheTTL); ok {
-		if n := pool.ApplyProbeCache(results); n > 0 {
-			logger.Printf("[probe] preloaded %d/%d entry latencies from cache", n, len(nodes))
-		}
-	}
-
-	// 探测节点延迟。改在后台跑：几十个节点同步探测要数秒，而这段时间代理还
-	// 没起来。延迟估计的收益（首个请求走快节点）也不必在启动前就拿到 ——
-	// 缓存命中时已经预置过，没有缓存时后台探测跑完前用默认顺序即可。
-	// 候选总量被 maxEntries 截住，所以这里无条件全量探测。
-	{
-		handle := func(results []nodepool.ProbeResult) {
-			logger.Printf("[probe] %s", nodepool.Summary(results))
-			if err := nodepool.SaveProbeCache(nodes, results); err != nil {
-				logger.Printf("[probe] WARN save cache: %v", err)
-			}
-		}
-		logger.Println("probing entry latency in background...")
-		done := pool.ProbeAsync()
-		go func() { handle(<-done) }()
-	}
-
-	// 2. 路由
-	var router *route.Router
-	if *rulesFile != "" {
-		router, err = route.Load(*rulesFile, route.Proxy)
-	} else {
-		router, err = route.LoadDefault(route.Proxy)
-	}
+	// 3. 分流规则：并行拉取内置 Clash 规则集，失败退缓存、再退内置兜底集。
+	//    --rules 只在用户明确指定自己的规则文件时生效（覆盖内置源）。
+	router, err := rules.LoadRules(context.Background(), rulesOverridesFromFile(*rulesFile), "default", geo)
 	if err != nil {
 		fatal("load rules: " + err.Error())
 	}
+	logger.Printf("rules: %d entries (%s, skipped %d lines)", router.Size(), router.Source(), router.SkippedLines())
 
-	// 3. 监听端口自动选择：先试 8080/1080，被占则顺延。用户通常不需要知道
-	// 端口号 —— 系统代理自动指向选定值；--manual 下端口只用来打印。
+	// 4. 监听端口自动选择：先试 8080/1080，被占则顺延。用户通常不需要知道
+	//    端口号 —— 系统代理自动指向选定值；--manual 下端口只用来打印。
 	httpPort, err := pickPort(8080)
 	if err != nil {
 		fatal("pick http port: " + err.Error())
@@ -339,7 +369,7 @@ func cmdServe(args []string) {
 		fatal("start proxy: " + err.Error())
 	}
 
-	// 4. 系统代理：只在接管时设置并拉起看门狗；--manual 只打印地址。
+	// 5. 系统代理：只在接管时设置并拉起看门狗；--manual 只打印地址。
 	// 顺序是刻意的，见 docs/operations.md —— 先自愈残留，再监听、再接管。
 	if cleaned, err := sysproxy.CleanupStale(); err != nil {
 		logger.Printf("WARN cleanup stale system proxy: %v", err)
@@ -452,7 +482,7 @@ func waitForSignal() {
 func usage() {
 	fmt.Println("usage: netmaster <serve|nodes|restore> [flags]")
 	fmt.Println("  serve   - run the local HTTP+SOCKS5 proxy and take over the system proxy")
-	fmt.Println("  nodes   - keep firing requests and watch adaptive exit selection live")
+	fmt.Println("  nodes   - keep fetching a URL through the proxy to watch whether the tunnel works")
 	fmt.Println("  restore - restore the system proxy (after serve was killed uncleanly)")
 	fmt.Print("\nConfig precedence: CLI flag > config.json > default. config.json mirrors the serve flags:\n" +
 		"  { \"server\": \"<domain>\", \"password\": \"<password>\", \"manual\": false, \"rules\": \"\" }\n" +

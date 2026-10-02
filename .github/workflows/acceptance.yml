@@ -1,0 +1,81 @@
+name: acceptance
+
+# 真实部署验收：拿已部署的 v2 Worker + 真实客户端（Go）跑一遍 PRD §14 的量化项。
+# 与 e2e.yml（协议层 Node 验收）互补 —— 这里验的是"用户实际会走的路"：
+#   node 侧验协议与状态码，本工作流验 TLS/ECH → WS → Session DO → 出口 → 回程。
+#
+# 不部署、不改 Worker：只消费已部署的 netmaster.edge-tunnel.workers.dev。
+
+on:
+  # push 触发器只为让 GitHub 注册这个工作流（默认分支之外的 workflow_dispatch-only
+  # 文件不会被注册，gh workflow run 会 404），顺带让协议/出口改动自动跑一遍验收。
+  push:
+    branches: [v2]
+    paths:
+      - ".github/workflows/acceptance.yml"
+      - "server/src/**"
+      - "client/internal/outbound/**"
+      - "client/internal/selector/**"
+  workflow_dispatch:
+    inputs:
+      worker:
+        description: "deployed worker hostname (no scheme)"
+        default: "netmaster.edge-tunnel.workers.dev"
+      rounds:
+        description: "repeated requests for the CF-hosted success-rate check"
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Protocol-level checks
+        working-directory: server
+        run: |
+          npm ci
+          for t in crypto protocol integration proxyip race router cron; do
+            printf '%-12s ' "$t"
+            node "test/$t.mjs" | tail -1
+          done
+
+      # 直连出口 + 多路复用：一次跑完，输出即验收依据。
+      - name: Live tunnel checks (direct exit + mux)
+        working-directory: client
+        env:
+          NETMASTER_E2E_WORKER: ${{ inputs.worker != '' && inputs.worker || 'netmaster.edge-tunnel.workers.dev' }}
+          NETMASTER_E2E_PASSWORD: ${{ secrets.PASSWORD }}
+        run: go test ./internal/outbound/ -run TestLive -v -count=1 -timeout 300s
+
+      # CF 托管目标的成功率（M3 的 ≥99% 项）：走 ProxyIP 竞速。
+      - name: CF-hosted target success rate
+        working-directory: client
+        env:
+          NETMASTER_E2E_WORKER: ${{ inputs.worker != '' && inputs.worker || 'netmaster.edge-tunnel.workers.dev' }}
+          NETMASTER_E2E_PASSWORD: ${{ secrets.PASSWORD }}
+          NETMASTER_E2E_ROUNDS: ${{ inputs.rounds }}
+        run: go test ./internal/outbound/ -run TestLiveCFHosted -v -count=1 -timeout 600s
+
+      # Cron 是否已把健康排名写进 KV。
+      - name: KV health snapshot
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          for key in proxyip:top cron:lastRun; do
+            printf '%-14s ' "$key"
+            curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/2ff6b8ebe80c4715b643ed46b45d8d09/values/$key" \
+              || echo "(read failed)"
+            echo
+          done

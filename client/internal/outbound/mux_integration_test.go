@@ -1,179 +1,363 @@
 package outbound
 
-// 端到端验证 mux 客户端 ↔ Node devserver（跑真实 forward.js）。
-// 需先启动：node test/devserver.mjs 8799 [password]
-// 运行：DEV_WS=1 go test ./internal/outbound -run TestMuxE2E -v
+// 端到端验证协议 v2 客户端 ↔ devserver（Node 同协议对端，见 server/test/devserver.mjs）。
+// 测试自行拉起 devserver（node 子进程），无需预先手动启动；机器上没有 node 时跳过。
 
 import (
-	"crypto/md5"
+	"bufio"
+	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
+// devserverPath 定位仓库内的 server/test/devserver.mjs（与测试包目录解耦）。
+func devserverPath() string {
+	_, thisFile, _, _ := runtime.Caller(0)
+	return filepath.Join(thisFile, "..", "..", "..", "..", "server", "test", "devserver.mjs")
+}
+
 const devPassword = "devserver-password"
 
-func requireDev(t *testing.T) {
+type devServer struct {
+	url  string
+	addr string // 127.0.0.1:<port>，devserver 监听地址
+	cmd  *exec.Cmd
+	done chan struct{}
+	t    *testing.T
+}
+
+func startDev(t *testing.T) *devServer {
 	t.Helper()
-	if testing.Short() {
-		t.Skip("skipping devserver test in -short mode")
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not on PATH; skipping devserver E2E")
+	}
+	cmd := exec.Command(node, devserverPath(), "0", devPassword, "0")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start devserver: %v", err)
+	}
+	done := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(done) }()
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		<-done
+	})
+
+	dev := &devServer{cmd: cmd, done: done, t: t}
+	lineCh := make(chan string, 1)
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			line := sc.Text()
+			if strings.HasPrefix(line, "PORT=") {
+				lineCh <- line
+				continue
+			}
+			t.Log("dev:", line)
+		}
+	}()
+	select {
+	case line := <-lineCh:
+		port := strings.TrimPrefix(line, "PORT=")
+		dev.url = "ws://127.0.0.1:" + port + "/"
+		dev.addr = "127.0.0.1:" + port
+		return dev
+	case <-time.After(15 * time.Second):
+		t.Fatal("devserver did not report PORT in time")
+		return nil
 	}
 }
 
-// TestMuxE2ESingle 单会话端到端取数据。
-func TestMuxE2ESingle(t *testing.T) {
-	requireDev(t)
-	m, err := DialMuxPlain("ws://127.0.0.1:8799", devAuth())
+// echoServer 原样回显的本地 TCP 服务，模拟任意流式目标。
+func echoServer(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Skipf("devserver not running (%v) — start: node test/devserver.mjs 8799 %s", err, devPassword)
+		t.Fatalf("echo listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				io.Copy(c, c) //nolint:errcheck
+				c.Close()
+			}(c)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func httpGet(t *testing.T, conn net.Conn, host string) string {
+	t.Helper()
+	req, _ := http.NewRequest("GET", "http://"+host+"/", nil)
+	req.Write(conn) //nolint:errcheck
+	data, _ := io.ReadAll(io.LimitReader(conn, 64<<10))
+	return string(data)
+}
+
+func TestProtoE2EEchoRoundtrip(t *testing.T) {
+	dev := startDev(t)
+	echo := echoServer(t)
+
+	m, err := DialMuxPlain(dev.url, devPassword)
+	if err != nil {
+		t.Fatalf("dial mux: %v", err)
 	}
 	defer m.Close()
 
-	conn, err := m.Open("127.0.0.1:8800")
+	conn, err := m.Open(echo)
 	if err != nil {
-		t.Fatalf("open session: %v", err)
+		t.Fatalf("open stream: %v", err)
 	}
 	defer conn.Close()
 
-	body := httpGet(t, conn)
-	if !strings.Contains(body, `"ok":true`) {
-		t.Fatalf("unexpected body: %q", body)
+	payload := []byte("hello over protocol v2")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
 	}
-	t.Logf("single session body: %s", body)
+	buf := make([]byte, len(payload))
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if string(buf) != string(payload) {
+		t.Fatalf("echo mismatch: %q", buf)
+	}
 }
 
-// TestMuxE2EConcurrent 多个会话并发跑在同一条 WS 上。
-func TestMuxE2EConcurrent(t *testing.T) {
-	requireDev(t)
-	m, err := DialMuxPlain("ws://127.0.0.1:8799", devAuth())
+func TestProtoE2EStatusCodes(t *testing.T) {
+	dev := startDev(t)
+
+	t.Run("wrong password rejected 0x01", func(t *testing.T) {
+		m, err := DialMuxPlain(dev.url, "wrong-password")
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer m.Close()
+		if _, err := m.Open("127.0.0.1:9"); err == nil {
+			t.Fatal("expected auth rejection")
+		} else if !strings.Contains(err.Error(), "0x01") {
+			t.Fatalf("expected 0x01, got: %v", err)
+		}
+	})
+
+	t.Run("forbidden target 0x02", func(t *testing.T) {
+		m, err := DialMuxPlain(dev.url, devPassword)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer m.Close()
+		if _, err := m.Open("10.0.0.1:80"); err == nil {
+			t.Fatal("expected forbidden")
+		} else if !strings.Contains(err.Error(), "0x02") {
+			t.Fatalf("expected 0x02, got: %v", err)
+		}
+	})
+
+	t.Run("refused target 0x03", func(t *testing.T) {
+		m, err := DialMuxPlain(dev.url, devPassword)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer m.Close()
+		if _, err := m.Open("127.0.0.1:1"); err == nil {
+			t.Fatal("expected exit failure")
+		} else if !strings.Contains(err.Error(), "0x03") {
+			t.Fatalf("expected 0x03, got: %v", err)
+		}
+	})
+}
+
+func TestProtoE2EConcurrentStreams(t *testing.T) {
+	dev := startDev(t)
+	echo := echoServer(t)
+
+	m, err := DialMuxPlain(dev.url, devPassword)
 	if err != nil {
-		t.Skipf("devserver not running (%v)", err)
+		t.Fatalf("dial mux: %v", err)
 	}
 	defer m.Close()
 
-	const n = 8
+	const n = 100 // PRD §14 M2：单 WS 并发 ≥ 100 条流
 	var wg sync.WaitGroup
 	errs := make([]error, n)
-	bodies := make([]string, n)
-
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			conn, err := m.Open("127.0.0.1:8800")
+			conn, err := m.Open(echo)
 			if err != nil {
-				errs[i] = err
+				errs[i] = fmt.Errorf("open: %w", err)
 				return
 			}
 			defer conn.Close()
-			// 交错发送：先写一点，等一会再写，模拟真实数据流
-			if _, err := conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
-				errs[i] = err
+			payload := []byte(fmt.Sprintf("stream-%d-payload", i))
+			conn.SetDeadline(time.Now().Add(10 * time.Second))
+			if _, err := conn.Write(payload); err != nil {
+				errs[i] = fmt.Errorf("write: %w", err)
 				return
 			}
-			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			buf := make([]byte, 4096)
-			total := 0
-			for total < 10 {
-				c, err := conn.Read(buf[total:])
-				total += c
-				if err != nil {
-					if err == io.EOF {
-						break
-					}
-					errs[i] = err
-					return
-				}
+			buf := make([]byte, len(payload))
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				errs[i] = fmt.Errorf("read: %w", err)
+				return
 			}
-			bodies[i] = string(buf[:total])
+			if string(buf) != string(payload) {
+				errs[i] = fmt.Errorf("mismatch: %q", buf)
+			}
 		}(i)
-		time.Sleep(15 * time.Millisecond) // 依次发起，确保并发落在同一条 WS
 	}
 	wg.Wait()
-
-	failCount := 0
 	for i, err := range errs {
 		if err != nil {
-			failCount++
-			t.Errorf("session %d error: %v", i, err)
-			continue
-		}
-		if !strings.Contains(bodies[i], `"ok":true`) {
-			failCount++
-			t.Errorf("session %d bad body: %q", i, truncate(bodies[i], 80))
+			t.Errorf("stream %d: %v", i, err)
 		}
 	}
-	if failCount == 0 {
-		t.Logf("all %d concurrent sessions succeeded over ONE websocket (live=%d)", n, m.LiveCount())
+	if got := m.LiveCount(); got != 0 {
+		t.Errorf("live streams after test = %d, want 0", got)
 	}
 }
 
-// TestMuxE2ESequentialReuse 连续多次 Open，复用同一条 WS。
-func TestMuxE2ESequentialReuse(t *testing.T) {
-	requireDev(t)
-	m, err := DialMuxPlain("ws://127.0.0.1:8799", devAuth())
+func TestProtoE2ELargePayload(t *testing.T) {
+	dev := startDev(t)
+	echo := echoServer(t)
+
+	m, err := DialMuxPlain(dev.url, devPassword)
 	if err != nil {
-		t.Skipf("devserver not running (%v)", err)
+		t.Fatalf("dial mux: %v", err)
 	}
 	defer m.Close()
 
-	for i := 0; i < 5; i++ {
-		conn, err := m.Open("127.0.0.1:8800")
-		if err != nil {
-			t.Fatalf("round %d open: %v", i, err)
-		}
-		body := httpGet(t, conn)
-		if !strings.Contains(body, `"ok":true`) {
-			t.Fatalf("round %d bad body: %q", i, truncate(body, 80))
-		}
-		conn.Close()
+	conn, err := m.Open(echo)
+	if err != nil {
+		t.Fatalf("open: %v", err)
 	}
-	t.Log("5 sequential sessions reused one websocket")
+	defer conn.Close()
+
+	// 300KB：超过单帧上限，验证写路径分帧 + 读路径重组
+	payload := make([]byte, 300*1024)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	go func() {
+		for off := 0; off < len(payload); off += MaxWriteChunk {
+			end := off + MaxWriteChunk
+			if end > len(payload) {
+				end = len(payload)
+			}
+			if _, err := conn.Write(payload[off:end]); err != nil {
+				return
+			}
+		}
+	}()
+	got, err := io.ReadAll(io.LimitReader(conn, int64(len(payload))))
+	if err != nil && len(got) < len(payload) {
+		t.Fatalf("read: %v (got %d bytes)", err, len(got))
+	}
+	if len(got) != len(payload) {
+		t.Fatalf("got %d bytes, want %d", len(got), len(payload))
+	}
+	for i := range payload {
+		if got[i] != payload[i] {
+			t.Fatalf("byte %d mismatch: %d != %d", i, got[i], payload[i])
+		}
+	}
 }
 
-func httpGet(t *testing.T, conn interface{ Write([]byte) (int, error) }) string {
-	t.Helper()
-	if _, err := conn.Write([]byte("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")); err != nil {
-		t.Fatalf("write: %v", err)
+// MaxWriteChunk 写路径每次投喂的最大量（客户端 Write 有 64KB 上限断言）。
+const MaxWriteChunk = 32 * 1024
+
+// TestProtoE2EReconnectAfterKill WS 被强断后，重建传输并立刻可用。
+// 这是 PRD §6.7 "断线重连" 的行为验收（时间预算由 selector 侧断言，这里只验协议层）。
+func TestProtoE2EReconnectAfterKill(t *testing.T) {
+	dev := startDev(t)
+	echo := echoServer(t)
+
+	m1, err := DialMuxPlain(dev.url, devPassword)
+	if err != nil {
+		t.Fatalf("first dial: %v", err)
 	}
-	rc, ok := conn.(interface {
-		Read([]byte) (int, error)
-		SetReadDeadline(time.Time) error
-	})
-	if !ok {
-		t.Fatalf("conn does not support read")
+	if _, err := m1.Open(echo); err != nil {
+		t.Fatalf("open on first transport: %v", err)
 	}
-	_ = rc.SetReadDeadline(time.Now().Add(5 * time.Second))
-	buf := make([]byte, 4096)
-	total := 0
-	for {
-		c, err := rc.Read(buf[total:])
-		total += c
-		if err != nil {
-			break
-		}
-		if total >= len(buf) {
-			break
-		}
+	m1.Close() // 强断：不等优雅关闭
+
+	m2, err := DialMuxPlain(dev.url, devPassword)
+	if err != nil {
+		t.Fatalf("reconnect dial: %v", err)
 	}
-	raw := string(buf[:total])
-	if i := strings.Index(raw, "\r\n\r\n"); i >= 0 {
-		return raw[i+4:]
+	defer m2.Close()
+	if !m2.Alive() {
+		t.Fatal("reconnected transport not alive")
 	}
-	return raw
+	conn, err := m2.Open(echo)
+	if err != nil {
+		t.Fatalf("open on reconnected transport: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("after reconnect")
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write after reconnect: %v", err)
+	}
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read after reconnect: %v", err)
+	}
+	if string(buf) != string(payload) {
+		t.Fatalf("echo mismatch after reconnect: %q", buf)
+	}
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
-}
+// TestProtoE2EStreamUnblockedOnWSKill 服务端整条 WS 死亡时，正阻塞在 Read 的流
+// 必须立刻带错误返回 —— markDead 丢了 dead 置位会让 Read 永久挂死（回归测试）。
+func TestProtoE2EStreamUnblockedOnWSKill(t *testing.T) {
+	dev := startDev(t)
+	echo := echoServer(t)
 
-// devAuth 返回 devserver 默认口令派生的鉴权字节。
-func devAuth() []byte {
-	auth := md5.Sum([]byte(devPassword))
-	return auth[:]
+	m, err := DialMuxPlain(dev.url, devPassword)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	conn, err := m.Open(echo)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 16)
+		conn.SetReadDeadline(time.Time{}) // 明确去掉 deadline：只靠 WS 死亡唤醒
+		_, err := conn.Read(buf)
+		done <- err
+	}()
+	time.Sleep(300 * time.Millisecond) // 让 Read 先沉下去
+	m.Close()                          // 整条 WS 死亡
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Read returned nil after ws kill, want error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Read still blocked 5s after ws kill — dead flag lost?")
+	}
 }

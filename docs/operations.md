@@ -1,199 +1,266 @@
 # 运维
 
-## 服务端
-
-### 部署要配什么
+## 部署要配什么
 
 **三个 GitHub Secret，一次 push，然后自己绑域名。** 没有别的。
 
 | Secret | 用途 |
 |---|---|
-| `CLOUDFLARE_API_TOKEN` | CI 调 Cloudflare API（需 Workers Scripts / D1 编辑权限） |
+| `CLOUDFLARE_API_TOKEN` | CI 调 Cloudflare API（需 Workers Scripts 编辑权限） |
 | `CLOUDFLARE_ACCOUNT_ID` | 账号 ID |
 | `PASSWORD` | 客户端连接口令，CI 透传成 Worker Secret |
 
 ```bash
-gh secret set CLOUDFLARE_API_TOKEN --repo <你>/<仓库>
-gh secret set CLOUDFLARE_ACCOUNT_ID --repo <你>/<仓库>
-gh secret set PASSWORD --repo <你>/<仓库>
-git push
+gh secret set PASSWORD
+gh secret set CLOUDFLARE_API_TOKEN
+gh secret set CLOUDFLARE_ACCOUNT_ID
 ```
 
-CI 自动：跑测试 → 建同名 D1 → 应用 schema（幂等）→ 部署 Worker → 透传 PASSWORD。
+push 到 `main` 后 `.github/workflows/deploy.yml` 自动跑：checks（构建 + 单测）→ 构建 bundle
+→ 通过 CF REST API 解析/创建同名 KV namespace 并把真实 id 写进 `wrangler.toml` 的占位符
+→ `wrangler deploy`（DO migration 随部署自动应用）→ 把 `PASSWORD` 透传成 Worker Secret。
 
-**CI 不做部署后验证**，这是刻意的：GitHub runner 在美国，用户在大陆，runner 能通
-不代表用户能通，反过来也一样。验证部署的方式就是拿客户端连一次。域名绑定是
-用户自己的事（控制台加 custom domain，或自己 wrangler 一行），项目不持有域名。
+也可以 `workflow_dispatch` 手动触发。
 
-### 鉴权：PASSWORD
+**没有部署后验证**：CI 的网络环境和用户差别很大（runner 在美国，用户在大陆），runner 能通
+不代表用户能通，反过来也一样。部署是否健康由"客户端能不能连上"直接回答——Worker 没有任何
+HTTP 端点来回答这个问题。
 
-- 客户端与 Worker 各自计算 `auth = md5(utf8(PASSWORD))`，网络只出现派生值
-  （16 字节，TLS 之内）。
-- 改口令 = 改 GitHub Secret 重新部署 + 改客户端参数，两端同步即可。
-- 没设 PASSWORD 时部署仍会成功，但 Worker 拒绝一切连接（upgrade 时返回 503）。
-- 派生值没有任何"默认可推算"的版本 —— 没有口令就没有派生值，Worker 明确报错
-  而不是退化到共享凭据。
+### 域名绑定不归项目管
 
-### D1
+Worker 只部署到 `workers.dev`。Custom domain 是用户在自己的 zone 上绑的（控制台或
+`wrangler` 均可），这一步同时建 DNS 记录和路由，是客户端能连上它的**全部前提**。项目不
+持有域名，也就没有"改一行 routes"这类配置。
 
-只绑定一张表：
+### 未设 PASSWORD 会怎样
 
-| 表 | 用途 |
-|---|---|
-| `relay_binding` | 域名 → 上次可用的中继（中继亲和的持久层） |
+部署仍会成功，但 Worker 会拒绝一切连接（首帧 HMAC 对不上）。CI 会打一条 warning。补上：
 
-`schema.sql` 全部是 `CREATE IF NOT EXISTS`，每次部署都会跑一遍 —— 之后新增表
-不需要迁移逻辑，重跑天然安全。
+```bash
+printf '%s' '你的口令' | npx wrangler secret put PASSWORD
+```
 
-### 构建与部署
+注意 `printf` 而不是 `echo`：`echo` 会追加一个换行符，那个换行会变成口令的一部分。
+
+## 本地部署
+
+**推荐：用一键脚本。** 它会自己建/复用 KV namespace、生成临时配置（不动入库的
+`wrangler.toml`）、部署并透传 `PASSWORD`：
+
+```bash
+export PASSWORD='<你的口令>'
+scripts/deploy.sh                 # 或先 scripts/deploy.sh --dry-run 看它要做什么
+```
+
+脚本用 `wrangler deploy -c wrangler.deploy.toml`，那份临时配置是 `wrangler.toml` 的副本加
+真实 namespace id，已在 `.gitignore` 里——**为什么不直接改写 `wrangler.toml`**：它是入库
+文件，就地改会污染工作区（`git status` 多一个改动、下次 `pull` 可能冲突）。CI 里可以就地
+`sed`，因为 runner 是一次性的。
+
+手动部署：
 
 ```bash
 cd server
-npm install                # 只有测试需要（ws）
-node build.mjs             # src/ -> _worker.js
+npm ci
+node build.mjs                              # 生成 _worker.js（改 src/，不要手改产物）
+npx wrangler login
+npx wrangler kv namespace create netmaster  # 输出的 id 填进 wrangler.toml 的 [[kv_namespaces]]
+npx wrangler secret put PASSWORD
+npx wrangler deploy
 ```
 
-`_worker.js` 是**产物**，不要手改。
+`wrangler.toml` 里的 KV `id` 是占位符 `00000000000000000000000000000000`，直接
+`wrangler deploy` 会因 id 非法而失败——**这是有意的：别拿占位符上线**。不需要 KV 时把
+`[[kv_namespaces]]` 整段删掉即可：缺少 KV 绑定时竞速只用内置兜底列表，功能不残。
 
-**正式部署路径是 CI**：`git push` 触发 `.github/workflows/deploy.yml`。
+`keep_vars = false` 是显式写出的：部署时删除 Worker 上已存在、但本文件里没有的变量。一份
+不描述现实的配置文件比没有配置文件更糟。
 
-### 环境变量
+## 部署产物
 
-只剩一个：
+`_worker.js` 由 `server/build.mjs` 把 `src/` 下 9 个模块拼接成一个文件
+（crypto → protocol → exits → proxyip → race → router → session → index）。
+它是**生成物**，改 `src/` 之后重新 `node build.mjs`。
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `DEBUG` | 关 | `1`/`true` 打开服务端日志（`wrangler tail` 里看） |
+`build.mjs` 同时是 CI 的语法门：`src/` 里任何一个走错字符都会在这里失败，而不是在生产里。
 
-其余一切都不是变量：鉴权是 PASSWORD secret；中继列表是动态获取 + 内置兜底；
-入口候选在客户端本地组装。
+## 环境变量
 
-### 客户端
+| 变量 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `PASSWORD` | Secret | — | 首帧 HMAC 密钥。必需 |
+| `DEBUG` | var | 空 | `'1'` 打开 `[session]` / `[router]` 日志，配合 `wrangler tail` |
+| `RACE_SLOTS` | var | 6 | 竞速槽位数 |
+| `RACE_SLOT_TIMEOUT_MS` | var | 1500 | 单槽超时 |
+| `RACE_GLOBAL_TIMEOUT_MS` | var | 3000 | 竞速全局超时 |
+| `RACE_STAGGER_MS` | var | 120 | 槽位交错启动间隔 |
+| `RACE_KV_TOP` | var | 4 | 从 KV 取前 N 个中继 |
+
+竞速参数非法或 ≤0 一律回落到默认（`posEnv`）：写错一个字符不该变成 0ms。
+
+`DEBUG` 是变量不是 Secret——改完要重新部署。
+
+## 存储与迁移
+
+| 绑定 | 类型 | migration tag | 说明 |
+|---|---|---|---|
+| `SESSION` | Durable Object（内存） | `v1` | 每条 WS 一个实例，不落盘 |
+| `ROUTER` | Durable Object（SQLite） | `v2` | 全局单实例，存目标 → 出口映射 |
+| `KV` | KV namespace | — | 订阅更新任务写 `proxyip:top`（见下节） |
+
+Migration 随 `wrangler deploy` 自动应用，不需要额外步骤。
+
+Router DO 的写入是"先返回、后落盘"：攒 5 秒或 50 条 flush 一次（DO Alarm 驱动），队列空了
+就撤掉待定 Alarm，避免空转唤醒消耗行写配额。flush 失败重试 1 次，仍失败就丢弃该批——缓存
+可以从竞速重建，不值得为它反复写。**进程驱逐时未 flush 的映射接受丢失。**
+
+`forget` 不排队，立即生效：映射被证伪时必须马上删，不能跟着队列一起等 5 秒，否则下一条流
+会踩同一脚。
+
+## 中继池刷新（GitHub Actions 定时任务，可选）
+
+`proxyip:top` 是竞速用的"当前最健康的 4 个中继"。它由
+`.github/workflows/refresh-relays.yml` 刷新：**每小时左右**跑一次
+`server/tools/refresh-relays.mjs`，拉社区源 + 内置兜底 → 并发探测（CONNECT
+握手，3s 超时）→ 按成功率/延迟排序 → 取前 4 写进 KV，last-good-wins（本轮全败
+就不写，保留上一轮）。
+
+### 默认不开，也不影响使用
+
+这一点值得说清：
+
+- **不启用这个定时任务，代理照样能用。** KV 为空时竞速只用内置兜底列表
+  （`proxyip.js` 的 9 条 CMLiussss），功能不残，只是候选质量差一些、命中率
+  低一些。
+- **启用之后**，KV 里有新鲜的健康排名，竞速把 KV top4 排在候选最前，
+  CF 承载目标的出口质量明显更好。
+- **GitHub 的 `schedule` 是"每小时左右"而不是准点**（官方说明有几分钟级延迟，
+  高峰期可能更久）。看到 KV 时间戳比整点晚几分钟是**正常的**，不是故障。
+  另外仓库连续 60 天无活动时 GH 会自动停用定时任务——长期不用的 fork 别指望它。
+
+启用：给仓库配两个 Secret（`CLOUDFLARE_API_TOKEN` 需 **KV 写**权限、
+`CLOUDFLARE_ACCOUNT_ID`），然后手动 `workflow_dispatch` 跑一次看输出；
+建议先勾 `dry_run=true` 确认它会写什么。
+
+### 用到的 KV 键
+
+| 键 | 内容 |
+|---|---|
+| `proxyip:top` | 前 4 名中继（竞速读它） |
+
+只有这一个键，没有游标、没有 pending：探测是在 runner 上一次性跑完的，不存在
+"分批续跑"的中间状态。
+
+### 排障
+
+run 页面就是唯一的排障现场，日志里逐条打印每个候选的成败与原因：
+
+```
+source https://ipdb.api.030101.xyz/?type=bestproxy: 10 entries
+source builtin:cmliussss: 9 entries
+probing 19 relays (concurrency 8, timeout 3000ms, target cp.cloudflare.com:80)
+probes: 3/19 usable
+  ok   ProxyIP.HK.CMLiussss.net:443 182ms
+  fail 8.218.70.238:443 46ms (CONNECT status 405)
+last-good-wins: no usable relay this round (19 probed) — keeping the previous proxyip:top
+```
+
+**绿灯不等于池子被刷新过**：本轮全败时也退出 0（定时任务红了会让人习惯性忽略），
+所以要认 `last-good-wins: …` 这一行，而不是只看 run 是不是绿的。
+
+本地干跑（真拉源 + 真探测，不写 KV）：
 
 ```bash
-cd client && go build -o netmaster.exe ./cmd/netmaster
-netmaster serve --server <域名> --password <PASSWORD>
+cd server && DRY_RUN=1 node tools/refresh-relays.mjs
 ```
 
-配置来源优先级：**命令行 flag > config.json > 默认值**。config.json 用标准库
-解析（零依赖），可配置项与 serve 的 flag 一一对应，写在当前目录或
-`%AppData%/netmaster/config.json`：
+## 构建与测试
 
-```json
-{ "server": "<域名>", "password": "<口令>", "manual": false, "rules": "", "latencyToleranceMs": 300 }
+```bash
+scripts/test-all.sh                                  # 全量（服务端 + 客户端）
+
+cd server && npm ci && node build.mjs                # 服务端构建
+node test/crypto.mjs   # 鉴权与 TS 窗口
+node test/protocol.mjs # 帧编解码
+node test/integration.mjs
+node test/proxyip.mjs  # 中继 CONNECT、兜底列表、健康记忆
+node test/race.mjs     # 竞速与候选组装
+node test/router.mjs   # Router DO 队列与 flush
+node test/refresh-relays.mjs  # 中继池刷新脚本（替代 Worker Cron）
+
+cd client && go vet ./... && go test ./...           # 客户端
+
+# 端到端（Go 客户端 ↔ Node devserver）
+cd server && node test/devserver.mjs 0 devserver-password 0 &
+cd client && go test ./internal/outbound -run TestProtoE2E -v
 ```
 
-写好之后日常就是裸的 `netmaster serve`。环境变量 `NETMASTER_SERVER` /
-`NETMASTER_PASSWORD`（`PASSWORD` 也认）是最后一级兜底，优先级低于 config.json。
-缺 server/password 时以退出码 2 报错，而不是拿空凭据去连。
+注意：`scripts/test-all.sh` 当前仍按 `for t in crypto protocol integration control relay`
+遍历，而 `control.mjs` / `relay.mjs` 在 `server/test/` 下已不存在（`control` 的内容现在在
+`proxyip.mjs` / `race.mjs`），真实存在的是
+`crypto / devserver / integration / protocol / proxyip / race / refresh-relays / router`。
+也就是说 **本地全量脚本当前跑不通**（`.github/workflows/ci.yml` 已经更新为 v2 列表，只是
+它没跟上）。
 
-### 延迟容忍（latencyToleranceMs）
+（`test/cron.mjs` 曾在这个列表里，随 Worker Cron 一起删除了——Cron 的替代品
+`refresh-relays.mjs` 有自己的单测。）
 
-出口亲和默认是"通一次就粘住，直到明确失败"。`latencyToleranceMs` 给粘性加一个
-天花板：
+`scripts/test-all.sh` 用 `set -o pipefail`——node 的报错走 stderr，`tail` 会吞掉退出码，不
+加这个测试挂了 CI 也是绿的。
 
-| 值 | 行为 |
-|---|---|
-| 不设（默认） | 粘死 —— 保守，出口 IP 最稳定 |
-| `0` 或负数 | 自优化 —— 每次请求都重新选优，代价是出口 IP 不稳定 |
-| 正数 N | 绑定节点的延迟**相对绑定时刻的基线升高超过 N ms** 时改选，改选成功后以新出口的当前延迟重锚基线 |
+## 发版
 
-语义是**漂移**而不是绝对阈值：绑定时刻的延迟是基线，当前延迟 = 基线 + N 才换。
-好处是全网变慢时基线随重绑自动重锚、不会乱跳，只有单个出口相对劣化才触发。
-只影响代理出口；直连出口不测延迟，不参与。改选只发生在自适应路径**成功**之后，
-不会因为换出口把请求本身弄失败。
+打 `v*` tag 即触发 `.github/workflows/release.yml`：构建 `_worker.js` 与 `wrangler.toml`，
+交叉编译五个平台的客户端（windows-amd64 / linux-amd64 / linux-arm64 / darwin-amd64 /
+darwin-arm64），按目标平台逐个 `go vet`、跑两端测试、做产物自检（体积异常小直接失败），
+创建 Release。标签重打时旧 Release 会被删除重建，保证 `vX.Y.Z` 的产物永远来自该标签当前
+指向的提交。
 
-### 入口候选规模
-
-候选 = 服务端域名 DNS + 三个社区源（各最多 50 条，总数截断到 64，DNS 优先保留），
-全部后台探测（12 并发、单节点 4s 预算）。探测只是排序，运行期自适应评分
-（成功率 × 1000 + 延迟 + 连败惩罚）才是真正的选择。
-
-**双击 exe 等价于 `serve`**：无参数启动即 serve；首次双击没有 config.json 时
-在 exe 旁生成模板，填好 server/password 再点一次；任何启动错误都会等一次
-回车再关窗口，不让人盯着一闪而过的黑框猜原因。注意直接关闭窗口 = 强杀进程，
-系统代理由看门狗还原（这正是它存在的意义）。
-
-serve 的 flag 收敛为 4 个：
-
-| 参数 | config.json 键 | 说明 |
-|---|---|---|
-| `--server` | `server` | 服务端域名（裸域名即可，scheme 会被剥掉） |
-| `--password` | `password` | 部署口令 |
-| `--manual` | `manual` | 不接管系统代理，只打印监听地址 |
-| `--rules` | `rules` | 自定义分流规则文件 |
-
-其余行为都是固定的好默认值：ECH 开、geoip 开、后台探测、mux 复用。
-
-### 端口自动选择
-
-HTTP 先试 8080、SOCKS5 先试 1080，被占则顺延找空闲端口，结果打印到终端。
-系统代理自动指向选定的 HTTP 端口，用户通常不需要知道端口号；`--manual` 下
-只打印地址，不接管。
-
-### 首次连通验证
-
-ready 之后 serve 在后台做一次真实的传输层建连（TLS+WS+auth），补一行日志：
-
-```
-tunnel established via node [3] 104.17.x.x
-tunnel failed: <原因>
+```bash
+git tag v0.2.0 && git push --tags
 ```
 
-部署是否健康，这一行就是最直接的回答（Worker 没有健康检查端点，CI 也不做
-部署后验证 —— 这一行就是验证）。
+macOS 产物未签名：首次运行会被 Gatekeeper 拦住，右键 → 打开，或
+`xattr -d com.apple.quarantine <文件名>`。
 
-### 隧道死亡的透明重试
+## 日志口径
 
-代理路径的 HTTPS 隧道与直连共用同一套"重放"哲学（见 routing.md）：CONNECT 的
-200 回出之后，首个飞行段（ClientHello）会被缓存；若上游在回任何字节之前死掉
-—— 典型场景是首次访问某 Cloudflare 承载站点时 worker 踩到"TCP 能通但不干活"
-的中继 —— 客户端解绑该域名的出口、记一次失败，换一个出口重放首段，浏览器无感。
-同时 worker 侧会把对这个域名 delivering 零字节的中继从亲和表（内存 + D1）里
-忘掉，保证重试和后续连接重新探测。只重试一次；已有数据回来的会话死亡属于
-中途断流，不在重放范围内。
-
-### 子命令
-
-| 命令 | 用途 |
-|---|---|
-| `serve` | 日常唯一命令 |
-| `nodes` | 持续发请求，观察自适应选路的实时效果；`--ipcheck` 统计出口 IP 分布 |
-| `restore` | 崩溃/强杀后手动还原系统代理 |
-
-`watchdog` 是内部命令，由 serve 自动派生，不面向用户。
-
-### 缓存位置
-
-`%LOCALAPPDATA%/netmaster/`：`entry-*.json`（社区优选）、`probe-*.json`（节点延迟）、
-`state-*.json`（域名亲和 + 直连冷却）、`geoip-*.json`（CN 网段）。删掉即可强制
-重新拉取/重新学习（serve 没有 --refresh flag，删缓存就是强制刷新的方式）。
-
-`state-*.json` 值得单独说明：里面是客户端**学到的**路由知识（哪个域名走哪个出口、
-哪些域名直连被阻断过）。落盘意味着重启不丢 —— 学到的最有价值的知识不该活不过
-一次重启。换服务端域名时旧状态天然失效（按域名做缓存键）。
-
-## 系统代理的接管与还原
-
-顺序是刻意的：
+服务端（DEBUG=1，`wrangler tail`）：
 
 ```
-1. 代理开始监听
-2. 清理上次残留的状态（异常退出后系统代理可能还指着不存在的端口）
-3. 设置系统代理（先落盘旧值，再逐项写注册表）
-4. 拉起看门狗（仅在第 3 步成功时）
-5. ready
+[session] authenticated; stream 1 -> example.com:80
+[session] direct exit failed (…); trying proxyip
+[session] router relay X failed: …
+[session] race slot 0 ProxyIP.HK.CMLiussss.net:443 failed: …
+[session] stream 7 no first byte in 3000ms, forgetting route
+[router] flush dropped 3 rows: …
 ```
 
-- **先监听再设代理**：避免出现"系统代理已指向、端口还没起来"的空窗。
-- **`Enable` 先落盘再改注册表**：反过来的话，进程在两者之间挂掉会造成"注册表已改但状态
-  文件不存在"，看门狗和下次启动的清理都检测不到，系统代理会一直悬着。
-- **看门狗只在接管了系统代理时拉起并落盘状态**：`--manual` 下不做；设置失败同样不留
-  空转进程。它阻塞等主进程退出，若状态文件仍在（说明主进程没走正常清理）就还原。
-- **`Enable` 中途失败会立即回滚**：它可能已经改了一部分注册表（比如 `ProxyEnable` 已置 1），
-  而调用方把错误当作"什么都没发生"，退出时就不还原了。
+客户端（stdout，`log.Ltime` 时间戳）：
 
-## 更新
+```
+config: D:\...\config.json
+entries: 51 (community: net)
+[probe] 51 entries -> 16 nodes in 1.4s
+rules: 8421 entries (fetched, skipped 312 lines)
+[geoip] CN ranges ready: 4312 (cache)
+[proxy] HTTP  proxy on 127.0.0.1:8080
+[proxy] SOCKS5 proxy on 127.0.0.1:1080
+[sys] system proxy ON -> http://127.0.0.1:8080 (auto-restored on exit)
+[sys] watchdog started (pid 12345) to auto-restore on crash
+ready in 1.2s. browse normally; Ctrl+C or close this window to stop (system proxy is restored).
+tunnel established via node 104.16.x.x
+```
 
-服务端和客户端可独立升级，协议不变。两端版本不匹配的表现是客户端连不上
-（协议字段变化）—— 两端都在这个仓库里，同时升级即可。
+客户端运行时输出一律英文。
+
+## M0 遗留物
+
+worker `netmaster-m0` 仍部署在账号上（零流量，不耗配额），确认不需要复核后删除：
+
+```bash
+gh workflow run m0-probe.yml --ref v2 -f teardown=true
+# 或本地：cd m0 && npx wrangler delete --name netmaster-m0 --force
+```
+
+`m0/` 目录与 `.github/workflows/m0-probe.yml` 在 v2 分支保留至架构定稿后删除。

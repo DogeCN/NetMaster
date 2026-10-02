@@ -1,0 +1,67 @@
+# refresh-relays.yml — ProxyIP 订阅更新器（替代 Worker Cron）
+#
+# 为什么搬出 Worker：免费版的 Cron 只有整点触发且经常整点漏发，而 KV 里的池子决定
+# CF 托管目标的出口质量——池子空了就只剩内置兜底。这个工作流每小时左右刷一次
+# proxyip:top，last-good-wins（本轮全败不写）。
+#
+# 不部署、不改 Worker 状态：只读中继列表 + 覆写一个 KV key。
+#
+# 注意：GitHub 的 schedule 是"每小时左右"而不是准点（官方说明有几分钟级延迟，
+# 高峰期可能更久）；仓库连续 60 天无活动时定时任务会被自动停用。
+
+name: refresh-relays
+
+on:
+  # push 触发器只为注册工作流（非默认分支上的 dispatch-only 文件不会注册）
+  push:
+    branches: [v2]
+    paths: [".github/workflows/refresh-relays.yml"]
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "only print what would be written, do not touch KV"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # 这个脚本只依赖 Node 内置模块（node:net / 全局 fetch）与仓库内的
+      # src/proxyip.js，**不需要 npm ci**——装依赖只会多一个网络失败点。
+      # 输出即验收依据：无论成败都留档，失败时不用重跑就能看是哪一步的问题。
+      - name: Refresh relay pool
+        working-directory: server
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # 可选：钉死 KV namespace id；留空则用 API 按 title=netmaster 解析
+          # （与 deploy.yml 同口径）。
+          RELAY_KV_NAMESPACE_ID: ${{ vars.NETMASTER_KV_ID }}
+          # 可选：填了就剔除回指本 Worker 的 ProxyIP（回连自身会被平台拒）
+          NETMASTER_WORKER_HOST: ${{ vars.NETMASTER_WORKER }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -o pipefail   # 报错走 stderr，tee 会吞掉退出码
+          NODE_OPTIONS="--import ./test/shims/register.mjs" node tools/refresh-relays.mjs 2>&1 | tee refresh-relays.log
+
+      - name: Upload refresh log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refresh-relays-log
+          path: server/refresh-relays.log
+          if-no-files-found: warn

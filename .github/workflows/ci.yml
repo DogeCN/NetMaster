@@ -34,15 +34,22 @@ jobs:
 
       # build.mjs is the real syntax gate: it concatenates src/ into _worker.js and
       # a stray character anywhere in src/ fails here rather than in production.
+      # _worker.js 带 cloudflare:* 平台 import，只能做语法检查（Node 加载不了平台模块，
+      # 那是 Workers 运行时的东西）。
       - name: Build worker bundle
         run: |
           node build.mjs
-          node -e "import('./_worker.js').then(()=>console.log('bundle loads OK'))"
+          node --check _worker.js
 
       - name: Unit tests
         run: |
           set -o pipefail   # node 的报错走 stderr，tail 会吞退出码 —— 不加这个测试挂了 CI 也是绿的
-          for t in crypto protocol integration control relay; do
+          # crypto/protocol 是纯逻辑；其余套件经 socket.js 摸平台模块，要挂 shim
+          for t in crypto protocol; do
             printf '%-12s ' "$t"
             node "test/$t.mjs" | tail -1
+          done
+          for t in integration proxyip race router; do
+            printf '%-12s ' "$t"
+            NODE_OPTIONS="--import ./test/shims/register.mjs" node "test/$t.mjs" | tail -1
           done

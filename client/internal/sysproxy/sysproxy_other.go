@@ -1,26 +1,26 @@
-//go:build !windows
+//go:build !windows && !darwin && !linux
 
 package sysproxy
 
 import "errors"
 
-// Enable 非 Windows 平台暂不支持（可用 env / 手动配置系统代理）。
+// Enable 不支持系统代理的平台：BSD、wasi 等。用 --manual。
 func Enable(proxyAddr string) (func(), error) {
-	return nil, errors.New("sysproxy: not supported on this platform")
+	return nil, errors.New("sysproxy: system proxy takeover not supported on this platform (use --manual)")
 }
 
-// Disable 非 Windows 平台暂不支持。
+// Disable 同上。
 func Disable() error {
-	return errors.New("sysproxy: not supported on this platform")
+	return errors.New("sysproxy: system proxy takeover not supported on this platform")
 }
 
-// Restore 非 Windows 平台暂不支持。
+// Restore 同上。
 func Restore() error {
-	return errors.New("sysproxy: not supported on this platform")
+	return errors.New("sysproxy: system proxy takeover not supported on this platform")
 }
 
-// CleanupStale 非 Windows 平台无事可做。
+// CleanupStale 无状态文件，无事可做。
 func CleanupStale() (bool, error) { return false, nil }
 
-// StatePath 非 Windows 平台无状态文件。
+// StatePath 无状态文件。
 func StatePath() string { return "" }

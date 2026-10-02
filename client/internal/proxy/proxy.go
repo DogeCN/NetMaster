@@ -14,9 +14,24 @@ import (
 	"sync"
 	"time"
 
-	"netmaster/internal/nodepool"
-	"netmaster/internal/route"
+	"netmaster/internal/rules"
 )
+
+// Router 是分流决策器：给定 host:port 返回直连还是代理。rules.Router 实现；
+// 测试可注入替身。
+type Router interface {
+	Match(host string, port uint16) rules.Action
+}
+
+// Exiter 是出口选择器需要提供的最小能力面：分流决策（DialAuto 的 direct 返回值）、
+// 代理建连与"直连被阻断后改走代理"。selector.Pool 实现；测试可注入替身。
+type Exiter interface {
+	Len() int
+	DialAuto(host string) (net.Conn, bool, error)
+	Dial(host string) (net.Conn, error)
+	RetryProxy(host string) (net.Conn, error)
+	NoteProxyFailure(host string)
+}
 
 // Config 代理服务配置。
 type Config struct {
@@ -25,9 +40,9 @@ type Config struct {
 	// SocksAddr 监听的 SOCKS5 代理地址，如 127.0.0.1:1080
 	SocksAddr string
 	// Router 分流决策
-	Router *route.Router
-	// Pool 海外出口节点池
-	Pool *nodepool.Pool
+	Router Router
+	// Pool 出口选择器（直连/代理决策与建连）。
+	Pool Exiter
 	// DirectFallback 路由未覆盖或节点池为空时是否直连（默认 true）
 	DirectFallback bool
 	// RetryViaProxy 在"尝试性直连"被判定阻断后改用代理重连（见 relayWithReplay）。
@@ -122,21 +137,22 @@ func (s *Server) Close() error {
 // 真能直连（GFW 常在看到 TLS SNI 后才发 RST）。调用方应据此决定要不要走
 // relayWithReplay。规则明确要求直连的（比如局域网、.cn 名单）不算尝试性。
 func (s *Server) dial(host string) (conn net.Conn, tentativeDirect bool, err error) {
-	action := route.Proxy
+	_, portStr, splitErr := net.SplitHostPort(host)
+	port := uint16(0)
+	if splitErr == nil {
+		if n, perr := strconv.ParseUint(portStr, 10, 16); perr == nil {
+			port = uint16(n)
+		}
+	}
+	action := rules.Proxy
 	if s.cfg.Router != nil {
-		action = s.cfg.Router.Decide(host)
+		action = s.cfg.Router.Match(host, port)
 	}
 	switch action {
-	case route.Direct:
+	case rules.Direct:
+		// 规则明确要求直连：不是"尝试性直连"，失败就直接失败（规则用户自己担责）。
 		c, derr := net.DialTimeout("tcp", host, s.cfg.DialTimeout)
 		return c, false, derr
-	case route.Auto:
-		// 未明确分流：交给出口层按 IP 归属 + 域名亲和选，失败互相回退。
-		if s.cfg.Pool == nil || s.cfg.Pool.Len() == 0 {
-			c, derr := net.DialTimeout("tcp", host, s.cfg.DialTimeout)
-			return c, false, derr
-		}
-		return s.cfg.Pool.DialAuto(host)
 	default: // proxy
 		if s.cfg.Pool == nil || s.cfg.Pool.Len() == 0 {
 			if s.cfg.DirectFallback {

@@ -1,31 +1,44 @@
-/**
- * MD5 correctness test against known RFC 1321 vectors, plus the auth
- * derivation. If MD5 is wrong, client and worker derive different auth
- * bytes and every connection is closed as unauthorized.
- */
-import { md5Hex, authBytes, safeEqualBytes, bytesToHex } from '../src/crypto.js';
+// crypto.mjs — v2 鉴权原语单测：HMAC 派生、TS 窗口、常量时间比较。
+import { createHmac } from 'node:crypto';
+import { authCode, tsFromBytes, tsWithinWindow, safeEqualBytes, utf8, AUTH_LEN, TS_WINDOW_SEC } from '../src/crypto.js';
 
 let pass = 0, fail = 0;
-const eq = (a, b, n) => { if (a === b) { pass++; console.log('  PASS ' + n); } else { fail++; console.log(`  FAIL ${n} got=${a} want=${b}`); } };
+const ok = (c, n, x = '') => { if (c) { pass++; console.log('  PASS ' + n); } else { fail++; console.log('  FAIL ' + n + ' ' + x); } };
 
-console.log('--- MD5 known vectors ---');
-eq(await md5Hex(''), 'd41d8cd98f00b204e9800998ecf8427e', 'empty string');
-eq(await md5Hex('a'), '0cc175b9c0f1b6a831c399e269772661', '"a"');
-eq(await md5Hex('abc'), '900150983cd24fb0d6963f7d28e17f72', '"abc"');
-eq(await md5Hex('message digest'), 'f96b697d7cb7938d525a2f31aaf161d0', '"message digest"');
-eq(await md5Hex('abcdefghijklmnopqrstuvwxyz'), 'c3fcd3d76192e4007dfb496cca67e13b', 'alphabet');
-eq(await md5Hex('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'), 'd174ab98d277d9f5a5611c2c9f419d9f', 'alnum');
-eq(await md5Hex('12345678901234567890123456789012345678901234567890123456789012345678901234567890'), '57edf4a22be3c955ac49da2e2107b67a', '80-digit string');
+console.log('--- authCode ---');
+{
+	// 与 node:crypto 的标准 HMAC-SHA256 交叉验证
+	const signed = Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 1, 2, 104, 101, 108, 108, 111, 0, 68]);
+	const got = await authCode('hunter2', signed);
+	const ref = createHmac('sha256', 'hunter2').update(signed).digest().slice(0, AUTH_LEN);
+	ok(got.length === AUTH_LEN, 'auth is 16 bytes');
+	ok(Buffer.from(got).equals(ref), 'matches node:crypto HMAC-SHA256[:16]');
+	const other = await authCode('hunter3', signed);
+	ok(!Buffer.from(got).equals(other), 'different password -> different auth');
+	const otherMsg = await authCode('hunter2', signed.slice(0, 12));
+	ok(!Buffer.from(got).equals(otherMsg), 'different message -> different auth');
+}
 
-console.log('--- auth derivation ---');
-eq(bytesToHex(authBytes('abc')), '900150983cd24fb0d6963f7d28e17f72', 'auth = md5(utf8(password))');
-eq(bytesToHex(authBytes('abc')), bytesToHex(authBytes('abc')), 'deterministic');
-eq(authBytes('abc').length, 16, '16 bytes');
-ok(safeEqualBytes(authBytes('abc'), authBytes('abc')) === true, 'safeEqualBytes true');
-ok(safeEqualBytes(authBytes('abc'), authBytes('abd')) === false, 'safeEqualBytes false');
-ok(safeEqualBytes(authBytes('abc'), new Uint8Array(16)) === false, 'safeEqualBytes length mismatch');
+console.log('--- ts window ---');
+{
+	const now = Math.floor(Date.now() / 1000);
+	ok(tsFromBytes(Uint8Array.from([0, 0, 0, 0, 0, 0, 0, 0])) === 0n, 'tsFromBytes zero');
+	const nowBytes = new Uint8Array(8);
+	new DataView(nowBytes.buffer).setBigUint64(0, BigInt(now), false);
+	ok(tsFromBytes(nowBytes) === BigInt(now), 'tsFromBytes roundtrip');
+	ok(tsWithinWindow(BigInt(now), now), 'now within window');
+	ok(tsWithinWindow(BigInt(now - TS_WINDOW_SEC), now), 'window edge -300 ok');
+	ok(tsWithinWindow(BigInt(now + TS_WINDOW_SEC), now), 'window edge +300 ok');
+	ok(!tsWithinWindow(BigInt(now - TS_WINDOW_SEC - 1), now), 'beyond -300 rejected');
+	ok(!tsWithinWindow(BigInt(now + TS_WINDOW_SEC + 1), now), 'beyond +300 rejected');
+}
 
-function ok(c, n) { if (c) { pass++; console.log('  PASS ' + n); } else { fail++; console.log('  FAIL ' + n); } }
+console.log('--- safeEqualBytes ---');
+{
+	ok(safeEqualBytes(Uint8Array.from([1, 2, 3]), Uint8Array.from([1, 2, 3])), 'equal');
+	ok(!safeEqualBytes(Uint8Array.from([1, 2, 3]), Uint8Array.from([1, 2, 4])), 'differ');
+	ok(!safeEqualBytes(Uint8Array.from([1, 2]), Uint8Array.from([1, 2, 3])), 'length differ');
+}
 
-console.log(`\n${pass} passed, ${fail} failed`);
-process.exit(fail ? 1 : 0);
+console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} pass, ${fail} fail`);
+process.exit(fail === 0 ? 0 : 1);
