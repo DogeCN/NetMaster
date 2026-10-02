@@ -195,18 +195,13 @@ cd server && node test/devserver.mjs 0 devserver-password 0 &
 cd client && go test ./internal/outbound -run TestProtoE2E -v
 ```
 
-注意：`scripts/test-all.sh` 当前仍按 `for t in crypto protocol integration control relay`
-遍历，而 `control.mjs` / `relay.mjs` 在 `server/test/` 下已不存在（`control` 的内容现在在
-`proxyip.mjs` / `race.mjs`），真实存在的是
-`crypto / devserver / integration / protocol / proxyip / race / refresh-relays / router`。
-也就是说 **本地全量脚本当前跑不通**（`.github/workflows/ci.yml` 已经更新为 v2 列表，只是
-它没跟上）。
+注意：`scripts/test-all.sh` 里 crypto/protocol 是纯逻辑直跑，其余套件
+（integration / proxyip / race / router / refresh-relays）经 `socket.js` 摸平台模块，
+脚本会挂 `NODE_OPTIONS="--import ./test/shims/register.mjs"`——单跑这些测试时同样要挂，
+否则 `ERR_UNSUPPORTED_ESM_URL_SCHEME`。
 
-（`test/cron.mjs` 曾在这个列表里，随 Worker Cron 一起删除了——Cron 的替代品
-`refresh-relays.mjs` 有自己的单测。）
-
-`scripts/test-all.sh` 用 `set -o pipefail`——node 的报错走 stderr，`tail` 会吞掉退出码，不
-加这个测试挂了 CI 也是绿的。
+`scripts/test-all.sh` 与各 workflow 都用 `set -o pipefail`——node 的报错走 stderr，
+`tail` 会吞掉退出码，不加这个测试挂了 CI 也是绿的。
 
 ## 发版
 
@@ -228,7 +223,7 @@ macOS 产物未签名：首次运行会被 Gatekeeper 拦住，右键 → 打开
 服务端（DEBUG=1，`wrangler tail`）：
 
 ```
-[session] authenticated; stream 1 -> example.com:80
+[session] authenticated; stream 1 -> www.google.com:443
 [session] direct exit failed (…); trying proxyip
 [session] router relay X failed: …
 [session] race slot 0 ProxyIP.HK.CMLiussss.net:443 failed: …
@@ -256,11 +251,6 @@ tunnel established via node 104.16.x.x
 
 ## M0 遗留物
 
-worker `netmaster-m0` 仍部署在账号上（零流量，不耗配额），确认不需要复核后删除：
-
-```bash
-gh workflow run m0-probe.yml --ref v2 -f teardown=true
-# 或本地：cd m0 && npx wrangler delete --name netmaster-m0 --force
-```
-
-`m0/` 目录与 `.github/workflows/m0-probe.yml` 在 v2 分支保留至架构定稿后删除。
+已全部清理完毕（2026-10-03）：探针 worker `netmaster-m0` 已删除，`m0/` 目录与
+`m0-probe.yml` / `live-debug.yml` / `cron-debug.yml` 已从仓库移除，临时 SSH key 已撤销。
+M0 结论固化在 [m0-findings.md](m0-findings.md)。

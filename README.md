@@ -221,12 +221,9 @@ cd server && node test/router.mjs
 cd server && node test/devserver.mjs 0 devserver-password 0 &
 cd client && go test ./internal/outbound -run TestProtoE2E -v
 
-# 端到端验收脚本（本地自检；给真实部署加 NETMASTER_ENDPOINT / NETMASTER_PASSWORD 即跑全量）
-cd server && node test/e2e.mjs
+# 端到端验收脚本（本地自检；给真实部署加 NETMASTER_E2E_WORKER / NETMASTER_E2E_PASSWORD 即跑全量）
+# 经 socket.js 摸平台模块，要挂 Node shim —— 与 test-all.sh 同因
+cd server && node --import ./test/shims/register.mjs test/e2e.mjs
 ```
-
-注意：`scripts/test-all.sh` 的测试清单仍指向已不存在的 `control` / `relay`
-（`.github/workflows/ci.yml` 已更新为 v2 列表），本地全量脚本跑不通——见
-[docs/operations.md](docs/operations.md)。
 
 发版：打 `v*` tag 即构建全部 Release 产物（`.github/workflows/release.yml`）。

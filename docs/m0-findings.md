@@ -1,7 +1,8 @@
 # M0 平台核验结论
 
 日期：2026-10-02。探针：`m0/`（worker `netmaster-m0`，CI 驱动，运行记录见 GitHub Actions
-`m0-probe` workflow，产物 `m0-drive-results`）。复核方式：重跑 workflow_dispatch 即可。
+`m0-probe` workflow，产物 `m0-drive-results`）。**2026-10-03 注：探针与 workflow 已删除**，
+本档即最终结论；如需复核，按各节"实验"描述重建探针即可。
 
 同日第二轮（E6-E9）：探针仍是 `netmaster-m0`，其中直连出口与 20 并发流的结论在**真实
 部署的 `netmaster` worker** 上复验过。E5 没有独立小节——它是 E4 的一个变体（见 E4 正文）。
@@ -140,9 +141,9 @@ www.cloudflare.com），与 E6 的失败形态对照。
 2. **目标选型教训**：文档、测试与验收脚本不能再拿 example.com 当"非 CF 直连目标"的
    样例。已改：`client/internal/outbound/live_test.go` 与 `server/test/e2e.mjs`
    （第 3/4 项的直连目标改成 `www.google.com:443`、CF 托管目标改成
-   `www.cloudflare.com:443`，两者都走 443，客户端做 TLS）。**仍需改**：
-   `docs/architecture.md`、`docs/operations.md`、`docs/troubleshooting.md` 里
-   `example.com:80` 的日志样例与验收描述，以及 `docs/PRD.md:518`（由主会话统一回写）。
+   `www.cloudflare.com:443`，两者都走 443，客户端做 TLS）。连带回写（2026-10-03）：
+   各文档的 `example.com:80` 日志样例、`selector.go` 里客户端首连通验证 `Verify()` 的
+   目标（原为 `example.com:80`，在真实部署上必失败）以及 `docs/PRD.md` 的对应表述。
 3. 一个合格的"直连验收目标"必须**同时**满足：解析结果不在 CF 网段 **且** 端口不是 80。
    只满足一条就会得到一个看似是平台故障、实际是选型错误的 0x03。
 4. 顺带澄清一处实现注释的越界：`exits.js` 头部写着"`connect()` 只接受 IP 字面量——
@@ -201,16 +202,17 @@ DO 之间 `fetch` 调用的可见性。
 结论：任何"靠 `wrangler tail` 看 Session DO 日志排障"的运维流程**无效**，而且失效得
 很安静——你看到的只是一个安静的 tail。设计含义：
 
-1. **诊断必须走 KV 通道**，已经有两条：出口失败原因写 `debug:lastExit`
-   （`session.js`），触发器是否在跑写 `cron:lastFired`（`index.js`）。
+1. **诊断必须走 KV 通道**，已有：出口失败原因写 `debug:lastExit`
+   （`session.js`）。
 2. 判断"某件事到底有没有发生"要**查 KV 的时间戳**，不要查 tail。日志只用于 worker 入口
    层面的粗筛。
-3. 本仓库里已经有一个现成的例子值得警惕：`index.js` 的 `scheduled` 处理器仍调用已被
+3. 本仓库里曾经有一个现成的例子值得警惕：`index.js` 的 `scheduled` 处理器仍调用已被
    删除的 `runCron`（`cron.js` 已删，`build.mjs` 的模块列表也已去掉）。因为
-   `wrangler.toml` 的 `[triggers] crons` 已被移除，这个处理器现在是**死代码、不会触发**；
+   `wrangler.toml` 的 `[triggers] crons` 已被移除，这个处理器当时是**死代码、不会触发**；
    但如果有人把触发器加回去，它会抛 `ReferenceError` 并被 `catch` 吞掉，而这条
-   `console.error` 按本节结论**在 tail 上看不见**——只有 `cron:lastFired` 会被更新，
-   看上去像"定时任务在正常运行"。这正是 E9 最典型的坑：失败静默、证据看起来是好的。
+   `console.error` 按本节结论**在 tail 上看不见**，看上去像"定时任务在正常运行"。
+   这正是 E9 最典型的坑：失败静默、证据看起来是好的。（该死代码已随后清除：
+   scheduled 处理器整段删除。）
 4. 推论：新增诊断信息时，**默认写 KV，不要默认写 console**。
 
 ---
@@ -240,14 +242,12 @@ DO 之间 `fetch` 调用的可见性。
 3. **预算三条对策**（E8）：DNS 进程内缓存、直连失败记忆（本连接内）、
    `connectCount >= 30` 优雅断开让客户端重连换预算。客户端侧的重连退避与等待队列
    是这个机制成立的前提。
-4. **诊断改走 KV**（E9）：`debug:lastExit` 记出口失败原因，`cron:lastFired` 记触发
-   是否在跑。**不依赖 `wrangler tail` 看 DO 日志**——DO 的 console 输出在那里不可见。
+4. **诊断改走 KV**（E9）：`debug:lastExit` 记出口失败原因。**不依赖
+   `wrangler tail` 看 DO 日志**——DO 的 console 输出在那里不可见。
 5. 出口池刷新从 Worker Cron 迁到 GitHub Actions（`.github/workflows/refresh-relays.yml`），
    KV 契约（`proxyip:top` 的字段与前 4 条）不变，`last-good-wins` 语义不变。
 
-## 遗留物
+## 遗留物（已清理）
 
-- worker `netmaster-m0` 仍部署在账号上（零流量，不耗配额）；确认不需要复核后删除：
-  `gh workflow run m0-probe.yml --ref v2 -f teardown=true`，或本地
-  `cd m0 && npx wrangler delete --name netmaster-m0 --force`。
-- `m0/` 目录与 `.github/workflows/m0-probe.yml` 在 v2 分支保留至架构定稿后删除。
+worker `netmaster-m0`、`m0/` 目录、`m0-probe.yml` 及一次性诊断 workflow 均已于
+2026-10-03 删除。

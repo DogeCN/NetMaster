@@ -24,27 +24,7 @@ export default {
     return env.SESSION.get(id).fetch(request);
   },
 
-  // Cron（PRD §9）：每小时刷新 KV 里的出口健康排名。分批探测 + last-good-wins，
-  // 细节见 cron.js。workerHost 用于剔除回指自身的 ProxyIP。
-  async scheduled(event, env, ctx) {
-    if (!env.KV) {
-      console.log("[cron] skipped: KV binding missing");
-      return;
-    }
-    let workerHost = "";
-    try {
-      workerHost = new URL(event?.request?.url || "https://workers.dev/").hostname;
-    } catch {}
-    // 埋点写在任何可能失败的工作之前：有它 = 触发器在跑，没它 = 根本没触发。
-    try {
-      await env.KV.put("cron:lastFired", String(Math.floor(Date.now() / 1000)));
-    } catch {}
-    try {
-      const stats = await runCron(env, ctx, workerHost);
-      console.log(`[cron] ${JSON.stringify(stats)}`);
-    } catch (e) {
-      // Cron 失败不重试：下一轮自然会重来，保留上一轮 KV 结果。
-      console.error(`[cron] failed: ${e.message || e}`);
-    }
-  },
+  // 无 scheduled handler：Worker Cron 已移除（PRD 附录 A6），中继池刷新由
+  // GitHub Actions 的 refresh-relays.yml 定时写 KV。留一个空壳反而危险 ——
+  // DO 内 console 输出在 tail 上不可见（m0-findings.md E9），死代码坏了也看不见。
 };

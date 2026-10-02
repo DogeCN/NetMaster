@@ -367,9 +367,11 @@ func (p *Pool) Verify() (string, error) {
 	if len(p.nodes) == 0 {
 		return "", fmt.Errorf("selector: no nodes")
 	}
-	// 首流目标是 example.com:80：非 CF 托管（直连不会被平台 CF 段规则拒绝），
-	// 建流成功即同时验证了传输层（TLS+WS+认证）与出站路径。
-	_, err := p.dialNode(0, "example.com:80")
+	// 首流目标是 www.google.com:443：M0 实测（m0-findings.md E6/E7）平台禁拨 80
+	// 端口、example.com 已迁 CF 网段，两者任占一条这个验证都会被出口层拒绝。
+	// 443 + 非 CF 目标是直连路径上唯一稳定的组合；建流成功即同时验证了
+	// 传输层（TLS+WS+认证）与出站路径。
+	_, err := p.dialNode(0, "www.google.com:443")
 	if err != nil {
 		return "", err
 	}

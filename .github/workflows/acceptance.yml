@@ -10,7 +10,7 @@ on:
   # push 触发器只为让 GitHub 注册这个工作流（默认分支之外的 workflow_dispatch-only
   # 文件不会被注册，gh workflow run 会 404），顺带让协议/出口改动自动跑一遍验收。
   push:
-    branches: [v2]
+    branches: [main, v2]
     paths:
       - ".github/workflows/acceptance.yml"
       - "server/src/**"
@@ -43,10 +43,18 @@ jobs:
       - name: Protocol-level checks
         working-directory: server
         run: |
+          set -o pipefail   # node 的报错走 stderr，tail 会吞掉退出码，不加这步恒绿
           npm ci
-          for t in crypto protocol integration proxyip race router cron; do
+          # 与 scripts/test-all.sh 同一份清单：crypto/protocol 是纯逻辑；
+          # 其余套件经 socket.js 摸平台模块，必须挂 Node shim，否则
+          # ERR_UNSUPPORTED_ESM_URL_SCHEME。
+          for t in crypto protocol; do
             printf '%-12s ' "$t"
             node "test/$t.mjs" | tail -1
+          done
+          for t in integration proxyip race router refresh-relays; do
+            printf '%-12s ' "$t"
+            NODE_OPTIONS="--import ./test/shims/register.mjs" node "test/$t.mjs" | tail -1
           done
 
       # 直连出口 + 多路复用：一次跑完，输出即验收依据。
@@ -57,7 +65,7 @@ jobs:
           NETMASTER_E2E_PASSWORD: ${{ secrets.PASSWORD }}
         run: go test ./internal/outbound/ -run TestLive -v -count=1 -timeout 300s
 
-      # CF 托管目标的成功率（M3 的 ≥99% 项）：走 ProxyIP 竞速。
+      # CF 托管目标的成功率（M3 出口质量项，阈值口径见 PRD 附录 A7）：走 ProxyIP 竞速。
       - name: CF-hosted target success rate
         working-directory: client
         env:
@@ -66,13 +74,13 @@ jobs:
           NETMASTER_E2E_ROUNDS: ${{ inputs.rounds }}
         run: go test ./internal/outbound/ -run TestLiveCFHosted -v -count=1 -timeout 600s
 
-      # Cron 是否已把健康排名写进 KV。
+      # 中继健康排名是否还在（由 refresh-relays 每小时写入；Cron 移除后 KV 只有这一个键）。
       - name: KV health snapshot
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          for key in proxyip:top cron:lastRun; do
+          for key in proxyip:top; do
             printf '%-14s ' "$key"
             curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
               "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/2ff6b8ebe80c4715b643ed46b45d8d09/values/$key" \

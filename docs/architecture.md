@@ -10,8 +10,7 @@
 | Worker 入口 | `server/src/index.js` | 路径校验（固定 `/`）+ WebSocket 升级，转交 Session DO；非 WS 请求一律 404 空 body |
 | Session DO | `server/src/session.js` | 每连接一个实例：首帧认证、流表管理、帧分发、出口选路、背压 |
 | Router DO | `server/src/router.js` | 全局单实例（分片接口已预留）：目标 → 出口路径映射，SQLite + 异步批量 flush |
-| KV | `wrangler.toml` 绑定 `KV` | Cron 每小时写的中继健康排名（`proxyip:top`）+ 分批游标（`cron:cursor` / `cron:pending` / `cron:lastRun`），last-good-wins |
-| Cron | `index.js` 的 `scheduled` → `cron.js` 的 `runCron` | 每小时探测候选中继，EWMA 排序，取前 4 写 KV |
+| KV | `wrangler.toml` 绑定 `KV` | 中继健康排名（`proxyip:top`，由 GitHub Actions 的 refresh-relays 每小时写入），last-good-wins |
 | 客户端 | `client/` | SOCKS5/HTTP 入站、分流、入口优选、ECH 出站、mux |
 
 ### Session DO 的分配
@@ -69,7 +68,7 @@ Workers `connect()` 对 IPv6 字面量与 NAT64 合成地址一律立即失败�
   （`session.js` 里 `if (!this.env.ROUTER && !this.env.KV) return { error: direct.error }`）。
 - **首字节宽限 3 秒**（`FIRST_BYTE_GRACE_MS`）：中继回了 200 只代表它愿意转发，不代表
   目标可达。学到映射后 3 秒内没有首字节，就承认学错了——删会话缓存 + `forget`。
-- **Router DO 条目 TTL 1 小时**，与 Cron 周期对齐；过期即视为未命中。
+- **Router DO 条目 TTL 1 小时**，与 refresh-relays 的刷新周期对齐；过期即视为未命中。
 - **会话缓存上限 512 条**（`EGRESS_CACHE_MAX`），只为本连接内省一次查询，不是状态。
 
 ## 4. 协议 v2 帧格式
@@ -161,15 +160,17 @@ mux   单 WS 多流，按 STREAM_ID 分发            internal/outbound/mux.go
   避免一批拨号同时踩坑。ECH 模式下直连优选 IP 而非域名——域名直连会让系统 DNS 解析出多个
   IP，其中不少并不承载目标域名，SYN 超时重传把握手拖到秒级。
 - **首次连通验证**：serve 启动后在后台做一次真实的 TLS+WS+首帧认证建流（目标
-  `example.com:80`），结果补一行 `tunnel established via node <addr>`。
+  `www.google.com:443`——平台禁拨 80、example.com 已迁 CF，见 m0-findings.md E6/E7），
+  结果补一行 `tunnel established via node <addr>`。
 
 ## 6. 可观测性
 
 **没有任何 HTTP 诊断端点**——没有 `/health`、没有 `/stats`、没有 `/sub`。非 WS 请求
 一律 404 空 body 且无额外头（避免指纹）。部署是否健康，由"客户端能不能连上"直接回答。
 
-- 服务端：设 Worker 变量 `DEBUG=1`，`[session]` / `[router]` 前缀的日志会打开（`[cron]`
-  的统计行每轮都打，不受它控制），用 `npx wrangler tail` 实时查看。
+- 服务端：设 Worker 变量 `DEBUG=1`，`[session]` / `[router]` 前缀的日志会打开，用
+  `npx wrangler tail` 实时查看。注意 M0 E9：**DO 内的 console 输出在 tail 上不可见**，
+  这些日志只有 worker 入口层的粗筛价值；"某件事到底有没有发生"要查 KV（`debug:lastExit`）。
 - 客户端：标准输出带时间戳的日志（`log.Ltime`），关键事件包括
   `entries: N (community: net|cache|none)`、`[probe] N entries -> M nodes in …`、
   `rules: N entries (fetched|cache|builtin, skipped K lines)`、
@@ -177,28 +178,31 @@ mux   单 WS 多流，按 STREAM_ID 分发            internal/outbound/mux.go
   `tunnel established via node …`、
   `[route] <host> direct unusable (…) — switched to proxy and replayed`。
 
-## 7. Cron 健康检查
+## 7. 中继健康检查（仓库侧）
 
-每小时一次（`wrangler.toml` 的 `crons = ["0 * * * *"]`），主体在 `cron.js` 的 `runCron`：
+Worker Cron 已移除（原因与替代方案见 PRD 附录 A6）。候选探测、排序与写入 `proxyip:top`
+由 `.github/workflows/refresh-relays.yml` 在 GitHub Actions 上每小时跑一次（可手动
+dispatch），主体在 `server/tools/refresh-relays.mjs`：
 
-1. **候选**：拉内置源（`RELAY_SOURCES`，纯文本 `host:port`），失败用 `BUILTIN_RELAYS`
-   （6 条 CMLiussss）；`filterLoopback` 剔除回指本 Worker 的条目——回连自身会被平台拒绝
-   （TCP Loop），留着只是白白消耗槽位。
-2. **分批探测**：免费版 Cron 触发每次运行最多 50 次外部子请求，预算取 48（留 2 个给 KV
-   读写）。用 `cron:cursor` 游标把候选切成每轮 ≤48 条，多轮跑完再排序。
-   `probeRelay` 完成 CONNECT 握手后确认隧道真的能载数据——单纯的 `connect()` 成功不代表
-   中继可用（很多中继 accept 后立刻 RST）。
-3. **排序**：EWMA（α=0.3，延迟:成功率 = 7:3），取前 4（`RACE_KV_TOP`）写进 `proxyip:top`，
-   last-good-wins——本轮全败就保留上一轮。
-4. Cron 失败不重试：下一轮自然会重来。
+1. **候选**：拉 IPDB bestproxy 等外部源 + 内置兜底（CMLiussss 后备列表）；`filterSelf`
+   剔除回指本 Worker 的条目。
+2. **并发探测**：TLS 握手探测（`tls.connect`，`servername=www.cloudflare.com`）区分
+   真正的 SNI 路由中继与盲转发器/失效节点——M0 之后 ProxyIP 只用 SNI 型中继。
+3. **排序**：成功率 desc → 平均延迟 asc（runner 每轮全新观测，没有可平滑的历史，
+   不做 EWMA），取前 4 写进 `proxyip:top`。
+4. **last-good-wins**：本轮全败不写、保留上一轮数据、退出码 0。
 
-`KV` 绑定缺席时 Cron 直接跳过（打印 `[cron] skipped: KV binding missing`）。
+排障现场是 Actions 的 run 页面，不是 `wrangler tail`；`cron:lastRun` / `cron:cursor` /
+`cron:pending` 三个 KV 键已不存在。
 
 ## 8. 已移除的东西
 
 写下来是为了别再找它们：
 
 - **NAT64 出口**：平台不支持 IPv6 出站（M0 E3）。
+- **Worker Cron 健康检查**：免费版触发不可靠且 50 子请求/轮逼出分批续跑；搬去
+  GitHub Actions（见上节与 PRD 附录 A6）。`cron.js`、`scheduled` handler、
+  `[triggers]` 已删。
 - **服务端关系型数据库**：已删除。中继亲和映射改用 Router DO 的 SQLite，部署不再需要建库
   与建表步骤。
 - **`schema.sql`**：随上面那条一起消失。

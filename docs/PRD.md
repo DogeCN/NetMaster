@@ -359,6 +359,10 @@ ProxyIP.US.CMLiussss.net:443
 
 ## 9. 健康检查（Cron）
 
+> **已由附录 A1 / A6 修订**：NAT64 出口移除；Worker Cron 整体移除，本节所述流程由
+> GitHub Actions 的 refresh-relays.yml 承担（成功率 desc → 延迟 asc，非 EWMA；
+> KV 只剩 proxyip:top 一个键）。以下为冻结基线原文。
+
 每小时一次：
 
 ## 1. 从内置源拉取最新 NAT64 前缀与 ProxyIP 池。
@@ -379,25 +383,26 @@ ProxyIP.US.CMLiussss.net:443
 
 ## 10. 限制与应对
 
-M0 平台核验已完成（2026-10-02，结论详见仓库 docs/m0-findings.md）：两项假设被推翻，
-按 §14 风险门暂停实施，待修订架构定稿。下表为回写后的状态：
+M0 平台核验已完成（2026-10-02，E1-E5；同日第二轮补 E6-E9，结论详见仓库
+docs/m0-findings.md）。所有实测结论已回写本表；架构按附录修订定稿并实施完毕（v0.2.0）。
 
 限制 现状 应对
-并发出站连接 【M0 实测】DO 内 12 条并发 connect() 全部成功，"每请求 6 条"限制不适用于 DO 内 TCP socket 6 槽位竞速保留为预算控制而非性能上限
-connect() 禁连 CF IP 段、localhost、私网、端口 25；无 UDP 出站；禁回连自身（TCP Loop）；【M0 实测】IPv6 出站不支持（IPv6 字面量与 NAT64 合成地址一律立即失败）→ NAT64 出口无法实现，需从架构中移除 ProxyIP 兜底成为 CF 承载目标的唯一出口；客户端私网强制 Direct；Cron 剔除回指 ProxyIP
-免费版每日 100k 请求 【M0 实测】WS 消息按 ≈1:1 计入请求，未观察到 20:1 折算（出站帧可能同样计费）mux 只省建连不省消息量；协议层吝啬帧数：数据帧尽量满 64KB、心跳只走 WS 协议层 Ping（不产生 DO 消息）
-脚本体积 1 MB（压缩） 当前产物 ~35 KB，余量充足
+并发出站连接 【M0 实测 E2】DO 内 12 条并发 connect() 全部成功，"每请求 6 条"限制不适用于 DO 内 TCP socket 6 槽位竞速保留为预算控制而非性能上限
+connect() 禁连 CF IP 段、localhost、私网、端口 25；无 UDP 出站；禁回连自身（TCP Loop）；【M0 实测 E3】IPv6 出站不支持（IPv6 字面量与 NAT64 合成地址一律立即失败）→ NAT64 出口无法实现，需从架构中移除；【M0 实测 E6】80 端口一律禁拨（与目标是否域名、是否 CF 网段无关）；【M0 实测 E7】E6/E7 拒绝的错误文案相同，区分只能靠自行解析比对网段 ProxyIP 兜底成为 CF 承载目标的唯一出口；客户端私网强制 Direct；refresh-relays 剔除回指条目；直连路径先 DoH 解析再逐 IP 拨号（判定点在 IP 层）；验收目标一律 443 + 非 CF 托管
+免费版每日 100k 请求 【M0 实测 E1】WS 消息按 ≈1:1 计入请求，未观察到 20:1 折算（出站帧可能同样计费）mux 只省建连不省消息量；协议层吝啬帧数：数据帧尽量满 64KB、心跳只走 WS 协议层 Ping（不产生 DO 消息）
+脚本体积 1 MB（压缩） v0.2.0 产物 _worker.js ≈ 59 KB，余量充足
 DO WS 接收消息 32 MiB 单帧 ≤ 64 KB（主动设计约束）
 SQLite 行写 免费版 100k 行/日；主要来源：Router DO flush 个人规模无压力
 SQLite 行读 免费版 5M 行/日；每未命中流 1 读（会话级缓存摊薄） 余量充足
 SQLite 存储 单 DO 10 GB；账户总存储免费版 5 GB NetMaster 用量（< 1 MB）远低于限档
-子请求 Cron 触发每次运行最多 50 次外部子请求（免费版） 超预算分多次执行
+子请求 【M0 实测 E8】每 invocation 50 个（免费版），一条活跃 WS 会话是一次长驻 invocation —— 实际是"每条连接一生"的总额度（实测第 26 对 fetch+connect 耗尽）DNS 进程内缓存（TTL 5min）；直连失败记忆（本连接内）；成功建连 30 次后 close(1000,"budget") 优雅断开，客户端重连换新预算（客户端重连退避 + 等待队列是该机制成立的前提）
 CPU Worker 10ms/请求；DO 30s/消息（未单独复核） 隧道逻辑落在 DO 内，I/O 密集
-DO 休眠与出站 socket 【M0 实测】有出站 socket 的 DO 不休眠（挂起 I/O 阻止休眠），socket 关闭后才可休眠；空闲 socket 由对端在数十秒内关闭 "休眠期间流保活"不成立也无需成立：零流空闲 WS 走 Hibernation 不驻留内存；每流死亡走 CLOSE 正常处理
-KV 读 ~10ms、最终一致 仅 Cron 使用，不在热路径
+DO 休眠与出站 socket 【M0 实测 E4】有出站 socket 的 DO 不休眠（挂起 I/O 阻止休眠），socket 关闭后才可休眠；空闲 socket 由对端在数十秒内关闭 "休眠期间流保活"不成立也无需成立：零流空闲 WS 走 Hibernation 不驻留内存；每流死亡走 CLOSE 正常处理
+可观测性 【M0 实测 E9】DO 内的 console 输出在 wrangler tail 上完全不可见（worker 入口可见；DO 间 fetch 可见）诊断走 KV 通道（debug:lastExit）；"是否发生"查 KV 时间戳不查 tail；新增诊断默认写 KV 不写 console
+KV 读 ~10ms、最终一致 竞速候选（proxyip:top）与调试通道使用，不在每帧热路径
 系统代理不转发 UDP 平台限制 客户端文档提示禁用 QUIC
 
-来源注释：Durable Objects（SQLite 后端，单 DO 10 GB）已在 Workers 免费计划可用且免费计划存储不收费，依据 Cloudflare Changelog 2025-04-07 与 2025-12-12。平台限额可能调整，部署前以 developers.cloudflare.com 当前页面为准；标注"M0 实测确认"的条目在 M0 完成前视为未验证假设。
+来源注释：Durable Objects（SQLite 后端，单 DO 10 GB）已在 Workers 免费计划可用且免费计划存储不收费，依据 Cloudflare Changelog 2025-04-07 与 2025-12-12。平台限额可能调整，部署前以 developers.cloudflare.com 当前页面为准。
 
 ---
 
@@ -515,7 +520,8 @@ M6 文档与部署脚本 一键部署脚本在全新账号跑通；README 快速
   `Upgrade: websocket`，其余一律 404 空 body、无额外头（避免指纹）。
 - 调试路径：Worker 变量 `DEBUG=1` + `npx wrangler tail`，日志前缀 `[session]` /
   `[router]` / `[cron]`。部署是否健康由"客户端能不能连上"直接回答；客户端 serve 启动后在
-  后台做一次真实建流（目标 `example.com:80`），结果补一行
+  后台做一次真实建流（目标 `www.google.com:443`，A7 按 E6/E7 从 `example.com:80`
+  改来），结果补一行
   `tunnel established via node <addr>`。
 - CI 无部署后验证：runner 在美国、用户在大陆，runner 能通不代表用户能通。
 
@@ -555,3 +561,27 @@ M6 文档与部署脚本 一键部署脚本在全新账号跑通；README 快速
 - 连带订正：A4 里"日志前缀 `[session]` / `[router]` / `[cron]`"一句中的 `[cron]`
   已失效——Cron 移除后服务端只剩前两个前缀。A4 其余内容（无 HTTP 诊断端点、
   `DEBUG=1` + `wrangler tail`、部署健康由客户端建流回答）不受影响。
+
+## A7. 修订 M3 出口质量判据与 M2 并发口径（覆盖 §14-M2、§14-M3）
+
+- 日期：2026-10-03。
+- 依据：正文 §14-M3 的"CF 托管目标成功率 ≥ 99%"写于 NAT64 可用之时。A1 移除 NAT64 后，
+  CF 承载目标只剩公共 SNI 中继一类的出口，实测（acceptance run 37063143931 / 37063498440，
+  间隔 8 分钟）同一部署 20 轮窗口分别测得 **45% 与 65%**，波动来源是公共中继池本身的
+  不稳定：`tls: EOF`（中继 accept 后即断）、**过期证书**（盲转发器拿无域名后备证书应答）、
+  403（SNI 路由拒绝）。这不是实现缺陷——竞速、健康排序、KV last-good-wins 均按 §8.2
+  实现并有单测——而是免费方案下出口池的质量天花板。
+- 修订（§14-M3 验收口径）：
+  - **≥99% 降级为"自建中继后的目标"**，不再是公共中继部署的验收线。自建 `http-connect`
+    类型中继的路径见 docs/relay.md；自建池稳定的部署可以把验收线调回 99%。
+  - 公共中继部署的 CI 验收线改为分级：**< 50% 硬失败**（出口层故障，如 DoH/竞速坏了），
+    **50–99% 记 WARNING**（已知池波动），由 `TestLiveCFHostedSuccessRate` 执行。
+  - §14-M3 的其余判据不受影响；其中"映射命中后建流 P50 ≤ 直连+30ms"一项的测量手段
+    （e2e 第 6 项）随 e2e workflow 修复后获得 CI 覆盖。
+- 连带订正（§14-M2 口径）："单 WS 并发 ≥100 条流"在 devserver 对等体上验证（100/100）；
+  真实部署上受 E8 预算约束（每条连接约 30 次成功建连即优雅断开重连），CI 对真实 Worker
+  验证 20 条流单 WS + 20 条流分摊 4 WS 两种形态。"空闲 5 分钟存活且 DO 无唤醒"由
+  e2e 第 8 项（live 模式 300s + 协议层 Ping）承担。
+- 随本修订一并订正的事实：客户端首连通验证 `Verify()` 的目标原为 `example.com:80`，
+  按 E6/E7 在真实部署上必失败（80 禁拨 + example.com 已迁 CF），已改为
+  `www.google.com:443`。

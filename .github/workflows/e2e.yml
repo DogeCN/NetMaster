@@ -51,15 +51,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # 环境变量名以脚本为准（server/test/e2e.mjs 顶部）：NETMASTER_WORKER 是裸
-      # 主机名或完整 URL 都认，NETMASTER_PASSWORD 只从环境读（脚本不接受口令
-      # 走命令行，免得进 shell 历史）。local 模式不需要任何 Secret —— 它拉起
-      # 进程内 devserver 自检脚本逻辑本身，第 5-8 项会如实 SKIP。
+      # 变量名与 acceptance.yml 及脚本首选的 NETMASTER_E2E_* 组对齐（脚本兼容
+      # 旧的 NETMASTER_WORKER / NETMASTER_ENDPOINT）。口令只从环境读。
+      # local 模式不需要任何 Secret —— 它拉起进程内 devserver 自检脚本逻辑本身，
+      # 第 5-8 项会如实 SKIP。
       - name: Run e2e
         id: e2e
         env:
-          NETMASTER_WORKER: ${{ inputs.worker || secrets.NETMASTER_WORKER }}
-          NETMASTER_PASSWORD: ${{ secrets.PASSWORD }}
+          NETMASTER_E2E_WORKER: ${{ inputs.worker || secrets.NETMASTER_WORKER }}
+          NETMASTER_E2E_PASSWORD: ${{ secrets.PASSWORD }}
           E2E_CF_ROUNDS: ${{ inputs.rounds }}
           E2E_MODE: ${{ inputs.mode }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -67,7 +67,9 @@ jobs:
           NETMASTER_KV_ID: ${{ secrets.NETMASTER_KV_ID }}
         run: |
           set -o pipefail   # 脚本的报错走 stderr，tee 会吞掉退出码
-          node test/e2e.mjs 2>&1 | tee e2e-output.txt
+          # e2e.mjs 经 src/race.js → proxyip.js → socket.js 摸 cloudflare:sockets，
+          # 必须挂 shim（与 scripts/test-all.sh 同因；B5 报告写明的前置条件）。
+          node --import ./test/shims/register.mjs test/e2e.mjs 2>&1 | tee e2e-output.txt
           echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
       # 输出即验收依据：无论成败都留档，失败时不用重跑就能看是哪一项挂了。

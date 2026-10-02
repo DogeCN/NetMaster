@@ -137,22 +137,18 @@ integration/proxyip/race/router，带 `cloudflare:*` shim）→ 五平台 `go ve
 - **中继池空/全败**：`refresh-relays.yml` 的日志是验收依据（无论成败都留 artifact）；
   池子空时竞速退化为内置兜底列表，功能不残但 CF 托管目标会明显变差。
 
-## 7. 合并后清理（一次性，单独提交，别混进 merge）
+## 7. 合并后清理（一次性，2026-10-03 已完成，留档备查）
 
-- [ ] 删 `m0/` 与 `.github/workflows/m0-probe.yml`（M0 结论已固化在 `docs/m0-findings.md`），
-      并同步修该文里"复核方式：重跑 workflow_dispatch"那句；
-- [ ] 删 `live-debug.yml`、`cron-debug.yml`（头部都写明"一次性诊断…结论落档后删除"）；
-- [ ] 删探针 worker `netmaster-m0`：
-      `gh workflow run m0-probe.yml --ref v2 -f teardown=true`，或
-      `cd m0 && npx wrangler delete --name netmaster-m0 --force`（**先删 worker，再删
-      `m0/` 与 workflow**，否则 teardown 入口先没了）；
-- [ ] 撤销临时 SSH key `165164569`（title: `netmaster-dev-temp (auto, remove after use)`）：
-      `gh api -X DELETE user/keys/165164569`；
-- [ ] 修 `acceptance.yml` 的 `Protocol-level checks`：去掉已删除的 `cron`、给需要平台 shim 的
+- [x] 删 `m0/` 与 `.github/workflows/m0-probe.yml`（M0 结论已固化在 `docs/m0-findings.md`），
+      该文里的复核指引已同步改为"按实验描述重建探针"；
+- [x] 删 `live-debug.yml`、`cron-debug.yml`（头部都写明"一次性诊断…结论落档后删除"）；
+- [x] 删探针 worker `netmaster-m0`（`wrangler delete --name netmaster-m0 --force`）；
+- [x] 撤销临时 SSH key（`gh api -X DELETE user/keys/<id>`）；
+- [x] 修 `acceptance.yml` 的 `Protocol-level checks`：去掉已删除的 `cron`、给需要平台 shim 的
       套件加 `NODE_OPTIONS="--import ./test/shims/register.mjs"`、整步加 `set -o pipefail`；
-- [ ] 修 `docs/architecture.md` 的 Cron 章节（第 13/14 行的 KV/Cron 表行、§7 整节）——
-      Worker Cron 已删除，中继池刷新搬到 `refresh-relays.yml`；
-- [ ] 把 `refresh-relays.log` 这类本地产物加进 `.gitignore`（或确保只在 `server/` 下生成）。
+- [x] 修 `docs/architecture.md` 的 Cron 章节（组件表、§7 整节）——Worker Cron 已删除，
+      中继池刷新搬到 `refresh-relays.yml`；
+- [x] 把 `refresh-relays.log` 这类本地产物加进 `.gitignore`。
 
 ## 附：两个版本号容易混
 

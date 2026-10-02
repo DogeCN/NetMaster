@@ -9,8 +9,9 @@
 tunnel established via node 104.16.x.x
 ```
 
-它是一次真实的 TLS + WebSocket + 首帧认证建流（目标 `example.com:80`）。失败了会打
-`tunnel failed: <原因>`。
+它是一次真实的 TLS + WebSocket + 首帧认证建流（目标 `www.google.com:443`，M0 实测后
+从 `example.com:80` 改来——平台禁拨 80 端口、example.com 已迁 CF 网段，见
+[m0-findings.md](m0-findings.md) E6/E7）。失败了会打 `tunnel failed: <原因>`。
 
 ## 连不上：先看这三件事
 
@@ -48,7 +49,7 @@ npx wrangler tail --format json    # JSON 格式
 `wrangler.toml` 的 `[vars]` 里写 `DEBUG = "1"`），再 `wrangler deploy`。日志前缀：
 
 ```
-[session] authenticated; stream 1 -> example.com:80
+[session] authenticated; stream 1 -> www.google.com:443
 [session] direct exit failed (…); trying proxyip
 [session] race slot 0 ProxyIP.HK.CMLiussss.net:443 failed: relay connect timeout (1502ms)
 [session] stream 7 no first byte in 3000ms, forgetting route
