@@ -34,6 +34,10 @@ export default {
     try {
       workerHost = new URL(event?.request?.url || "https://workers.dev/").hostname;
     } catch {}
+    // 埋点写在任何可能失败的工作之前：有它 = 触发器在跑，没它 = 根本没触发。
+    try {
+      await env.KV.put("cron:lastFired", String(Math.floor(Date.now() / 1000)));
+    } catch {}
     try {
       const stats = await runCron(env, ctx, workerHost);
       console.log(`[cron] ${JSON.stringify(stats)}`);
