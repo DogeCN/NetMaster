@@ -42,7 +42,7 @@ jobs:
       - name: Unit tests
         run: |
           set -o pipefail   # node 的报错走 stderr，tail 会吞退出码 —— 不加这个测试挂了 CI 也是绿的
-          for t in crypto protocol integration control relay; do
+          for t in crypto protocol integration proxyip race router cron; do
             printf '%-12s ' "$t"
             node "test/$t.mjs" | tail -1
           done
