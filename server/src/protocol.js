@@ -1,154 +1,251 @@
-/**
- * protocol.js — NetMaster 内部协议（两端都是我们的，不存在兼容负担）。
- *
- * 传输：一条 WebSocket（路径 /），全部为二进制消息。
- *
- *   消息 1（握手）  16 字节 auth = md5(utf8(PASSWORD))。
- *                   不匹配 → close(1008)。之后不再有鉴权开销。
- *   会话开帧        mux 帧，payload = [port u16 BE][addrType][addr][初始数据]
- *   数据帧          mux 帧，payload = 原始字节
- *   控制帧          [0x00][idLen][sessionId][utf-8 文本]，空文本 = 会话就绪
- *
- * mux 帧是唯一的复用机制：[idLen][sessionId][payload]，一条 WS 上并发跑多个
- * 会话。控制帧借用了 idLen=0 这个会话帧不可能出现的形态（会话 id 恒 ≥1 字节
- * 且首字节非 0）。
- */
+// 协议 v2 帧编解码（PRD §4）。全部多字节字段大端。
+//
+//   首帧   AUTH(16) | TS(8) | STREAM_ID(4) | ATYP(1) | ADDR | PORT(2)
+//   开帧   STREAM_ID(4) | ATYP(1) | ADDR | PORT(2)
+//   数据帧 STREAM_ID(4) | PAYLOAD            PAYLOAD ≤ 64 KB
+//   控制帧 0x00000000 | CTRL_TYPE(1) | ...    总长 ≤ 9 字节
+//   响应帧 STREAM_ID(4) | STATUS(1)
+//
+// 流 ID ∈ [1, 0xFFFFFFFE]；0 是控制帧专用前缀，0xFFFFFFFF 永久保留。
+// 递增到 0xFFFFFFFE 后回绕到 1。
+//
+// 开帧与数据帧在裸字节上同形（ID 开头），区分靠流状态机：客户端在收到该流的
+// STATUS 0x00 之前不发任何数据帧（PRD §4.4），因此服务端只对“流表里不存在的
+// ID”按开帧解析。
 
-export const ADDR_IPV4 = 1;
-export const ADDR_DOMAIN = 2;
-export const ADDR_IPV6 = 3;
+import { utf8, tsFromBytes } from './crypto.js';
 
-/**
- * Parse a session-open payload.
- * @param {Uint8Array} data
- * @returns {{status:'ok'|'need_more'|'invalid', reason?:string, result?:object}}
- */
-export function parseSessionOpen(data) {
-	const len = data.byteLength;
-	if (len < 3) return { status: 'need_more' };
+export const ATYP_IPV4 = 1;
+export const ATYP_DOMAIN = 2;
+export const ATYP_IPV6 = 3;
 
-	const port = (data[0] << 8) | data[1];
-	const addrType = data[2];
-	const addrIndex = 3;
+export const STATUS_OK = 0;
+export const STATUS_BAD = 1; // 格式或认证错误
+export const STATUS_FORBIDDEN = 2; // 目标禁连
+export const STATUS_NOEXIT = 3; // 出口全部失败
 
-	let headerLen = -1;
-	let host = '';
+export const CTRL_CLOSE = 1;
 
-	if (addrType === ADDR_IPV4) {
-		if (len < addrIndex + 4) return { status: 'need_more' };
-		host = `${data[addrIndex]}.${data[addrIndex + 1]}.${data[addrIndex + 2]}.${data[addrIndex + 3]}`;
-		headerLen = addrIndex + 4;
-	} else if (addrType === ADDR_DOMAIN) {
-		if (len < addrIndex + 1) return { status: 'need_more' };
-		const dLen = data[addrIndex];
-		if (len < addrIndex + 1 + dLen) return { status: 'need_more' };
-		host = new TextDecoder().decode(data.subarray(addrIndex + 1, addrIndex + 1 + dLen));
-		headerLen = addrIndex + 1 + dLen;
-	} else if (addrType === ADDR_IPV6) {
-		// Go 的 net.SplitHostPort 会剥掉 IPv6 字面量的方括号，所以客户端对
-		// [2606:4700::1111]:443 这类目标发的是 atyp 3。
-		if (len < addrIndex + 16) return { status: 'need_more' };
-		const parts = [];
-		for (let i = 0; i < 8; i++) {
-			const base = addrIndex + i * 2;
-			parts.push(((data[base] << 8) | data[base + 1]).toString(16));
-		}
-		host = parts.join(':');
-		headerLen = addrIndex + 16;
-	} else {
-		return { status: 'invalid', reason: 'bad address type' };
-	}
+export const MAX_PAYLOAD = 64 * 1024;
+export const STREAM_ID_MAX = 0xfffffffe;
 
-	if (!host) return { status: 'invalid', reason: 'empty host' };
-	if (!port) return { status: 'invalid', reason: 'empty port' };
-
-	return {
-		status: 'ok',
-		result: {
-			host,
-			port,
-			payload: data.subarray(headerLen),
-		},
-	};
+export function validStreamId(id) {
+  return id >= 1 && id <= STREAM_ID_MAX;
 }
 
-/**
- * Serialize a session-open payload (client side and tests).
- * @param {{host:string, port:number, payload?:Uint8Array}} o
- * @returns {Uint8Array}
- */
-export function buildSessionOpen(o) {
-	const { host, port, payload = new Uint8Array(0) } = o;
-	const nameBytes = new TextEncoder().encode(host);
-	let addr;
-	const isV4 = /^(\d{1,3}\.){3}\d{1,3}$/.test(host);
-	if (isV4) {
-		addr = Uint8Array.from(host.split('.').map(Number));
-	} else if (host.includes(':')) {
-		// IPv6 字面量：与 Go 客户端一致，按 16 字节二进制编码。
-		addr = Uint8Array.from(ip6Bytes(host));
-	} else {
-		addr = new Uint8Array(1 + nameBytes.length);
-		addr[0] = nameBytes.length;
-		addr.set(nameBytes, 1);
-	}
-	const addrType = isV4 ? ADDR_IPV4 : host.includes(':') ? ADDR_IPV6 : ADDR_DOMAIN;
-	const out = new Uint8Array(3 + addr.length + payload.length);
-	let i = 0;
-	out[i++] = (port >> 8) & 0xff;
-	out[i++] = port & 0xff;
-	out[i++] = addrType;
-	out.set(addr, i); i += addr.length;
-	out.set(payload, i);
-	return out;
+// ---- 地址编解码 ----
+
+// encodeAddr 把 host/port 编成 ATYP | ADDR | PORT。host 是 IPv4 字面量、
+// IPv6 字面量或域名；解析失败返回 null。
+export function encodeAddr(host, port) {
+  let atyp;
+  let addr;
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(host)) {
+    const parts = host.split(".").map(Number);
+    if (parts.some((n) => n > 255)) return null;
+    atyp = ATYP_IPV4;
+    addr = Uint8Array.from(parts);
+  } else if (host.includes(":")) {
+    const bin = parseIPv6(host);
+    if (!bin) return null;
+    atyp = ATYP_IPV6;
+    addr = bin;
+  } else {
+    const raw = utf8(host.toLowerCase());
+    if (raw.length < 1 || raw.length > 255) return null;
+    atyp = ATYP_DOMAIN;
+    addr = Uint8Array.of(raw.length, ...raw);
+  }
+  const out = new Uint8Array(1 + addr.length + 2);
+  out[0] = atyp;
+  out.set(addr, 1);
+  out[out.length - 2] = (port >> 8) & 0xff;
+  out[out.length - 1] = port & 0xff;
+  return out;
 }
 
-function ip6Bytes(host) {
-	// 展开 ::（RFC 4291）：左侧组从头填，右侧组从尾填，中间补零。
-	let left = host, right = '';
-	if (host.includes('::')) [left, right] = host.split('::');
-	const l = left ? left.split(':') : [];
-	const r = right ? right.split(':') : [];
-	if (l.length + r.length > 8) throw new Error(`bad ipv6 literal: ${host}`);
-	const groups = new Array(8).fill(0);
-	for (let i = 0; i < l.length; i++) groups[i] = parseInt(l[i], 16) || 0;
-	for (let i = 0; i < r.length; i++) groups[8 - r.length + i] = parseInt(r[i], 16) || 0;
-	const out = new Uint8Array(16);
-	for (let i = 0; i < 8; i++) {
-		out[i * 2] = groups[i] >> 8;
-		out[i * 2 + 1] = groups[i] & 0xff;
-	}
-	return out;
+// parseAddr 解析 ATYP | ADDR | PORT，返回 { atyp, addr, port, len }。
+// addr 归一为字符串（域名小写）；失败返回 null。len 是消耗的字节数。
+export function parseAddr(b, off) {
+  if (off >= b.length) return null;
+  const atyp = b[off];
+  let addr;
+  let len;
+  switch (atyp) {
+    case ATYP_IPV4:
+      if (off + 1 + 4 + 2 > b.length) return null;
+      addr = `${b[off + 1]}.${b[off + 2]}.${b[off + 3]}.${b[off + 4]}`;
+      len = 7;
+      break;
+    case ATYP_DOMAIN: {
+      if (off + 2 > b.length) return null;
+      const n = b[off + 1];
+      if (n < 1 || off + 2 + n + 2 > b.length) return null;
+      addr = new TextDecoder().decode(b.slice(off + 2, off + 2 + n)).toLowerCase();
+      len = 4 + n;
+      break;
+    }
+    case ATYP_IPV6:
+      if (off + 1 + 16 + 2 > b.length) return null;
+      addr = formatIPv6(b.slice(off + 1, off + 17));
+      len = 17;
+      break;
+    default:
+      return null;
+  }
+  const port = (b[off + len - 2] << 8) | b[off + len - 1];
+  return { atyp, addr, port, len };
 }
 
-/**
- * Frame a payload for an established session: [idLen][sessionId][payload].
- */
-export function buildMuxFrame(sessionId, payload) {
-	const out = new Uint8Array(1 + sessionId.length + payload.length);
-	out[0] = sessionId.length;
-	out.set(sessionId, 1);
-	out.set(payload, 1 + sessionId.length);
-	return out;
+// ---- 帧编解码 ----
+
+// encodeFirstFrame 构造首帧；auth 由调用方计算（签名区 = 除 AUTH 外的全部字节）。
+export function encodeFirstFrame(auth, tsSec, streamId, host, port) {
+  const addr = encodeAddr(host, port);
+  if (!addr) return null;
+  const out = new Uint8Array(16 + 8 + 4 + addr.length);
+  out.set(auth, 0);
+  const ts = BigInt(tsSec);
+  for (let i = 0; i < 8; i++) out[16 + i] = Number((ts >> BigInt(56 - 8 * i)) & 0xffn);
+  out[24] = (streamId >>> 24) & 0xff;
+  out[25] = (streamId >>> 16) & 0xff;
+  out[26] = (streamId >>> 8) & 0xff;
+  out[27] = streamId & 0xff;
+  out.set(addr, 28);
+  return out;
 }
 
-/**
- * Parse a mux frame header from the head of a buffer.
- * The frame is [idLen][sessionId][payload...]; payload runs to the end of the
- * buffer, so `consumed` is reported for callers that must handle trailing bytes
- * (multiple frames arriving coalesced in one WS message).
- * @param {Uint8Array} buf
- * @returns {{sessionId:Uint8Array, payload:Uint8Array, consumed:number}|null}
- */
-export function parseMuxFrame(buf) {
-	if (buf.byteLength < 2) return null;
-	const idLen = buf[0];
-	if (idLen < 1) return null;
-	const headerLen = 1 + idLen;
-	if (buf.byteLength < headerLen) return null;
-	return {
-		sessionId: buf.slice(1, headerLen),
-		payload: buf.subarray(headerLen),
-		consumed: buf.byteLength,
-	};
+// parseFirstFrame 校验首帧结构并返回 { ts, streamId, host, port, signed }。
+// signed 是 TS 起的全部字节（HMAC 的输入区）。结构性失败返回 null；
+// 认证校验在 session.js 里做（需要 password）。
+export function parseFirstFrame(b) {
+  if (b.length < 16 + 8 + 4 + 2) return null; // 不够到 PORT 就没有解析意义
+  const ts = tsFromBytes(b.slice(16, 24));
+  const streamId = (b[24] << 24) | (b[25] << 16) | (b[26] << 8) | b[27];
+  const a = parseAddr(b, 28);
+  if (!a) return null;
+  return { ts, streamId, host: a.addr, port: a.port, signed: b.slice(16) };
+}
+
+// encodeOpenFrame 构造开帧。
+export function encodeOpenFrame(streamId, host, port) {
+  const addr = encodeAddr(host, port);
+  if (!addr) return null;
+  const out = new Uint8Array(4 + addr.length);
+  out[0] = (streamId >>> 24) & 0xff;
+  out[1] = (streamId >>> 16) & 0xff;
+  out[2] = (streamId >>> 8) & 0xff;
+  out[3] = streamId & 0xff;
+  out.set(addr, 4);
+  return out;
+}
+
+// parseOpenFrame 解析开帧，返回 { streamId, host, port } 或 null。
+export function parseOpenFrame(b) {
+  if (b.length < 4) return null;
+  const streamId = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+  const a = parseAddr(b, 4);
+  if (!a) return null;
+  return { streamId, host: a.addr, port: a.port };
+}
+
+export function encodeDataFrame(streamId, payload) {
+  const out = new Uint8Array(4 + payload.length);
+  out[0] = (streamId >>> 24) & 0xff;
+  out[1] = (streamId >>> 16) & 0xff;
+  out[2] = (streamId >>> 8) & 0xff;
+  out[3] = streamId & 0xff;
+  out.set(payload, 4);
+  return out;
+}
+
+export function encodeResponse(streamId, status) {
+  return Uint8Array.of(
+    (streamId >>> 24) & 0xff,
+    (streamId >>> 16) & 0xff,
+    (streamId >>> 8) & 0xff,
+    streamId & 0xff,
+    status
+  );
+}
+
+export function encodeCloseControl(streamId) {
+  return Uint8Array.of(
+    0, 0, 0, 0, CTRL_CLOSE,
+    (streamId >>> 24) & 0xff,
+    (streamId >>> 16) & 0xff,
+    (streamId >>> 8) & 0xff,
+    streamId & 0xff
+  );
+}
+
+// isControl 前缀 0x00000000 判定；流 ID ≥ 1 的数据帧首字节不可能是 0。
+export function isControl(b) {
+  return b.length >= 4 && b[0] === 0 && b[1] === 0 && b[2] === 0 && b[3] === 0;
+}
+
+// parseCloseControl 解析 CLOSE 控制帧，返回 streamId 或 null。
+export function parseCloseControl(b) {
+  if (b.length < 9 || b[4] !== CTRL_CLOSE) return null;
+  return (b[5] << 24) | (b[6] << 16) | (b[7] << 8) | b[8];
+}
+
+export function streamIdFromBytes(b) {
+  return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+}
+
+// ---- IPv6 字面量辅助 ----
+
+// parseIPv6 解析 IPv6 字面量为 16 字节；支持 :: 缩写与内嵌 IPv4。失败返回 null。
+export function parseIPv6(s) {
+  s = s.replace(/^\[|\]$/g, "");
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const parseGroups = (part) => {
+    if (part === "") return [];
+    const groups = [];
+    const items = part.split(":");
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      if (it.includes(".")) {
+        if (i !== items.length - 1) return null;
+        const m = it.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+        if (!m) return null;
+        const octs = m.slice(1).map(Number);
+        if (octs.some((n) => n > 255)) return null;
+        groups.push((octs[0] << 8) | octs[1], (octs[2] << 8) | octs[3]);
+      } else {
+        if (!/^[0-9a-fA-F]{1,4}$/.test(it)) return null;
+        groups.push(parseInt(it, 16));
+      }
+    }
+    return groups;
+  };
+  let head;
+  let tail;
+  if (halves.length === 2) {
+    head = parseGroups(halves[0]);
+    tail = parseGroups(halves[1]);
+    if (head === null || tail === null) return null;
+    if (head.length + tail.length > 7) return null;
+  } else {
+    head = parseGroups(halves[0]);
+    if (head === null || head.length !== 8) return null;
+    tail = [];
+  }
+  const groups = [...head, ...Array(8 - head.length - tail.length).fill(0), ...tail];
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 8; i++) {
+    out[2 * i] = groups[i] >> 8;
+    out[2 * i + 1] = groups[i] & 0xff;
+  }
+  return out;
+}
+
+// formatIPv6 输出展开形式（每组 4 位十六进制、零不压缩）——展开形式是合法的
+// IPv6 字面量，connect() 与测试都直接可用。
+export function formatIPv6(b) {
+  const groups = [];
+  for (let i = 0; i < 8; i++) groups.push(((b[2 * i] << 8) | b[2 * i + 1]).toString(16).padStart(4, "0"));
+  return groups.join(":");
 }

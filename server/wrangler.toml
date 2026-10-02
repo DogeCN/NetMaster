@@ -1,8 +1,8 @@
-# NetMaster 服务端部署配置。
+# NetMaster 服务端部署配置（v2：Worker + Session Durable Object）。
 #
 # 这里没有任何要你填的东西：域名绑定是你自己的事（控制台加 custom domain，
-# 或自己 wrangler 一行命令），项目不管可达性；database_id 是占位符，deploy
-# 工作流会解析（或创建）同名 D1 并就地改写这一行。
+# 或自己 wrangler 一行命令），项目不管可达性。唯一的 secret 是 PASSWORD，
+# 走 `wrangler secret put`（CI 透传 GitHub Secret），不在本文件管辖范围内。
 
 name = "netmaster"
 main = "_worker.js"
@@ -10,13 +10,14 @@ compatibility_date = "2025-11-04"
 
 # keep_vars 默认是 false，显式写出：部署时删除 Worker 上已存在、但本文件里
 # 没有的变量。一份不描述现实的配置文件比没有配置文件更糟。
-# 唯一的 secret 是 PASSWORD，走 `wrangler secret put`（CI 透传 GitHub Secret），
-# 不在本文件管辖范围内。
 keep_vars = false
 
-# 唯一的存储：域名 → 中继 亲和（relay_binding）。中继的出口 IP 决定
-# Cloudflare 系站点给 200 还是 403，学到的绑定持久化，新 isolate 直接继承。
-[[d1_databases]]
-binding = "DB"
-database_name = "netmaster"
-database_id = "00000000-0000-0000-0000-000000000000"
+# Session DO：每条 WS 连接一个实例，承载认证与多路复用。不落盘——
+# 状态只在实例内存与 WS 生命周期内有效，休眠/驱逐即随流一起结束。
+[[durable_objects.bindings]]
+name = "SESSION"
+class_name = "SessionDO"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["SessionDO"]

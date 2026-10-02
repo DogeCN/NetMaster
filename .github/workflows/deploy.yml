@@ -1,11 +1,11 @@
 name: deploy
 
-# Pipeline: checkout -> install -> build -> ensure same-name D1 -> patch
-# wrangler.toml -> apply schema (idempotent) -> deploy -> pass PASSWORD through.
+# Pipeline: checkout -> install -> build -> deploy (migrations 随 deploy 自动
+# 应用) -> pass PASSWORD through.
 #
 # 没有部署后验证：CI 的网络环境和用户差别很大（GitHub runner 在美国，用户在
 # 大陆），runner 能通不代表用户能通，反过来也一样。部署是否健康由"客户端
-# 能不能连上"直接回答 —— Worker 也没有 /health 之类的端点来回答这个问题。
+# 能不能连上"直接回答 —— Worker 没有任何 HTTP 端点来回答这个问题。
 #
 # 域名绑定不归项目管：Worker 只部署到 workers.dev，用户自己在自己的 zone 上
 # 绑 custom domain（控制台或 wrangler 均可）。项目不持有域名，也就没有
@@ -22,8 +22,7 @@ env:
 permissions:
   contents: read
 
-# One deploy at a time: two overlapping runs would race on `wrangler deploy` and
-# on the wrangler.toml rewrite below.
+# One deploy at a time: two overlapping runs would race on `wrangler deploy`.
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
@@ -56,59 +55,12 @@ jobs:
       - name: Build worker bundle
         run: node build.mjs
 
-      - name: Ensure same-name D1 exists
-        run: |
-          get_db_id() {
-            npx wrangler d1 list --json 2>/dev/null | node -e '
-              let d = "";
-              process.stdin.on("data", c => d += c).on("end", () => {
-                const m = d.match(/\[[\s\S]*\]/);
-                if (!m) { console.error("no JSON array in wrangler output"); process.exit(1); }
-                const hit = JSON.parse(m[0]).find(x => x.name === "netmaster");
-                console.log(hit ? hit.uuid : "");
-              });'
-          }
-          DB_ID="$(get_db_id)"
-          if [ -z "$DB_ID" ]; then
-            echo "D1 'netmaster' not found — creating"
-            npx wrangler d1 create netmaster
-            DB_ID="$(get_db_id)"
-          fi
-          if [ -z "$DB_ID" ]; then
-            echo "::error::failed to resolve database_id for 'netmaster'"
-            exit 1
-          fi
-          echo "DB_ID=$DB_ID" >> "$GITHUB_ENV"
-          echo "D1 'netmaster' ready"
-
-      - name: Patch wrangler.toml
-        run: |
-          sed -i "s/^database_id = .*/database_id = \"$DB_ID\"/" wrangler.toml
-
-      # schema.sql 全部是 CREATE IF NOT EXISTS，每次部署都跑一遍是刻意设计：
-      # 之后新增表时不需要额外的迁移逻辑，重跑天然安全。
-      - name: Apply schema
-        run: |
-          npx wrangler d1 execute netmaster --remote --file=schema.sql
-          VERIFY="$(npx wrangler d1 execute netmaster --remote --command "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='relay_binding'" --json)"
-          HAVE="$(printf '%s' "$VERIFY" | node -e '
-            let d = "";
-            process.stdin.on("data", c => d += c).on("end", () => {
-              try { console.log(JSON.parse(d.match(/\[[\s\S]*\]/)[0])[0].results[0].n); }
-              catch { console.log("ERR"); }
-            });')"
-          if [ "$HAVE" != "1" ]; then
-            echo "::error::relay_binding table missing after schema apply"
-            exit 1
-          fi
-          echo "relay_binding ready"
-
       - name: Deploy Worker
         run: npx wrangler deploy
 
       # 鉴权口令：GitHub Secrets 配置，这里透传成 Worker Secret。
-      # 客户端用同一个口令本地派生 auth（md5），网络只出现派生值。
-      # 未设置时部署仍会成功，但 Worker 会拒绝一切连接（upgrade 时返回 503）。
+      # 客户端用同一个口令在首帧里做 HMAC-SHA256 签名，网络上只出现签名。
+      # 未设置时部署仍会成功，但 Worker 会拒绝一切连接。
       - name: Pass PASSWORD through to Worker secret
         env:
           PASSWORD_VALUE: ${{ secrets.PASSWORD }}
