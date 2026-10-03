@@ -37,8 +37,12 @@ import (
 // 探测层只关心握手能不能完成。
 
 const (
-	probeTopN      = 16
-	probeParallel  = 12
+	probeTopN = 16
+	// probeParallel 是 TLS 握手阶段的并发。刻意高于 probeUpgradeParallel：
+	// TLS 握手只到 CF 边缘、不进 Worker，没有升级那一路的限流问题（见
+	// probeUpgradeParallel 的说明）。与 probeTLSCandidates 对齐后 TLS 阶段
+	// 正好一波跑完，把原先 24 候选/12 并发 = 2 波（最坏 5s）压成 1 波。
+	probeParallel  = 20
 	probeBudgetAll = 10 * time.Second // PRD §14 M4：优选全流程 ≤ 10s
 
 	// probeUpgradeCandidates 是"WS 升级"这一阶段要验的候选数（按 TLS 延迟取前 N）。
@@ -59,14 +63,19 @@ const (
 	// 而最终最多只用 16 个。先用一次便宜的 TCP 建连把明显不通的挡掉，再对前 N 个
 	// 做真握手，启动能省下三秒左右 —— 用户在启动期间是什么都干不了的。
 	//
-	// 取 24 而不是 16：TCP 测不出"TLS 被 RST"这一类（那正是探测存在的理由），
-	// 多留几个名额给它们，免得最后剩下的好节点不够。
-	probeTLSCandidates = 24
+	// 取 20（= probeParallel）而不是 24：TLS 阶段与 probeParallel 对齐后正好一波
+	// 跑完，避免第二波那几个慢候选把整段拖长。仍比 probeTopN(16) 多 4 个名额，
+	// 给"TLS 被 RST"这类 TCP 测不出的失败留余量。
+	probeTLSCandidates = 20
 	// probeScreenTimeout 是 TCP 建连筛查的时限。它必须明显小于 TLS 阶段 ——
 	// 这一层的意义就是"快"，慢的候选直接留给下一轮去淘汰。
-	probeScreenTimeout = 900 * time.Millisecond
+	//
+	// 600ms 而非 900ms：CF 边缘的 TCP 建连通常 < 100ms；被墙的 IP 要么立刻 RST，
+	// 要么静默丢包。900ms 给静默丢包留得太宽，而筛查的目的正是把这类挡在外面 ——
+	// 让它们早点超时，省下的时间留给 TLS 阶段。
+	probeScreenTimeout = 600 * time.Millisecond
 	// probeScreenParallel 是筛查层的并发。TCP 建连很便宜，可以比后面两段开得高。
-	probeScreenParallel = 24
+	probeScreenParallel = 32
 	// probeUpgradeParallel 是升级阶段的并发数，**刻意比 TLS 阶段低**。
 	//
 	// 依据是一次实测：把 12 个升级同时打到同一个 Worker 上，有 7~12 个直接回
@@ -387,13 +396,14 @@ func Optimize(ctx context.Context, nodes []entry.Node, sni string, insecure bool
 	// 无关，逐个取会把启动时间乘以候选数。
 	//
 	// 取不到就退回明文 SNI（见 handshake 的说明）：那是"少一层保护"，不是"不测"。
-	ech := echConfigFor(ctx, sni)
-	res.ECHConfigured = len(ech) > 0
+	//
+	// 与 TCP 筛查**并行**：echConfigFor 走 DoH，最多 2s，与 screenTCP 互不依赖。
+	// 原先串行时它在筛查前面白白挡 2s；并行后这 2s 叠在筛查上，筛查通常更快，
+	// 于是 ECH 这一步对启动关键路径的贡献趋近于零。
+	echCh := make(chan []byte, 1)
+	go func() { echCh <- echConfigFor(ctx, sni) }()
 	// 每轮从零开始：同一进程可能连着跑好几次探测，上一轮成功不能算这一轮的成果。
 	echWorked.Store(false)
-	if res.ECHConfigured {
-		defer func() { res.ECHWorked = echWorked.Load() }()
-	}
 
 	// 第一段：便宜的 TCP 筛查，把候选缩到值得握手的规模。
 	scrStart := time.Now()
@@ -410,6 +420,13 @@ func Optimize(ctx context.Context, nodes []entry.Node, sni string, insecure bool
 		// 一个都连不上：不要在这里就交白卷。这一层的时限比后面两段都短，
 		// 全灭更可能是筛查太严而不是全网不通，交给 TLS 阶段去试。
 		tlsCandidates = nodes
+	}
+
+	// 筛查结束后取 ECH 配置：此时它多半已返回，没返回就等它——TLS 阶段要用。
+	ech := <-echCh
+	res.ECHConfigured = len(ech) > 0
+	if res.ECHConfigured {
+		defer func() { res.ECHWorked = echWorked.Load() }()
 	}
 
 	// 第二段：真实 TLS 握手（优先 ECH）。
