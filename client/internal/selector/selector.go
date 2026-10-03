@@ -59,12 +59,19 @@ type Pool struct {
 	// 改掉同进程里所有别的池。
 	muxTarget     int
 	idleTrimDelay time.Duration
-	closed        bool // Close 之后为终态：不再拨号、不再补齐
+	// warmRetryDelay 是本池"一轮补齐失败"后的首次重试等待（之后指数增长到
+	// warmRetryMaxDelay）。存进 Pool 的理由与上面两个旋钮同源，但这里还多一条
+	// 更硬的：它在 TopUp 起的 goroutine 里被读（delay := p.warmRetryDelay << ...），
+	// 而测试要把它调小才跑得完 —— 直接读包级变量就与测试的赋值构成数据竞争，
+	// race detector 在 CI 上抓到过（上一轮测试遗留的 goroutine 还在跑，下一轮
+	// 测试已经在改那个包级变量）。
+	warmRetryDelay time.Duration
+	closed         bool // Close 之后为终态：不再拨号、不再补齐
 
 	// warmRetries: 连续几轮补齐失败（指数退避用；成功即清零）。
 	//
 	// 必须是原子的：它在 TopUp 起的最多 warmSlots 个 goroutine 里被读-改-写
-	// （下面那个 delay := warmRetryDelay << min(...) 后紧跟 ++ 是一次读改写），
+	// （下面那个 delay := p.warmRetryDelay << min(...) 后紧跟 ++ 是一次读改写），
 	// 还会被 time.AfterFunc 的重试链继续触发。裸 int 会丢更新，而丢更新的后果
 	// 恰好是这个退避唯一要防的东西：计数被压回 0 → 延迟塌回 2 秒地板 → 一个
 	// 已经关掉的 Worker 被我们每 2 秒拨满 warmSlots 次（正是本文件下面注释里
@@ -114,6 +121,9 @@ func New(cfg Config) *Pool {
 	}
 	if p.idleTrimDelay <= 0 {
 		p.idleTrimDelay = idleTrimDelay
+	}
+	if p.warmRetryDelay <= 0 {
+		p.warmRetryDelay = warmRetryDelay
 	}
 	p.pending = newDialPending(p)
 	return p
@@ -368,6 +378,9 @@ const warmSlots = 3
 
 // warmRetryDelay 是一轮补齐失败后的首次重试等待；之后按指数增长到
 // warmRetryMaxDelay 为止。
+//
+// 这里只是**默认值**：真正被读的是 Pool.warmRetryDelay（构造时从它取值），
+// 理由见那个字段的注释。
 var warmRetryDelay = 2 * time.Second
 
 // warmRetryMaxDelay 是重试等待的上限。
@@ -527,7 +540,7 @@ func (p *Pool) TopUp() {
 			// 计数与取延迟必须合成一次原子操作：先 Load 再 Store 是读-改-写，
 			// 几个 goroutine 同时失败时照样丢更新，退避就被压回地板。
 			prev := p.warmRetries.Add(1) - 1
-			delay := warmRetryDelay << min(prev, 5)
+			delay := p.warmRetryDelay << min(prev, 5)
 			if delay > warmRetryMaxDelay {
 				delay = warmRetryMaxDelay
 			}

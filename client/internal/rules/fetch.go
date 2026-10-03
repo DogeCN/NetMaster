@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"netmaster/internal/cache"
@@ -86,8 +87,17 @@ var (
 	// MaxBody 限制单份列表大小：这些源是几百 KB 的文本，超过就是异常。
 	MaxBody = 8 << 20
 	// httpClient 可替换，测试用来注入假传输。
-	httpClient = http.DefaultClient
+	//
+	// 用 atomic.Pointer 而不是普通变量：stubClient 的写入与 fetchAll 派生出去的
+	// goroutine 的读取会并发发生 —— 上一个测试留下的拉取 goroutine 可能还没退出，
+	// 下一个测试就换了 client，race detector 在 CI 上抓到过这条（测试改包级变量
+	// 与并发读的经典形状）。原子读写在热路径上的代价是一次 Load，可以接受。
+	httpClient atomic.Pointer[http.Client]
 )
+
+// 零值的 atomic.Pointer 是 nil，这里补上默认实现（放 init 而不是变量初始化式：
+// Store 是方法调用，写进 var 块会变成一段难读的立即执行函数）。
+func init() { httpClient.Store(http.DefaultClient) }
 
 const (
 	cacheNamespace = "rules"
@@ -237,7 +247,7 @@ func fetchOne(ctx context.Context, url string) (string, error) {
 		return "", err
 	}
 	req.Header.Set("User-Agent", "netmaster")
-	resp, err := httpClient.Do(req)
+	resp, err := httpClient.Load().Do(req)
 	if err != nil {
 		return "", err
 	}

@@ -56,10 +56,13 @@ func newFakeBodyServer(t *testing.T, mode, body string) *fakeServer {
 }
 
 // stubClient 把 httpClient 换成指定实现；返回还原函数。
+//
+// 走 Load/Store：前一个测试派生出去的拉取 goroutine 可能还没退出，它会在
+// fetchOne 里读这个 client，与本函数的写并发 —— race detector 抓到过。
 func stubClient(c *http.Client) func() {
-	old := httpClient
-	httpClient = c
-	return func() { httpClient = old }
+	old := httpClient.Load()
+	httpClient.Store(c)
+	return func() { httpClient.Store(old) }
 }
 
 // isolateCache 把缓存目录指到临时目录：cache 包用的是真实的用户缓存目录，

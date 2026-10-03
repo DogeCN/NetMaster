@@ -158,10 +158,6 @@ func srvAddr(t *testing.T, srv *httptest.Server) (string, int) {
 // 启动时恰好撞上一个坏节点，这个池就一直是 muxTarget-1，直到下一个请求碰巧触发
 // 补齐为止。用户的体感是"有时候打开视频就是卡"。
 func TestWarmupRetriesAfterFailedDial(t *testing.T) {
-	old := warmRetryDelay
-	warmRetryDelay = 20 * time.Millisecond
-	defer func() { warmRetryDelay = old }()
-
 	// 前两次升级被拒（TLS 握手照常成功，失败点在 HTTP 层，与"边缘回 403"同形），
 	// 第三次放行。
 	//
@@ -186,6 +182,10 @@ func TestWarmupRetriesAfterFailedDial(t *testing.T) {
 		Insecure:  true,
 		MuxTarget: 1,
 	})
+	// 退避调小到 20ms：这条用例要在秒级内跑完"失败 → 退避 → 重试 → 成功"。
+	// 写在实例字段上而不是包级变量上——包级变量会被 TopUp 起的 goroutine 读，
+	// 与这里的赋值构成数据竞争（CI 的 -race 抓到过）。
+	p.warmRetryDelay = 20 * time.Millisecond
 	defer p.Close()
 	p.Warm()
 

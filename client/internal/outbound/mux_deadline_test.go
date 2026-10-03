@@ -55,7 +55,13 @@ func TestArmTimerRearmAfterFire(t *testing.T) {
 		t.Fatal("stream was revived after the deadline fired")
 	}
 	// 也不能因为"复活"而在 2 秒后再次动作（死流不该被计时器移出 map 之外的东西影响）
-	if _, ok := m.streams[1]; ok {
+	//
+	// 必须持 m.mu 读：markDead 会在计时器 goroutine 里经 remove() 写同一个 map
+	// （mux.go），这里的裸读与那次写构成数据竞争 —— race detector 在 CI 上抓到过。
+	m.mu.Lock()
+	_, present := m.streams[1]
+	m.mu.Unlock()
+	if present {
 		t.Fatal("dead stream still registered in mux")
 	}
 }
