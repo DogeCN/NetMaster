@@ -48,6 +48,10 @@ func Write(w io.Writer, b []byte) (int, error) {
 // 分片只覆盖前 span 字节，其余一次性写出：再往后与识别 SNI 无关，
 // 全部分片只会白白增加首包延迟。写入语义与 io.Writer 一致 —— 累计返回写入字节数，
 // 出错即返回已写出的部分。
+//
+// 参数钳制：chunk<=0 视作"不分片"，span 一律夹到 [0, len(b)]。这两个参数是包级 var，
+// 测试与未来的调用方都会改它们；一个误用值值得一次明确的边界处理，不值得一次
+// slice bounds panic —— 客户端的输入来自网络。
 func WriteWith(w io.Writer, chunk int, delay time.Duration, span int, b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
@@ -55,31 +59,64 @@ func WriteWith(w io.Writer, chunk int, delay time.Duration, span int, b []byte) 
 	if chunk <= 0 {
 		chunk = len(b)
 	}
+	if span < 0 {
+		span = 0
+	}
 	if span > len(b) {
 		span = len(b)
 	}
 	total := 0
-	for off := 0; off < span; off += chunk {
+	for off := 0; off < span; {
 		end := off + chunk
 		if end > span {
 			end = span
 		}
-		n, err := w.Write(b[off:end])
-		total += n
-		if err != nil {
-			return total, err
+		// 游标必须按**实际写出的字节数**推进，而不是按 chunk。
+		//
+		// io.Writer 契约明确允许返回 `n < len(p) && err == nil`（socket 发送缓冲区
+		// 满就是这种形态），所以"没写完且不报错"是合法输入。按 chunk 推进会把
+		// 没写出去的字节**永久跳过** —— ClientHello 直接损坏，而 total 还少报，
+		// 调用方拿到一个偏小的 n。
+		wn, werr := writeFull(w, b[off:end], &total)
+		off += wn
+		if werr != nil {
+			return total, werr
 		}
 		// 最后一片后面不睡：那后面已经是一次性写出的尾巴，睡它没有意义。
-		if end < len(b) {
+		if off < len(b) {
 			time.Sleep(delay)
 		}
 	}
 	if span < len(b) {
-		n, err := w.Write(b[span:])
-		total += n
+		// 尾巴同样要走 writeFull：它是"一次性写出"，但**一次性**说的是策略而不是
+		// 系统调用次数 —— socket 缓冲满时这一次 Write 照样只收下部分字节。
+		_, err := writeFull(w, b[span:], &total)
 		return total, err
 	}
 	return total, nil
+}
+
+// writeFull 把 p 全部写进 w，把累计写入量加到 *total，并返回本次实际写出的字节数。
+//
+// 语义对齐 io.Copy：短写就续写；写不动了（n==0 且 err==nil）返回 io.ErrShortWrite。
+// 最后那条不是防御性冗余：契约上"报告 0 字节且不报错"是 writer 的 bug，而这里的
+// 调用方是一个按 chunk 循环切分的写循环 —— 不拦住就是**死循环**，也就是客户端挂死。
+func writeFull(w io.Writer, p []byte, total *int) (int, error) {
+	written := 0
+	for written < len(p) {
+		n, err := w.Write(p[written:])
+		if n > 0 {
+			written += n
+			*total += n
+		}
+		if err != nil {
+			return written, err
+		}
+		if n == 0 {
+			return written, io.ErrShortWrite
+		}
+	}
+	return written, nil
 }
 
 // Conn 把一条连接的前若干字节分片写出，之后原样透传。
@@ -95,6 +132,17 @@ type Conn struct {
 	budget int // 还剩多少字节需要分片
 	chunk  int
 	delay  time.Duration
+
+	// wmu 把**整个写过程**串行化，与 mu 分开。
+	//
+	// 为什么必须两把锁：mu 只保护预算的读取与扣减，而真正的 I/O 在锁外做。
+	// crypto/tls 的 Conn 文档明确允许并发调用方法，于是两条并发 Write 各自拿到一段
+	// 预算后会在 TCP 上交叉 —— 对端看到 A1 B1 A2 B2 而不是 A1 A2 B1 B2，
+	// 拼不出任何一条合法记录，ClientHello 直接废掉。
+	//
+	// 以前之所以没暴露：标准 http.Transport 的写侧恰好只有一个 writeLoop goroutine。
+	// 那是**巧合，不是保证**；而 tlsfrag.Conn 的存在意义就是"接在别人看不见的地方"。
+	wmu sync.Mutex
 }
 
 // NewConn 返回一个把前 MaxSpan 字节分片写出的连接（包级默认参数）。
@@ -118,6 +166,10 @@ func (c *Conn) Write(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
+	// 串行化整个写过程：分片序列绝不能与另一条 Write 的分片交叉。
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+
 	c.mu.Lock()
 	if c.budget <= 0 {
 		c.mu.Unlock()
@@ -135,6 +187,11 @@ func (c *Conn) Write(b []byte) (int, error) {
 	written, err := WriteWith(c.Conn, chunk, delay, n, b[:n])
 	if err != nil {
 		return written, err
+	}
+	if n >= len(b) {
+		// 预算刚好覆盖整条数据，没有尾巴。此时再 Write(b[n:]) 会写一个**空切片** ——
+		// 真实 socket 上是白跑一次系统调用，而 ClientHello 会在预算内被切成几十片。
+		return written, nil
 	}
 	rest, err := c.Conn.Write(b[n:])
 	return written + rest, err
