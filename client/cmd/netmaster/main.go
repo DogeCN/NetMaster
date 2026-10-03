@@ -468,6 +468,9 @@ func cmdServe(args []string) {
 			}
 		} else {
 			logger.Printf("tunnel established via node %s", node)
+			// 补齐其余传输：每条连接的服务端建连预算约 30 次，资源密集页面一次
+			// 开 50+ 条流，单条连接必然中途被回收。多备几条把并发余量摊开。
+			pool.Warm()
 		}
 	}()
 

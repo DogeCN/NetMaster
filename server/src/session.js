@@ -28,6 +28,10 @@ const FIRST_BYTE_GRACE_MS = 3000;
 // 会话级出口缓存上限：只为省掉同连接内的重复查询，不是状态。
 const EGRESS_CACHE_MAX = 512;
 
+// CONNECT_BUDGET 是本会话一生允许的出站建连次数（耗尽后回收换新预算）。
+// 低于平台 50 子请求/调用的硬上限：直连路径 1 次 connect，DNS 未命中再 +1 DoH。
+const CONNECT_BUDGET = 30;
+
 class SessionDO {
   constructor(state, env) {
     this.state = state;
@@ -44,6 +48,7 @@ class SessionDO {
     this.directFailed = new Set(); // 直连被平台拒绝的目标（hash），本连接内不再重试
     this.connectCount = 0; // 本激活期已消耗的出站连接数（≈子请求预算）
     this.idleTimer = null;
+    this.draining = false; // 预算见底且仍有在途流：等它们跑完再回收
     this.lastActivity = 0;
   }
 
@@ -346,10 +351,20 @@ class SessionDO {
     // 预算管理：免费版每个 invocation 50 个子请求，每条流约 1 个（connect），
     // 加上 DNS 缓存未命中时的 DoH。预算见底前优雅断开，客户端会带着等待队列
     // 重连拿到全新预算 —— 这是有意的续命机制，不是故障。
-    if (++this.connectCount >= 30) {
+    //
+    // **排空而不是当场杀**：还有在途流时只标记，等最后一条流结束再关。资源密集
+    // 页面（Netflix 首屏 50+ 条流）必然撞到预算线，当场 close 会把正在传输的
+    // 响应全部腰斩，浏览器整页失败重试；排空后这些流正常完成，客户端在下一条
+    // 新流时才用上重连好的新连接（客户端有多条连接轮转，见 selector 的 muxTarget）。
+    if (++this.connectCount >= CONNECT_BUDGET) {
       this.log(`connect budget ${this.connectCount} reached, recycling session`);
       console.error(`[exit] budget recycled after ${this.connectCount} connects`);
-      try { this.ws.close(1000, "budget"); } catch {}
+      if (this.streams.size > 0) {
+        this.draining = true;
+        this.log(`draining ${this.streams.size} in-flight stream(s) before recycle`);
+      } else {
+        this.closeSessionForBudget();
+      }
     }
     const rec = {
       socket: ex.socket,
@@ -453,11 +468,22 @@ class SessionDO {
     if (notify && rec?.ws) {
       try { rec.ws.send(encodeCloseControl(id)); } catch {}
     }
+    // 排空完成：预算已见底且最后一条在途流结束，现在回收会话。
+    if (this.draining && this.streams.size === 0) {
+      this.log('drained, recycling session for a fresh connect budget');
+      this.closeSessionForBudget();
+    }
   }
 
   rememberClosed(id) {
     if (this.closedIds.size > 4096) this.closedIds.clear();
     this.closedIds.add(id);
+  }
+
+  // closeSessionForBudget 回收会话：预算见底后的正常关闭点。
+  closeSessionForBudget() {
+    this.closeAll();
+    try { this.ws?.close(1000, "budget"); } catch {}
   }
 
   closeAll() {

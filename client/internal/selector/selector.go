@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,6 +47,7 @@ type Pool struct {
 	mu            sync.Mutex
 	muxes         map[int]*outbound.MuxConn // 节点索引 -> 活跃 mux
 	warming       atomic.Bool               // 已有预热拨号在进行中（防惊群）
+	rr            atomic.Uint32             // 流分摊用的轮转游标
 	directBlocked map[string]time.Time
 	direct        map[string]bool // host -> 已学习的直连/代理粘性
 	fails         map[int]int     // 节点索引 -> 连续失败次数
@@ -181,17 +183,84 @@ func (p *Pool) onMuxDead(idx int, planned bool) {
 	if !planned {
 		p.noteFailure(idx)
 	}
-	if _, live := p.liveMux(); live != nil {
-		return // 还有别的传输在用，不必预热
+	// 不管还剩几条活着都补到 muxTarget：资源密集页面靠的就是这份余量。
+	p.TopUp()
+}
+
+// muxTarget 是同时保持的传输（WebSocket）条数。
+//
+// 为什么必须 >1：服务端每条连接一生只有约 30 次出站建连的子请求预算
+// （m0-findings E8），到点整条连接被回收。而资源密集页面（Netflix、Instagram
+// 首屏）一次开 50+ 条流，单条连接必然在加载中途被回收，在途流全死、浏览器重试，
+// 表现为"整页加载超时"。4 条连接 = 4 份预算 ≈ 120 条流的中位余量。
+//
+// 分摊到多条连接不破坏出口 IP 稳定性：出口由服务端的 Router DO 映射决定
+// （v0.2.1 修复后跨会话生效），入口连接换了，映射照旧命中同一条中继。
+const muxTarget = 4
+
+// pickMux 在活跃传输里轮转选一条：并发流分摊到多条连接，而不是把整份预算压在
+// 一条上。选中的那条刚好死掉就换下一条。
+func (p *Pool) pickMux() (int, *outbound.MuxConn) {
+	for try := 0; try < 2; try++ {
+		p.mu.Lock()
+		idxs := make([]int, 0, len(p.muxes))
+		for i, m := range p.muxes {
+			if m != nil && m.Alive() {
+				idxs = append(idxs, i)
+			}
+		}
+		sort.Ints(idxs) // 稳定顺序，轮转才有意义
+		var (
+			m   *outbound.MuxConn
+			idx int
+		)
+		if len(idxs) > 0 {
+			idx = idxs[int(p.rr.Add(1)-1)%len(idxs)]
+			m = p.muxes[idx]
+		}
+		p.mu.Unlock()
+		if m == nil {
+			return -1, nil
+		}
+		if m.Alive() {
+			return idx, m
+		}
+	}
+	return -1, nil
+}
+
+// liveCount 返回活跃传输条数（补齐/诊断用）。
+func (p *Pool) liveCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, m := range p.muxes {
+		if m != nil && m.Alive() {
+			n++
+		}
+	}
+	return n
+}
+
+// TopUp 把活跃传输补到 muxTarget 条（后台进行，不阻塞调用方）。每成功一条就
+// 再检查一次（attach 之后递归进来补下一条）。
+func (p *Pool) TopUp() {
+	if p.liveCount() >= muxTarget {
+		return
 	}
 	if !p.warming.CompareAndSwap(false, true) {
-		return
+		return // 已有一个在拨号
 	}
 	go func() {
 		defer p.warming.Store(false)
-		p.redial()
+		if p.redial() {
+			p.TopUp()
+		}
 	}()
 }
+
+// Warm 起 muxTarget 条传输（serve 启动后调用，与请求路径解耦）。
+func (p *Pool) Warm() { p.TopUp() }
 
 // dialMux 建立节点 idx 的传输（不登记进池）。
 func (p *Pool) dialMux(idx int) (*outbound.MuxConn, error) {
@@ -297,7 +366,7 @@ func (p *Pool) Dial(target string) (net.Conn, error) {
 		return nil, errNoUsableExit
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		idx, m := p.liveMux()
+		idx, m := p.pickMux()
 		if m != nil {
 			conn, err := m.Open(target)
 			if err == nil {
