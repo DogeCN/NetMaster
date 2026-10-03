@@ -31,7 +31,10 @@ type Config struct {
 }
 
 // directBlockedTTL 是"该域名禁用直连"的冷却时长。
+//
 // 冷却而非永久：一次网络抖动不该让这个域名从此失去直连（国内站会因此绕远路）。
+// 注意现在只有"代理真的送出了字节"才会写这条记忆（见 NoteProxyConfirmed），
+// 所以它已经是一个强信号了，但长度仍按"网络会变"来给。
 const directBlockedTTL = 30 * time.Minute
 
 type Pool struct {
@@ -46,13 +49,17 @@ type Pool struct {
 
 	mu            sync.Mutex
 	muxes         map[int]*outbound.MuxConn // 节点索引 -> 活跃 mux
-	warming       atomic.Bool               // 已有预热拨号在进行中（防惊群）
+	warming       atomic.Int32              // 正在进行的预热拨号数（并行，非互斥）
 	rr            atomic.Uint32             // 流分摊用的轮转游标
 	directBlocked map[string]time.Time
 	direct        map[string]bool // host -> 已学习的直连/代理粘性
-	fails         map[int]int     // 节点索引 -> 连续失败次数
-	dead          map[int]bool    // 连续失败到阈值判死，等待重随机时复活
-	pending       *dialPending    // 断线等待队列与退避重连
+	// fragDirect 记住"这个域名只有把 TLS 首段分片才能直连"（TLS-RF，见 proxy/tlsfrag.go）。
+	// 存在这里的含义是"分片直连已验证可行"，因此它的优先级高于 directBlocked：
+	// 后者只是"明文 SNI 挨过一次拦"的冷却，不该把学到的能力作废。
+	fragDirect map[string]time.Time
+	fails      map[int]int  // 节点索引 -> 连续失败次数
+	dead       map[int]bool // 连续失败到阈值判死，等待重随机时复活
+	pending    *dialPending // 断线等待队列与退避重连
 }
 
 func New(cfg Config) *Pool {
@@ -65,6 +72,7 @@ func New(cfg Config) *Pool {
 		muxes:         make(map[int]*outbound.MuxConn),
 		directBlocked: make(map[string]time.Time),
 		direct:        make(map[string]bool),
+		fragDirect:    make(map[string]time.Time),
 		fails:         make(map[int]int),
 		dead:          make(map[int]bool),
 	}
@@ -236,6 +244,9 @@ func (p *Pool) onMuxDead(idx int, planned bool) {
 // （v0.2.1 修复后跨会话生效），入口连接换了，映射照旧命中同一条中继。
 const muxTarget = 4
 
+// warmSlots 是同时进行的预热拨号上限：全并发会和请求路径抢节点池。
+const warmSlots = 3
+
 // pickMux 在活跃传输里轮转选一条：并发流分摊到多条连接，而不是把整份预算压在
 // 一条上。选中的那条刚好死掉就换下一条。
 func (p *Pool) pickMux() (int, *outbound.MuxConn) {
@@ -281,20 +292,27 @@ func (p *Pool) liveCount() int {
 }
 
 // TopUp 把活跃传输补到 muxTarget 条（后台进行，不阻塞调用方）。每成功一条就
-// 再检查一次（attach 之后递归进来补下一条）。
+// 再检查一次，直到补满。
 func (p *Pool) TopUp() {
-	if p.liveCount() >= muxTarget {
+	missing := muxTarget - p.liveCount()
+	if missing <= 0 {
 		return
 	}
-	if !p.warming.CompareAndSwap(false, true) {
-		return // 已有一个在拨号
-	}
-	go func() {
-		defer p.warming.Store(false)
-		if p.redial() {
-			p.TopUp()
+	// 并行补齐，最多 warmSlots 个。串行补齐会让一次突发等 3× 拨号时间（实测每条
+	// 隧道 1~2 秒），而"突发后的第一波请求"恰恰是最在意延迟的时候——那几秒正好
+	// 压在用户首屏上。
+	for i := 0; i < missing; i++ {
+		if p.warming.Add(1) > warmSlots {
+			p.warming.Add(-1)
+			return
 		}
-	}()
+		go func() {
+			defer p.warming.Add(-1)
+			if p.redial() {
+				p.TopUp()
+			}
+		}()
+	}
 }
 
 // Warm 起 muxTarget 条传输（serve 启动后调用，与请求路径解耦）。
@@ -468,6 +486,13 @@ func (p *Pool) dialNode(idx int, target string) (net.Conn, error) {
 // 稳定——同域一会儿直连一会儿代理会让按 IP 判定的登录态失效）。
 func (p *Pool) shouldDirect(host string) bool {
 	p.mu.Lock()
+	// 分片记忆优先于"别直连"的冷却。这个域名我们已经验证过"分片直连走得通"，
+	// 而冷却期的由来只是"明文 SNI 挨过一次拦"——按冷却把它丢给代理，等于把
+	// 已经付过代价学到的能力作废，逼着每次连接重走一遍失败的明文探测。
+	if p.fragDirectFreshLocked(host) {
+		p.mu.Unlock()
+		return true
+	}
 	sticky, ok := p.direct[host]
 	blocked := false
 	if at, has := p.directBlocked[host]; has {
@@ -490,6 +515,44 @@ func (p *Pool) shouldDirect(host string) bool {
 		}
 	}
 	return false
+}
+
+// fragDirectTTL 是"这个域名需要分片直连"这条记忆的保留时长。
+//
+// 比 directBlockedTTL 长得多：directBlocked 是一次失败就能下的结论（冷却短一点，
+// 代价是偶尔多绕一跳）；而分片记忆是"试了才知道"的结论 —— 重新学一遍要额外付一次
+// 明文首段被拦的探测（3 秒窗口）+ 一次分片重试。留短了等于反复交学费。
+const fragDirectTTL = 6 * time.Hour
+
+// fragDirectFreshLocked 查分片记忆是否仍在保留期内。调用方必须已持 p.mu。
+func (p *Pool) fragDirectFreshLocked(host string) bool {
+	at, has := p.fragDirect[host]
+	if !has {
+		return false
+	}
+	if time.Since(at) > fragDirectTTL {
+		delete(p.fragDirect, host)
+		return false
+	}
+	return true
+}
+
+// NoteFragDirect 记下"该域名的直连首段要分片发"（实现 proxy.FragDirecter）。
+//
+// 由 proxy 层在"明文首段被拦、但分片重试成功"时调用。顺带清掉该域名的直连冷却：
+// 既然分片这条路已验证可行，再按冷却强制走代理就是白白多付一跳。
+func (p *Pool) NoteFragDirect(host string) {
+	p.mu.Lock()
+	p.fragDirect[host] = time.Now()
+	delete(p.directBlocked, host)
+	p.mu.Unlock()
+}
+
+// NeedsFragDirect 查该域名是否已记住需要分片直连（实现 proxy.FragDirecter）。
+func (p *Pool) NeedsFragDirect(host string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fragDirectFreshLocked(host)
 }
 
 func (p *Pool) bindDirect(host string, direct bool) {
@@ -539,10 +602,23 @@ func (p *Pool) DialAuto(target string) (net.Conn, bool, error) {
 func (p *Pool) RetryProxy(target string) (net.Conn, error) {
 	host := hostOf(target)
 	p.mu.Lock()
+	delete(p.direct, host)
+	p.mu.Unlock()
+	return p.Dial(target)
+}
+
+// NoteProxyConfirmed 在代理隧道真的送出第一个字节之后调用（实现 proxy.ProxyConfirmer）。
+//
+// 为什么不在 RetryProxy 里就记 blocked：RetryProxy 只表示"我们开始试代理了"，
+// 那次尝试本身可能因为节点故障而失败，与"这个域名被墙"毫无关系。把两者记成同一件事，
+// 会让一次代理侧的偶发失败把一个本来能直连的域名按进强制代理。
+//
+// 时长比本文件其它记忆都长：只有真被墙、且分片也没救回来的域名才会走到这里，
+// 所以"落到代理"本身就是一个强信号。
+func (p *Pool) NoteProxyConfirmed(host string) {
+	p.mu.Lock()
 	p.directBlocked[host] = time.Now()
 	p.mu.Unlock()
-	p.unbind(host)
-	return p.Dial(target)
 }
 
 // NoteProxyFailure 记录某目标经代理失败：立刻重随机换节点（PRD §6.7）。

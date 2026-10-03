@@ -359,10 +359,40 @@ func cmdServe(args []string) {
 	all, src := resolveEntries(context.Background(), host)
 	logger.Printf("entries: %d (community: %s)", len(all), src)
 
+	// IP 归属判断：规则未明确分流的主机靠它决定首次走直连还是代理。
+	// 不阻塞启动 —— 没有表时退回"一律偏代理"的老行为，表在后台装好后生效。
+	// 先于探测构造：规则加载要用它（geoip 规则），而规则加载要与探测并行。
+	geo := geoip.New(geoip.DefaultURL, geoip.DefaultTTL)
+	geo.Start(func(size int, fromCache bool) {
+		from := "fetched"
+		if fromCache {
+			from = "cache"
+		}
+		logger.Printf("[geoip] CN ranges ready: %d (%s)", size, from)
+	})
+
 	// 2. IP 优选（PRD §6.6）：并发做真实 TLS 握手（同拨号路径），取最快 16 个进池。
 	//    全流程 ≤ 10s，超预算就用已到手的结果 —— 优选是优化，不是能不能用的前提。
-	nodes, took := selector.Optimize(context.Background(), all, host, cfg.InsecureEnabled())
-	logger.Printf("[probe] %d entries -> %d nodes in %s", len(all), len(nodes), took.Round(time.Millisecond))
+	//    规则集拉取与它**并行**：两者都是网络 I/O，串行等于把两段等待叠起来
+	//    （规则源最坏 3s + 探测最坏 10s），而用户在这段时间里什么都做不了。
+	type probeResult struct {
+		nodes []entry.Node
+		took  time.Duration
+	}
+	probed := make(chan probeResult, 1)
+	go func() {
+		n, took := selector.Optimize(context.Background(), all, host, cfg.InsecureEnabled())
+		probed <- probeResult{nodes: n, took: took}
+	}()
+	rulesOverrides := rulesOverridesFromFile(*rulesFile)
+	router, rerr := rules.LoadRules(context.Background(), rulesOverrides, "default", geo)
+	if rerr != nil {
+		fatal("load rules: " + rerr.Error())
+	}
+	logger.Printf("rules: %d entries (%s, skipped %d lines)", router.Size(), router.Source(), router.SkippedLines())
+	pr := <-probed
+	logger.Printf("[probe] %d entries -> %d nodes in %s", len(all), len(pr.nodes), pr.took.Round(time.Millisecond))
+	nodes := pr.nodes
 
 	pool := selector.New(selector.Config{
 		Nodes:    nodes,
@@ -375,26 +405,9 @@ func cmdServe(args []string) {
 		Insecure: cfg.InsecureEnabled(),
 	})
 	pool.SetDialTimeout(15 * time.Second)
-
-	// IP 归属判断：规则未明确分流的主机靠它决定首次走直连还是代理。
-	// 不阻塞启动 —— 没有表时退回"一律偏代理"的老行为，表在后台装好后生效。
-	geo := geoip.New(geoip.DefaultURL, geoip.DefaultTTL)
 	pool.SetGeo(geo)
-	geo.Start(func(size int, fromCache bool) {
-		from := "fetched"
-		if fromCache {
-			from = "cache"
-		}
-		logger.Printf("[geoip] CN ranges ready: %d (%s)", size, from)
-	})
 
-	// 3. 分流规则：并行拉取内置 Clash 规则集，失败退缓存、再退内置兜底集。
-	//    --rules 只在用户明确指定自己的规则文件时生效（覆盖内置源）。
-	router, err := rules.LoadRules(context.Background(), rulesOverridesFromFile(*rulesFile), "default", geo)
-	if err != nil {
-		fatal("load rules: " + err.Error())
-	}
-	logger.Printf("rules: %d entries (%s, skipped %d lines)", router.Size(), router.Source(), router.SkippedLines())
+	// 3. 分流规则已在入口候选之后与探测并行加载完毕（见上）。
 
 	// 4. 监听端口自动选择：先试 8080/1080，被占则顺延。用户通常不需要知道
 	//    端口号 —— 系统代理自动指向选定值；--manual 下端口只用来打印。
