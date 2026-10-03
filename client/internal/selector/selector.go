@@ -277,6 +277,9 @@ const MaxMuxTarget = 8
 // warmSlots 是同时进行的预热拨号上限：全并发会和请求路径抢节点池。
 const warmSlots = 3
 
+// warmRetryDelay 是一轮补齐失败后的重试等待。
+var warmRetryDelay = 2 * time.Second
+
 // pickMux 在活跃传输里轮转选一条：并发流分摊到多条连接，而不是把整份预算压在
 // 一条上。选中的那条刚好死掉就换下一条。
 func (p *Pool) pickMux() (int, *outbound.MuxConn) {
@@ -324,7 +327,11 @@ func (p *Pool) liveCount() int {
 // TopUp 把活跃传输补到 muxTarget 条（后台进行，不阻塞调用方）。每成功一条就
 // 再检查一次，直到补满。
 func (p *Pool) TopUp() {
-	missing := p.muxTarget - p.liveCount()
+	// 在途的拨号也要算进"已经占用的名额"：每个 warming 槽位最多会再添一条隧道。
+	// 不减掉它就会出现超发 —— 两条并行的 TopUp 各看到 missing=2，就真的拨出 4 条
+	// （本机实测能稳定复现到多出 1 条）。多出来的隧道不是白搭：空闲回收要等
+	// idleTrimDelay，而在此期间它按 DO 时长计费，正是免费版最紧张的额度。
+	missing := p.muxTarget - p.liveCount() - int(p.warming.Load())
 	if missing <= 0 {
 		return
 	}
@@ -337,10 +344,19 @@ func (p *Pool) TopUp() {
 			return
 		}
 		go func() {
-			defer p.warming.Add(-1)
-			if p.redial() {
+			ok := p.redial()
+			// 先释放名额，再决定要不要继续补。顺序反了会**永远少一条**：goroutine 里
+			// 的 TopUp 看到的 warming 至少包含自己，于是它永远认为还有一条在路上，
+			// 于是永远不再补 —— 本机实测池会停在 muxTarget-1 上直到下次拨号事件。
+			p.warming.Add(-1)
+			if ok {
 				p.TopUp()
+				return
 			}
+			// 这一次没拨出来。补齐失败不能就此搁置（否则启动时正好撞上一次坏节点，
+			// 这个池就长期少一条，直到下一个请求碰巧触发补齐），但也不能立刻重试 ——
+			// 全灭时那会变成热循环。退避后重来一轮。
+			time.AfterFunc(warmRetryDelay, p.TopUp)
 		}()
 	}
 }

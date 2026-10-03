@@ -1,6 +1,7 @@
 package selector
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
@@ -138,4 +139,48 @@ func srvAddr(t *testing.T, srv *httptest.Server) (string, int) {
 		t.Fatalf("parse server port: %v", err)
 	}
 	return u.Hostname(), port
+}
+
+// TestWarmupRetriesAfterFailedDial 钉住"一轮补齐失败要退避重来"。
+//
+// 背景：补齐失败时原实现直接返回，既不重试也不记账。后果不是慢，是**长期少一条** ——
+// 启动时恰好撞上一个坏节点，这个池就一直是 muxTarget-1，直到下一个请求碰巧触发
+// 补齐为止。用户的体感是"有时候打开视频就是卡"。
+func TestWarmupRetriesAfterFailedDial(t *testing.T) {
+	old := warmRetryDelay
+	warmRetryDelay = 20 * time.Millisecond
+	defer func() { warmRetryDelay = old }()
+
+	// 前两次升级被拒（TLS 握手照常成功，失败点在 HTTP 层，与"边缘回 403"同形），
+	// 第三次放行。
+	var upgrades int
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrades++
+		if upgrades <= 2 {
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		muxHandler().ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	host, port := srvAddr(t, srv)
+
+	p := New(Config{
+		Nodes:     repeatNodes(host, port, 2),
+		SNI:       "example.com",
+		Password:  "pw",
+		Insecure:  true,
+		MuxTarget: 1,
+	})
+	defer p.Close()
+	p.Warm()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && p.liveCount() < 1 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if p.liveCount() < 1 {
+		t.Fatalf("no tunnel after the first failures were served (upgrades=%d): "+
+			"warm-up gives up instead of retrying", upgrades)
+	}
 }
