@@ -21,7 +21,7 @@ HMAC 认证。没有用户标识符要生成、没有数据库 ID 要复制、�
         │  分流：Clash 规则集 → geoip → 兜底；入口并发优选
         ├──────────────── 直连 ────────────────────────────▶ 目标站        2 跳
         │
-        │  wss://  TLS(+ECH, 见限制一节) + WebSocket + 协议 v2 mux 帧
+        │  wss://  TLS(ECH，判据见限制一节) + WebSocket + 协议 v2 mux 帧
         ▼
   Cloudflare 边缘 Worker ──▶ Session DO（每连接一个，Hibernation）
                                   │  出口选路
@@ -179,7 +179,7 @@ Worker 这段链路的 SNI 隐藏）、`--tunnels <1-8>`（同时保持几条隧
 | `manual` | bool | true 时不接管系统代理，只打印监听地址 |
 | `rules` | string | 自定义分流规则文件路径（Clash RULE-SET 格式，动作按文件名推断）；留空用内置规则集 |
 | `tunnels` | int | 同时保持几条到边缘的隧道，1–8，省略时 4 |
-| `no-ech` | bool | true 时关掉客户端→Worker 这段链路的 SNI 隐藏（默认开启）。仅在遇到偶发 bad handshake、需要对照实验时才需要改 |
+| `no-ech` | bool | true 时关掉客户端→Worker 这段链路的 SNI 隐藏（默认开启）。仅在遇到偶发 bad handshake、需要对照实验时才需要改；本域明文 SNI 已被 RST（2026-10-04 实测），关掉很可能直接连不上 |
 | `insecure` | bool | true 时不校验边缘证书（默认校验）。只给自建网关用自签证书的场景 |
 
 `tunnels` 为什么值得调：资源密集的页面（视频、图片流）一次会开几十条连接，多几条
@@ -200,14 +200,16 @@ Worker 这段链路的 SNI 隐藏）、`--tunnels <1-8>`（同时保持几条隧
   出口只剩 ProxyIP 中继一类。
 - **公共中继的出口 IP 被 Cloudflare 系站点拉黑是常态**，动态列表 + 竞速 + 亲和记忆
   是自愈机制，不是根治。
-- **ECH 目前不生效，服务端域名是明文的。** 2026-10-03 实测确认：客户端每次拨号的
-  ECH 握手都被边缘拒绝（拿到的是 `cloudflare-ech.com` 的 outer 名证书，或直接
-  `server rejected ECH`），于是熔断 60 秒、退回明文 SNI。也就是说**每次连接都是明文
-  SNI**，而这一版之前文档和 `no-ech` 开关都写着它在隐 —— 失败一路静默，没人发现。
-  客户端现在会在启动日志里直说（`[ech] ...fall back to a VISIBLE SNI`）。
-  要真正隐起来，需要在 Cloudflare 控制台给该 zone 打开
-  Encrypted Client Hello（SSL/TLS → Edge Certificates）；打开后启动日志会变成
-  `[ech] SNI hidden by ECH`。在此之前不要依赖 ECH 的任何保护。
+- **ECH 生效，且对本域是必需项。** 2026-10-04 实测（本机、`proxy.0xa.cc.cd`，zone 的
+  Encrypted Client Hello 一直开着）：DNS 的 HTTPS RR 发布 `ech=`；启动日志
+  `[ech] SNI hidden by ECH`；仓库自带的 `go run ./cmd/echprobe <域名>` 连跑 4 轮全部
+  内层证书校验通过（叶子证书 `*.proxy.0xa.cc.cd`）。对照组：同一边缘 IP 上明文 SNI 写这个
+  域名 4/4 被 RST，而换 `www.cloudflare.com` 同一 IP 是 200 —— 明文那条路对本域是断的，
+  所以"退化成可见 SNI"不再是"少一层保护"，而是连不上。
+  判据只看启动日志三态（`no ECH config published` / `...VISIBLE SNI` / `SNI hidden by ECH`），
+  不要假设它在隐。历史：2026-10-03 曾记录"完全不生效"（拿到外层 `cloudflare-ech.com`
+  证书或直接 `server rejected ECH`），10-04 未能复现，按当时本机网络波动理解
+  （未进一步验证）。
 - geoip 的 CN 网段表只有 IPv4，纯 IPv6 站点一律按"非 CN"处理。
 - 系统代理不转发 UDP：QUIC 不会被代理，建议在浏览器里禁用 QUIC
   （`chrome://flags/#enable-quic`），强制回落 TCP。

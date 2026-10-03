@@ -89,9 +89,32 @@ runner 上，不在 Worker 里。要看它的输出去 Actions 的 run 页面：
 | `[frag] <host> remembered fragmentation no longer works (…) — forgetting it` | 旧的分片记忆已失效 | 正常；不清它会让此后 6 小时每条连接白付约 400ms 再落代理 |
 | `[route] <host> proxy tunnel dead (…) — switched exit and replayed` | 隧道建立但零字节即断，已换出口 | 正常自愈；Worker 侧也会把坏中继忘掉 |
 
+## ECH：怎么知道现在是哪一态
+
+ECH 用来隐藏 SNI。客户端在启动时把当前状态**明说**（`main.go` 的三态），这就是判据，不要
+凭"文档说过它在隐"来假设：
+
+| 日志 | 含义 | 怎么办 |
+|---|---|---|
+| `[ech] no ECH config published for this domain` | 域名的 HTTPS RR 里没有 `ech=`（zone 未开 Encrypted Client Hello） | 控制台 SSL/TLS → Edge Certificates 打开它 |
+| `[ech] ECH handshake failed on every attempt — …VISIBLE SNI` | 有配置但握手没成 | 下看"回退链"，并跑 `echprobe` 复核 |
+| `[ech] SNI hidden by ECH` | ECH 生效 | 不用管 |
+
+2026-10-04 实测（`proxy.0xa.cc.cd`）是最后一态：`echprobe` 4/4 内层证书校验通过，同一边缘
+IP 上明文 SNI 写本域 4/4 被 RST（换 `www.cloudflare.com` 同 IP 是 200）。
+
+**握手级复核**（不只信启动日志）：
+
+```bash
+cd client && go run ./cmd/echprobe <域名>
+# [1] 取 ECHConfig → [2a] 带校验的 ECH 握手 → [2b] 不校验 → [2c] 明文 TLS 对照
+```
+
+四步里 `[2a] OK` 才算"真的隐了"；`[2c]` 是判别"明文这条路通不通"的对照组。
+
 ## ECH 回退
 
-ECH 的作用是隐藏 SNI，属于锦上添花，**它失败不该拖累正常连接**。客户端的兜底链：
+兜底链（代码路径没变）：
 
 1. 尝试 ECH（2 秒预算，走优选 IP；失败再试域名直连）；
 2. 超预算或握手失败 → 退普通 TLS（明文 SNI），并触发 60 秒短路；

@@ -95,13 +95,16 @@ Cloudflare 免费版的 50 次/轮子请求，换成了 GitHub 的 runner 分钟
   泄漏，是否配加密 DNS 由用户决定。
 - **公共中继的出口 IP 被 CF 系站点拉黑是常态**，动态列表 + 竞速 + 亲和记忆是自愈机制不是
   根治。要根治只能自建中继（见 [relay.md](relay.md)）。
-- **ECH 当前完全不生效**（2026-10-03 实测，非"部分网络"）：`utls` 在 ECH 模式下拿外层
-  `cloudflare-ech.com` 的证书去匹配真实域名，必然失败；把 `ServerName` 改成 public_name
-  则边缘直接回 `server rejected ECH`。失败被 `isStructuralECHFailure` 判成结构性故障 →
-  熔断 60 秒 → 之后每次拨号都退回明文 SNI。
-  客户端已改为**在启动日志里明说**（`[ech] ...VISIBLE SNI`），探测也不再被 ECH 拖垮
+- **ECH 生效（2026-10-04 实测），并且它是必需品不是锦上添花**：`echprobe` 4/4 内层证书
+  校验通过；同一边缘 IP 上明文 SNI 写本域 4/4 被 RST（换 `www.cloudflare.com` 同 IP 200，
+  即 IP 本身可达）。所以 ECH 失败后熔断 60 秒、退明文 SNI 的那条兜底路径**对本域表现为连
+  不上**——"明文 SNI 是常态"这句在 10-03 写下时成立，现在反过来了。
+  客户端在启动日志里明说当前是哪一态（`no ECH config published` / `...VISIBLE SNI` /
+  `SNI hidden by ECH`）；握手级复核用 `go run ./cmd/echprobe <域名>`（打印取配置、
+  带校验的 ECH 握手、不校验握手、明文对照四步）。探测不再被 ECH 拖垮这一点不变
   （失败一次后本轮其余候选直接走明文，不再拿同一份配置一个个去撞）。
-  修复方向：在 Cloudflare zone 上开启 Encrypted Client Hello；未开启前明文 SNI 是常态。
+  历史：2026-10-03 的记录是"完全不生效"（外层证书不匹配 / `server rejected ECH`），
+  10-04 未能复现，归因为当时本机网络波动（未进一步验证）。
 - **geoip 表只有 IPv4**，纯 IPv6 站点一律按"非 CN"处理（走代理）。
 - **无版本协商**：协议升级是破坏性变更，客户端与服务端必须同时更新；错误版本的帧呈现为
   `0x01`，与密码错误不可区分。
