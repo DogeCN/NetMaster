@@ -25,11 +25,31 @@ import (
 	"netmaster/internal/geoip"
 	"netmaster/internal/instlock"
 	"netmaster/internal/procwait"
+	"netmaster/internal/profile"
 	"netmaster/internal/proxy"
 	"netmaster/internal/rules"
 	"netmaster/internal/selector"
 	"netmaster/internal/sysproxy"
+	"netmaster/internal/tlsfrag"
 )
+
+// boolWord 把布尔旋钮写成"开/关"而不是 "true/false"：指纹是给人读的，
+// "ech=enabled" 比 "ech=true" 少一次翻译。
+func boolWord(b bool, on, off string) string {
+	if b {
+		return on
+	}
+	return off
+}
+
+// rulesFileLabel 把"用了哪份自定义规则"写进指纹。空与"某文件"是两种不同的
+// 分流行为，代价也不同，必须能区分。
+func rulesFileLabel(path string) string {
+	if path == "" {
+		return "(builtin)"
+	}
+	return path
+}
 
 // 连接配置的优先级：命令行 flag > config.json > 环境变量。
 // 实现上把 config.json 的值当作 flag 的默认值（见 internal/config），flag 一旦
@@ -350,6 +370,12 @@ func cmdNodes(args []string) {
 
 func cmdServe(args []string) {
 	appStart := time.Now()
+
+	// 采集器要在最早期就决定，因为启动阶段恰好包含最值得量的几段。
+	// 未开启时 tr 是 nil，全部调用都是空操作，热路径上不留任何 if。
+	profOn, profPath := profile.FromEnv()
+	tr := profile.New(profOn)
+
 	cfg, cfgPath, err := config.Load()
 	if err != nil {
 		fatal(err.Error())
@@ -373,6 +399,16 @@ func cmdServe(args []string) {
 		fatal(fmt.Sprintf("tunnels must be between 1 and %d, got %d", selector.MaxMuxTarget, *tunnels))
 	}
 
+	// 指纹事实：凡是会改变耗时的旋钮都要登记，否则两次运行的数字不可比，
+	// 而不可比的数字比没有数字更坏（见 profile 包的说明）。
+	if tr != nil {
+		tr.Fact("tunnels", strconv.Itoa(*tunnels))
+		tr.Fact("ech", boolWord(*noECH, "disabled", "enabled"))
+		tr.Fact("insecure", boolWord(cfg.InsecureEnabled(), "on", "off"))
+		tr.Fact("rules-file", rulesFileLabel(*rulesFile))
+		tr.Fact("frag", fmt.Sprintf("%dB/%dms/%dB", tlsfrag.Chunk, tlsfrag.Delay.Milliseconds(), tlsfrag.MaxSpan))
+	}
+
 	// 单实例（PRD §6.5 step 1）：两个 serve 会互相抢系统代理。锁只拦"接管系统
 	// 代理"的实例——--manual 不碰系统代理，允许多开（诊断/并行观察是正当需求）。
 	// 锁文件系统失败只降级告警，不拦着用户上网。
@@ -393,6 +429,16 @@ func cmdServe(args []string) {
 	}
 
 	logger := log.New(os.Stdout, "", log.Ltime)
+	if tr != nil {
+		defer func() {
+			// 报告直接走 stdout 而不是 logger：logger 每行带时间戳，而这份报告
+			// 自己就有偏移列，再叠一层时间戳只会让人分不清哪列是哪列。
+			_ = tr.WriteReport(os.Stdout)
+			if err := tr.WriteJSON(profPath); err != nil {
+				logger.Printf("WARN profile json: %v", err)
+			}
+		}()
+	}
 	if lockWarn != nil {
 		logger.Printf("WARN single-instance lock: %v (continuing without it)", lockWarn)
 	} else if unlock != nil {
@@ -403,8 +449,16 @@ func cmdServe(args []string) {
 	}
 
 	// 1. 入口候选（每次启动都尝试刷新社区源；有界等待，失败退缓存）
+	entriesStart := time.Now()
 	all, src := resolveEntries(context.Background(), host)
+	tr.Mark("entries", fmt.Sprintf("%d candidates from %s", len(all), src))
 	logger.Printf("entries: %d (community: %s)", len(all), src)
+	// 节点池的**实际成员**是耗时的一部分：探测耗的是被选中的那批，不同的成员
+	// 意味着不同的网络路径。不登记它，"这次快了 2 秒"就可能是"这次池子更好"。
+	if tr != nil {
+		tr.FactInt("entries", len(all))
+		tr.FactInt("entry-fetch-ms", int(time.Since(entriesStart).Milliseconds()))
+	}
 
 	// IP 归属判断：规则未明确分流的主机靠它决定首次走直连还是代理。
 	// 不阻塞启动 —— 没有表时退回"一律偏代理"的老行为，表在后台装好后生效。
@@ -426,13 +480,26 @@ func cmdServe(args []string) {
 	probed := make(chan selector.OptResult, 1)
 	go func() { probed <- selector.Optimize(context.Background(), all, host, cfg.InsecureEnabled()) }()
 	//规则只用内置集：不拉订阅、不读磁盘缓存（见 rules.BuiltinOnly 的理由）。
+	endRules := tr.Begin("rules.load", 500*time.Millisecond)
 	rulesOverrides := rulesOverridesFromFile(*rulesFile)
 	router, rerr := rules.BuiltinOnly(rulesOverrides.Custom, geo)
 	if rerr != nil {
+		endRules()
 		fatal("load rules: " + rerr.Error())
 	}
+	endRules()
 	logger.Printf("rules: %d entries (%s, skipped %d lines)", router.Size(), router.Source(), router.SkippedLines())
+
+	// 探测预算：selector 内部的全流程预算是 10s，这里留 12s 的告警线。
+	// 超了不是 bug，是"入口质量或链路变了"的信号 —— 正是要它自己跳出来的那种事。
+	endProbe := tr.Begin("probe.total", 12*time.Second)
 	pr := <-probed
+	endProbe()
+	tr.Mark("probe.done", fmt.Sprintf("%d/%d nodes", len(pr.Nodes), len(all)))
+	if tr != nil {
+		tr.FactInt("nodes", len(pr.Nodes))
+		tr.FactInt("refused", pr.Rejected)
+	}
 	// 两段耗时分别印出来：启动慢的时候，"哪一段慢"和"慢多少"才是能据此动手的信息，
 	// 一句"探测用了 10 秒"只会让人干瞪眼。
 	// ECH 的成败必须说在启动日志里。
@@ -524,6 +591,7 @@ func cmdServe(args []string) {
 		DirectFallback: true,
 		Logger:         logger,
 		DialTimeout:    15 * time.Second,
+		Trace:          tr,
 	})
 	if err := srv.Start(); err != nil {
 		fatal("start proxy: " + err.Error())
@@ -559,6 +627,7 @@ func cmdServe(args []string) {
 
 	logger.Printf("ready in %s. browse normally; Ctrl+C or close this window to stop (system proxy is restored).",
 		time.Since(appStart).Round(time.Millisecond))
+	tr.Mark("ready", fmt.Sprintf("after %s", time.Since(appStart).Round(time.Millisecond)))
 
 	// 首次连通验证：一次真实的传输层建连（TLS+WS+auth），在后台跑，
 	// 结果出来补一行日志 —— 部署是否健康，这一行就是最直接的回答。
@@ -566,7 +635,10 @@ func cmdServe(args []string) {
 	// ClientHello 被 RST，其他域名正常），这是"连不上"的头号原因，失败时
 	// 直接把方向指给用户。
 	go func() {
+		endVerify := tr.Begin("tunnel.verify", 10*time.Second)
 		if node, err := pool.Verify(); err != nil {
+			endVerify()
+			tr.Mark("tunnel.failed", err.Error())
 			logger.Printf("tunnel failed: %v", err)
 			if strings.HasSuffix(host, ".workers.dev") {
 				logger.Println("hint: *.workers.dev domains are SNI-blocked in mainland China (and ECH is not published for them).")
@@ -575,6 +647,8 @@ func cmdServe(args []string) {
 				logger.Println("      then put that domain in config.json as \"server\". See docs/deployment.md.")
 			}
 		} else {
+			endVerify()
+			tr.Mark("tunnel.ok", "via "+node)
 			logger.Printf("tunnel established via node %s", node)
 		}
 		// 补齐其余传输：每条连接的服务端建连预算约 30 次，资源密集页面一次
