@@ -6,6 +6,10 @@
 import { spawnSync } from "node:child_process";
 
 // crypto/protocol 是纯逻辑；其余套件经 socket.js 摸平台模块，要挂 Node shim。
+//
+// regressions 排在最后：它测的是"不该发生的事"——作用域逃逸、字符集注入、
+// 打包器静默丢模块——所以它会改写 src/ 下的文件做变异再还原。放最后跑，
+// 万一中途挂掉，前面几套件的结论仍然有效，排查时也不会看到一个半改过的 src/。
 const suites = [
   ["crypto", false],
   ["protocol", false],
@@ -14,6 +18,8 @@ const suites = [
   ["race", true],
   ["router", true],
   ["refresh-relays", true],
+  ["profile", false],
+  ["regressions", false],
 ];
 
 for (const [name, shim] of suites) {
@@ -24,4 +30,4 @@ for (const [name, shim] of suites) {
     process.exit(r.status ?? 1);
   }
 }
-console.log("\nnpm test: all 7 suites passed");
+console.log(`\nnpm test: all ${suites.length} suites passed`);

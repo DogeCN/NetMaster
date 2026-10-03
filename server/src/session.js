@@ -14,6 +14,11 @@
 import { dialRelay, parseRelay, RELAY_TYPE_SNI, RELAY_TYPE_HTTP_CONNECT } from './proxyip.js';
 import { startRace } from './race.js';
 import { targetHash, routerName, routerShardId } from './router.js';
+// 名字直接用 profile.js 里的原名：**不要**写 `flush as flushProfile`。
+// build.mjs 的拼接式打包只是把 import 语句整行删掉，不处理重命名 —— 别名在源码里
+// 读着完全正常，符号却在 bundle 里不存在，表现为运行期 ReferenceError。
+// build.mjs 现在会硬拒绝带 as 的相对 import，所以这个坑至少不会再无声发生。
+import { makeProfiler, flush } from './profile.js';
 
 const STREAM_BUFFER_LIMIT = 1024 * 1024;
 
@@ -40,6 +45,11 @@ const EGRESS_CACHE_MAX = 512;
 // 50 子请求/调用之内。
 const CONNECT_BUDGET = 20;
 
+// PROF_FLUSHES_PER_SESSION 是**全会话**的 KV 写次数上限（不是每个目标各算一份）。
+// 见 profile.js 的 flush(budget)：一条连接会承载很多目标，按目标各算一份的话，
+// 一次首屏就能把配额烧掉，而那正是最不该花的场景。
+const PROF_FLUSHES_PER_SESSION = 3;
+
 class SessionDO {
   constructor(state, env) {
     this.state = state;
@@ -58,6 +68,39 @@ class SessionDO {
     this.idleTimer = null;
     this.draining = false; // 预算见底且仍有在途流：等它们跑完再回收
     this.lastActivity = 0;
+    this.profBudget = { left: PROF_FLUSHES_PER_SESSION };
+    this.profSession = makeProfiler(this.env, { target: "session" });
+    this.profTargets = new Map(); // target -> 采集器（见 profFor）
+    this.profFlush = null; // 最近一次落盘的 promise，供 webSocketClose 等待
+  }
+
+  // profFor 取（并缓存）某个目标的采集器。
+  //
+  // 为什么按目标分桶而不是整会话一个：客户端那边是按 host 记录的（profile 的
+  // Fact/Fingerprint 都带目标），服务端共用一个 "session" 桶就对不上账了。
+  // 协议首帧没有余量塞 trace id，"目标 + 时间窗" 是唯一的关联手段
+  // （见 profile.js 头部）。
+  profFor(target) {
+    let p = this.profTargets.get(target);
+    if (!p) {
+      p = makeProfiler(this.env, { target });
+      this.profTargets.set(target, p);
+    }
+    return p;
+  }
+
+  // flushProfile 把本会话所有采集器落盘。写 KV 要配额，所以只在会话结束时做；
+  // 失败一律吞掉 —— profile 是排障工具，它坏了不该影响转发。
+  async flushProfile() {
+    const all = [this.profSession, ...this.profTargets.values()];
+    this.profTargets.clear();
+    for (const p of all) {
+      try {
+        await flush(p, this.env, this.profBudget);
+      } catch {
+        // 见上：观测数据不值得为之抛错。
+      }
+    }
   }
 
   log(msg) {
@@ -118,10 +161,12 @@ class SessionDO {
 
   async webSocketClose() {
     this.closeAll();
+    await this.profFlush; // 等 KV 落盘：关连接是本会话最后一个能安全写的机会
   }
 
   async webSocketError() {
     this.closeAll();
+    await this.profFlush;
   }
 
   touch() {
@@ -151,33 +196,44 @@ class SessionDO {
   // ---- 首帧：认证 + 打开流 1 ----
 
   async handleFirstFrame(ws, data) {
-    // 结构校验
-    const f = parseFirstFrame(data);
-    if (!f || !validStreamId(f.streamId) || !tsWithinWindow(f.ts, Math.floor(Date.now() / 1000))) {
-      this.log("first frame rejected (structure/ts/stream-id)");
-      if (f) {
-        this.send(encodeResponse(f.streamId, STATUS_BAD));
-      } else {
-        // 结构层面就解析不出来，没有合法 stream id 可引用 —— 用保留的 0 号回 0x01，
-        // 让客户端也能拿到 STATUS 而不是只看到裸 close（PRD §11 的"非法均回 0x01"）。
-        this.send(encodeResponse(0, STATUS_BAD));
+    // 认证整段计时。用 try/finally 而不是逐个 return 前手动收尾 —— 这里有三条
+    // 出口（结构拒、认证拒、正常），漏掉一条就意味着"失败的那几次"没有数据，
+    // 而失败路径的耗时恰恰是要查的。
+    const endAuth = this.profSession.begin("auth");
+    try {
+      // 结构校验
+      const f = parseFirstFrame(data);
+      if (!f || !validStreamId(f.streamId) || !tsWithinWindow(f.ts, Math.floor(Date.now() / 1000))) {
+        this.log("first frame rejected (structure/ts/stream-id)");
+        this.profSession.count("auth.reject", 1);
+        if (f) {
+          this.send(encodeResponse(f.streamId, STATUS_BAD));
+        } else {
+          // 结构层面就解析不出来，没有合法 stream id 可引用 —— 用保留的 0 号回 0x01，
+          // 让客户端也能拿到 STATUS 而不是只看到裸 close（PRD §11 的"非法均回 0x01"）。
+          this.send(encodeResponse(0, STATUS_BAD));
+        }
+        try { ws.close(1008, ""); } catch {}
+        return;
       }
-      try { ws.close(1008, ""); } catch {}
-      return;
+      // 认证校验：签名区 = TS 起的全部字节
+      const expect = await authCode(this.password, f.signed);
+      if (!safeEqualBytes(expect, data.slice(0, 16))) {
+        this.log("first frame rejected (auth)");
+        this.profSession.count("auth.reject", 1);
+        this.send(encodeResponse(f.streamId, STATUS_BAD));
+        try { ws.close(1008, ""); } catch {}
+        return;
+      }
+      this.profSession.count("auth.ok", 1);
+      this.authed = true;
+      this.authPending = false;
+      this.log(`authenticated; stream ${f.streamId} -> ${f.host}:${f.port}`);
+      await this.openStream(f.streamId, f.host, f.port);
+      await this.drainPending();
+    } finally {
+      endAuth();
     }
-    // 认证校验：签名区 = TS 起的全部字节
-    const expect = await authCode(this.password, f.signed);
-    if (!safeEqualBytes(expect, data.slice(0, 16))) {
-      this.log("first frame rejected (auth)");
-      this.send(encodeResponse(f.streamId, STATUS_BAD));
-      try { ws.close(1008, ""); } catch {}
-      return;
-    }
-    this.authed = true;
-    this.authPending = false;
-    this.log(`authenticated; stream ${f.streamId} -> ${f.host}:${f.port}`);
-    await this.openStream(f.streamId, f.host, f.port);
-    await this.drainPending();
   }
 
   // ---- 已认证后的帧分发 ----
@@ -220,13 +276,31 @@ class SessionDO {
   // Cloudflare 网段或不可达"的信号（connect() 拨 CF 段必被平台拒），这时才走
   // ProxyIP：会话缓存 → Router DO → 竞速。
   async openExit(atyp, host, port) {
+    const p = this.profFor(`${host}:${port}`);
     const hash = await targetHash(host);
+
+    // direct 必须提到 if 外面声明。
+    //
+    // 它原本是块内 const，却被下面的竞速失败分支引用 —— 块级作用域，那两行必然
+    // ReferenceError。而它命中的正是最常见的故障态（直连失败 **且** 竞速 6 槽全灭：
+    // 中继池挂了、目标落在 CF 网段）。后果比抛异常更糟：openStream 还没来得及发
+    // STATUS_NOEXIT 就 reject，客户端拿不到任何响应帧，只能干等 20s 超时；认证期间
+    // 排队的开帧也一起丢掉。
+    //
+    // 之所以能上线：integration.mjs 断言了 0x03，但它连的是 devserver 这个**替身**，
+    // 真实的 openExit 零覆盖；而 `node --check` 只查语法，查不出运行期未定义标识符。
+    let direct = null;
 
     // 直连失败记忆：解析到 CF 网段的目标直连必被平台拒（每次失败还白烧子请求
     // 预算），本连接内直接走 ProxyIP。
     if (!this.directFailed.has(hash)) {
-      const direct = await directConnect(atyp, host, port);
-      if (!direct.error) return { socket: direct.socket };
+      const endDirect = p.begin("exit.direct");
+      direct = await directConnect(atyp, host, port);
+      endDirect();
+      if (!direct.error) {
+        p.count("exit.rung", 0);
+        return { socket: direct.socket };
+      }
       console.error(`[exit] direct ${host}:${port} failed: ${direct.error}`);
       this.directFailed.add(hash);
       this.log(`direct exit failed (${direct.error}); trying proxyip`);
@@ -237,17 +311,27 @@ class SessionDO {
     // ① 会话级缓存：只在本 WebSocket 会话内有效。
     const mem = this.egress.get(hash);
     if (mem) {
+      const endCache = p.begin("exit.cache");
       const r = await dialRelay(mem, host, port);
-      if (!r.error) return { socket: r.socket, hash, relay: mem };
+      endCache();
+      if (!r.error) {
+        p.count("exit.rung", 1);
+        return { socket: r.socket, hash, relay: mem };
+      }
       this.log(`cached relay ${mem.host}:${mem.port} failed: ${r.error}`);
       this.egress.delete(hash);
     }
 
     // ② Router DO：跨会话复用的唯一来源。
+    const endLookup = p.begin("exit.router.lookup");
     const hit = await this.routerLookup(hash);
+    endLookup();
     if (hit) {
+      const endRouter = p.begin("exit.router.dial");
       const r = await dialRelay(hit, host, port);
+      endRouter();
       if (!r.error) {
+        p.count("exit.rung", 2);
         this.rememberEgress(hash, hit);
         // http-connect 的 CONNECT 2xx 是端到端验证，可以learn；SNI 型的 TCP
         // 成功不构成验证（盲转发也能连），其健康由 GH 探测写进 KV，不进 Router。
@@ -261,13 +345,20 @@ class SessionDO {
     }
 
     // ③ 竞速：候选 = KV top4 → 内置兜底补齐 6 槽（Router 映射刚被证伪或本就没有）。
+    const endRace = p.begin("exit.race");
     const race = await startRace({ env: this.env, log: (m) => this.log(m) }, { host, port });
+    endRace();
     if (race.error) {
       console.error(`[exit] race ${host}:${port} all slots failed: ${race.error}`);
-      this.env.KV?.put("debug:lastExit", `${new Date().toISOString()} ${host}:${port} race: ${race.error} | direct: ${direct.error}`).catch?.(() => {});
-      return { error: `${direct.error}; ${race.error}` };
+      // direct 为 null 是正常情形：本会话早前那条流已经把直连判死、directFailed
+      // 记住了，于是这次根本没再拨。把它读成 "(已在本次会话失败)"，而不是再崩一次 ——
+      // 上一版就是在这里崩的，而这里恰好是最常被走到的一行。
+      const directErr = direct ? direct.error : "(already failed earlier this session)";
+      this.env.KV?.put("debug:lastExit", `${new Date().toISOString()} ${host}:${port} race: ${race.error} | direct: ${directErr}`).catch?.(() => {});
+      return { error: `${directErr}; ${race.error}` };
     }
     const relay = { ...parseRelay(race.relay), type: race.type || RELAY_TYPE_SNI };
+    p.count("exit.rung", 3);
     this.rememberEgress(hash, relay);
     if (relay.type === RELAY_TYPE_HTTP_CONNECT) {
       // CONNECT 2xx 是端到端验证，立即 learn。SNI 型的 TCP 成功不构成验证
@@ -359,7 +450,10 @@ class SessionDO {
       this.rememberClosed(id);
       return;
     }
+    const p = this.profFor(`${host}:${port}`);
+    const endExit = p.begin("exit.total");
     const ex = await this.openExit(atyp, host, port);
+    endExit();
     if (ex.error) {
       this.log(`stream ${id} connect failed: ${ex.error}`);
       this.send(encodeResponse(id, STATUS_NOEXIT));
@@ -397,6 +491,8 @@ class SessionDO {
       firstByteTimer: null,
       learnPending: !!ex.learnPending, // SNI 型：首字节才是端到端验证，到点才 learn
       relayId: ex.relay ? `${ex.relay.host}:${ex.relay.port}` : null,
+      prof: p, // 首字节到达时打点用（见 pumpOutbound）
+      openedAt: Date.now(),
     };
     if (rec.hash) {
       // 出口学到的映射先乐观记下，3 秒内没有首字节就承认学错了。
@@ -427,6 +523,11 @@ class SessionDO {
           // 首字节到了：出口路径成立，撤掉 3 秒失效定时器。
           clearTimeout(rec.firstByteTimer);
           rec.firstByteTimer = null;
+          // 出站建连成功到目标真的回字节，这一段是"中继/直连选得对不对"的唯一
+          // 端到端证据（TCP 通了不代表隧道通）。startup 慢在这里的话，
+          // exit.* 的 span 全都好看，只有这个 span 会大。
+          rec.prof?.count("firstByte", 1);
+          rec.prof?.mark("firstByte", `${Date.now() - rec.openedAt}ms after open`);
           if (rec.learnPending) {
             // SNI 中继此刻被端到端证实（数据真的穿过了隧道），写入 Router DO
             // 供跨会话复用——这是竞速 6 槽预算之外唯一的复用来源。
@@ -518,5 +619,8 @@ class SessionDO {
     this.pendingFrames = [];
     this.pendingBytes = 0;
     this.ws = null;
+    // profile 落盘。fire-and-forget：closeAll 在关连接的关键路径上，不能 await；
+    // promise 存下来给 webSocketClose / webSocketError 等。
+    this.profFlush = this.flushProfile().catch(() => {});
   }
 }

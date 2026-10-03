@@ -51,7 +51,12 @@ export function encodeAddr(host, port) {
     atyp = ATYP_IPV6;
     addr = bin;
   } else {
-    const raw = utf8(host.toLowerCase());
+    const lower = host.toLowerCase();
+    // 与 parseAddr 同一套白名单。服务端的 parseAddr 才是安全边界（那里校验的是
+    // 不可信的网络输入），这里只是不让客户端把垃圾送上线路 —— 少一个要解释的
+    // "为什么客户端会把 CR/LF 编进目标"。
+    if (!/^[a-z0-9._-]+$/.test(lower)) return null;
+    const raw = utf8(lower);
     if (raw.length < 1 || raw.length > 255) return null;
     atyp = ATYP_DOMAIN;
     addr = Uint8Array.of(raw.length, ...raw);
@@ -81,7 +86,26 @@ export function parseAddr(b, off) {
       if (off + 2 > b.length) return null;
       const n = b[off + 1];
       if (n < 1 || off + 2 + n + 2 > b.length) return null;
-      addr = new TextDecoder().decode(b.slice(off + 2, off + 2 + n)).toLowerCase();
+      const raw = b.slice(off + 2, off + 2 + n);
+      // 主机名必须是**白名单字符**，不是"没坏字节就行"。
+      //
+      // 这个字符串下游会被 proxyip.js 逐字插进发往第三方 http-connect 中继的**裸
+      // HTTP 请求**。TextDecoder 是非致命的：CR/LF 原样通过，于是
+      // "a.example\r\nx-injected: pwned\r\n\r\nGET /evil:443 HTTP/1.1" 就能把那条
+      // 请求劈成两条 —— 对池里任何 http-connect 型中继都是实打实的请求拆分。
+      //
+      // 真正的域名只会用到这些字符（IDN 进来时已是 punycode，同样是 ASCII），
+      // 所以白名单不会误伤正常目标；而控制字符、空格、CR/LF 一并出局。
+      for (const byte of raw) {
+        const ok =
+          (byte >= 0x61 && byte <= 0x7a) || // a-z
+          (byte >= 0x30 && byte <= 0x39) || // 0-9
+          byte === 0x2d || // -
+          byte === 0x2e || // .
+          byte === 0x5f; // _ （部分内网服务确实用）
+        if (!ok) return null;
+      }
+      addr = new TextDecoder().decode(raw).toLowerCase();
       len = 4 + n;
       break;
     }
