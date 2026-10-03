@@ -89,6 +89,21 @@ func TestTunnels(t *testing.T) {
 	if got := cfg.TunnelsValue(); got != 0 {
 		t.Errorf("unset tunnels = %d, want 0 (caller falls back to the built-in default)", got)
 	}
+
+	// 写了 0 必须与"没写"区分得开：0 是无效配置，cmd 层要报错退出。
+	// TunnelsValue 两者都返回 0，真正的判别靠 Tunnels 指针是否为 nil。
+	writeConfig(t, `{"server":"a.example","password":"p","tunnels":0}`)
+	cfg, _, err = Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Tunnels == nil {
+		t.Error(`"tunnels":0 must parse as "written", not as "absent" — otherwise it ` +
+			"silently becomes the default instead of being rejected")
+	}
+	if cfg.TunnelsValue() != 0 {
+		t.Errorf("tunnels = %d, want 0", cfg.TunnelsValue())
+	}
 }
 
 // 未知字段不报错：老配置文件里带 latencyToleranceMs 也要能读（只是被忽略），

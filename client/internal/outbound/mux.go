@@ -40,9 +40,10 @@ type MuxConn struct {
 	// 每条连接一生约 30 次出站建连）。这不是故障——不计入节点失败，并值得
 	// 立刻在后台把下一条连接备好，避免下一波请求（浏览器一次开几十条流）
 	// 全挤在重连的关键路径上。
-	recycled atomic.Bool
+	recycled    atomic.Bool
+	selfTrimmed atomic.Bool // 由上层主动的空闲回收关闭（区别于服务端预算回收）
 	// onDead 在传输终止时回调（planned=true 表示服务端主动回收）。
-	onDead func(planned bool)
+	onDead func(planned, selfTrimmed bool)
 	// onIdle 在最后一条流结束时回调（空闲信号，用于回收多余隧道）。
 	onIdle func()
 	// ping/pong 判死（PRD §4.6）：30s 一发，连续 2 个周期没 Pong 判死。
@@ -109,9 +110,25 @@ func NewMuxConn(ws *websocket.Conn, password string) *MuxConn {
 
 func (m *MuxConn) Alive() bool { return m.alive.Load() }
 
+// MarkPlanned 把这条传输标成"主动关闭、不是坏了"，再由调用方关掉它。
+//
+// 为什么需要：onDead 的 planned=true 与 false 走的是完全不同的两条路 ——
+// planned=false 会被记成一次节点失败。空闲回收、服务端预算回收、进程退出，
+// 这些**我们自己要它死**的情况都不该让节点背锅：攒够 nodeFailLimit 次之后好
+// 节点会被误判死（noteSuccess 只清计数、不清 dead），而这个误伤是永久的。
+func (m *MuxConn) MarkPlanned() { m.recycled.Store(true) }
+
+// MarkSelfTrimmed 把"空闲回收主动关掉这条隧道"这件事也标出来。
+//
+// 为什么要和 MarkPlanned 分开：两者都不该算节点失败，但只有空闲回收**不该触发
+// 补齐**。服务端预算回收之后马上补一条是对的（那是设计好的续命点）；空闲回收
+// 之后马上补一条则会把"空闲期收缩到一条"原样抵消 —— 关掉一条、再建一条、
+// 隧道数没变、额度没省，还多付一次握手和一次 DO 创建。
+func (m *MuxConn) MarkSelfTrimmed() { m.selfTrimmed.Store(true) }
+
 // OnDead 注册传输终止回调（planned=true = 服务端主动预算回收，非故障）。
 // 回调在独立 goroutine 里触发，不要在里面做阻塞操作。
-func (m *MuxConn) OnDead(fn func(planned bool)) { m.onDead = fn }
+func (m *MuxConn) OnDead(fn func(planned, selfTrimmed bool)) { m.onDead = fn }
 
 // LiveCount 返回当前活跃流数（诊断用）。
 func (m *MuxConn) LiveCount() int {
@@ -320,7 +337,7 @@ func (m *MuxConn) kill(cause error) {
 	}
 	_ = m.ws.Close()
 	if m.onDead != nil {
-		go m.onDead(m.recycled.Load())
+		go m.onDead(m.recycled.Load(), m.selfTrimmed.Load())
 	}
 }
 

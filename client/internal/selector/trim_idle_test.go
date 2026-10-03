@@ -98,6 +98,16 @@ func TestTrimIdleDropsSurplusMux(t *testing.T) {
 		t.Fatalf("live count = %d, want 2", p.liveCount())
 	}
 
+	// 第一条上留一条开着的流：它不能被回收，于是唯一可能被回收的是第二条。
+	//
+	// （两条都空着的话，谁先到计时器谁走 —— attach 现在会给没有流的隧道也排计时器，
+	// 这正是"备用隧道也能收缩"的代价：这条用例必须把另一条按住。）
+	hold, err := m0.Open("example.com:443")
+	if err != nil {
+		t.Fatalf("open stream on mux 0: %v", err)
+	}
+	defer hold.Close()
+
 	// 在第二条隧道上开一条流再关掉：最后一条流结束 → 空闲 → 应被回收
 	st, err := m1.Open("example.com:443")
 	if err != nil {

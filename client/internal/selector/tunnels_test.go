@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -94,6 +96,15 @@ func TestIdleTrimDelayFromConfig(t *testing.T) {
 	p.attach(0, m0)
 	p.attach(1, m1)
 
+	// m0 上留一条**开着**的流：它不能被回收，于是唯一可能被回收的就是 m1。
+	// （两条都空着的话，谁先到计时器谁走，这条用例就变成掷硬币 —— attach 现在
+	// 会为没有流的隧道也排计时器，正是为了让"备用隧道"也能收缩。）
+	hold, err := m0.Open("example.com:443")
+	if err != nil {
+		t.Fatalf("open stream on mux 0: %v", err)
+	}
+	defer hold.Close()
+
 	st, err := m1.Open("example.com:443")
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
@@ -153,10 +164,13 @@ func TestWarmupRetriesAfterFailedDial(t *testing.T) {
 
 	// 前两次升级被拒（TLS 握手照常成功，失败点在 HTTP 层，与"边缘回 403"同形），
 	// 第三次放行。
-	var upgrades int
+	//
+	// 计数用原子量而不是普通 int：处理函数跑在 httptest 自己的 goroutine 上，
+	// 而失败时要在测试 goroutine 里读它。用普通 int 的话，这条用例自己就是一个
+	// 数据竞争 —— 而 CI 里正好有一道 -race 的门会把它揪出来。
+	var upgrades atomic.Int32
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrades++
-		if upgrades <= 2 {
+		if upgrades.Add(1) <= 2 {
 			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 			return
 		}
@@ -181,6 +195,118 @@ func TestWarmupRetriesAfterFailedDial(t *testing.T) {
 	}
 	if p.liveCount() < 1 {
 		t.Fatalf("no tunnel after the first failures were served (upgrades=%d): "+
-			"warm-up gives up instead of retrying", upgrades)
+			"warm-up gives up instead of retrying", upgrades.Load())
+	}
+}
+
+// TestConcurrentDialStaysWithinTarget 钉住"请求路径也要守名额"。
+//
+// 背景：58ffc12 修了预热路径的超发，却漏了请求路径 —— `Pool.Dial` 直接调 redial，
+// 完全不经过 warming 计数。断线瞬间上层同时涌进十几条连接、池又是空的，于是每个
+// 请求各拨一条：实测 muxTarget=2 时池里能出现 6 条。每条常连隧道都按 DO 时长
+// 计费，正是免费版最紧张的那笔额度。
+func TestConcurrentDialStaysWithinTarget(t *testing.T) {
+	srv := miniWSTLS(t)
+	defer srv.Close()
+	host, port := srvAddr(t, srv)
+
+	p := New(Config{
+		Nodes:     repeatNodes(host, port, 8),
+		SNI:       "example.com",
+		Password:  "pw",
+		Insecure:  true,
+		MuxTarget: 2,
+	})
+	defer p.Close()
+
+	// 池是空的 —— 这正是会超发的时刻。八个请求一起进来。
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := p.Dial("example.com:443")
+			if err == nil {
+				_ = c.Close()
+			}
+		}()
+	}
+	wg.Wait()
+
+	deadline := time.Now().Add(3 * time.Second)
+	var n int
+	for time.Now().Before(deadline) {
+		n = p.liveCount()
+		if n > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n > 2 {
+		t.Errorf("live tunnels = %d for a target of 2: the request path is not counting "+
+			"its dials, so a burst of connections multiplies the DO time bill", n)
+	}
+}
+
+// TestIdleTrimActuallyShrinksThePool 钉住"空闲回收真的会收缩隧道数"。
+//
+// 这是一条对着文档写的测试。`limitations.md` 与代码注释一直写着"空闲期收缩到
+// 一条"，而实际行为是：回收 -> Close -> onDead -> 无条件 TopUp -> 立刻补一条回来。
+// 隧道数没变、额度没省，还多付一次握手和一次 DO 创建 —— 一项纯亏的额度保护。
+//
+// 现在的契约：空闲回收之后不补齐；要扩容由请求路径自己说（排进队列 = 需求超了）。
+//
+// 对端必须是**真的能拨通**的：否则"补齐的那次拨号失败"，池看起来缩了，而补齐
+// 路径有没有被真正掐断根本没被验证到 —— 第一版就栽在这里，变异测试一跑才发现
+// 这条用例压根抓不住它要抓的东西。
+func TestIdleTrimActuallyShrinksThePool(t *testing.T) {
+	srv := miniWSTLS(t)
+	defer srv.Close()
+	host, port := srvAddr(t, srv)
+
+	p := New(Config{
+		Nodes:         repeatNodes(host, port, 4),
+		SNI:           "example.com",
+		Password:      "pw",
+		Insecure:      true,
+		MuxTarget:     2,
+		IdleTrimDelay: 40 * time.Millisecond,
+	})
+	defer p.Close()
+
+	p.Warm()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && p.liveCount() < 2 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if p.liveCount() < 2 {
+		t.Fatalf("warm-up produced %d tunnels, want 2", p.liveCount())
+	}
+
+	// 两条都还没接过流（备用状态），等第一条被空闲回收，然后盯住**之后**的峰值。
+	//
+	// 断峰值而不是断最后一刻的值：如果补齐没被掐断，池子会在 1 和 2 之间来回抖
+	// （回收 -> 补一条 -> 新的那条再被回收），只看最后一刻有大约一半的运气落在 1。
+	// 峰值是稳定的判据：补齐一旦发生，200ms 内就会把数字顶回 2。
+	firstTrim := time.Now().Add(5 * time.Second)
+	for time.Now().Before(firstTrim) && p.liveCount() > 1 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if p.liveCount() > 1 {
+		t.Fatal("idle trimming never fired")
+	}
+
+	settle := time.Now().Add(1200 * time.Millisecond)
+	for time.Now().Before(settle) {
+		if n := p.liveCount(); n > 1 {
+			t.Fatalf("live tunnels = %d after the pool had shrunk to 1: trimming is being "+
+				"undone by an immediate refill, so it saves no DO time quota while still "+
+				"costing a handshake and a Durable Object each round", n)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := p.liveCount(); n < 1 {
+		t.Errorf("live tunnels = %d: the last tunnel was reaped too, leaving the client "+
+			"unable to browse without a reconnect", n)
 	}
 }

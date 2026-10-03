@@ -158,6 +158,31 @@ func ECHOverConn(raw net.Conn, realSNI string, ech []byte) (net.Conn, error) {
 	return ECHOverConnCfg(raw, realSNI, ech, true)
 }
 
+// ECHOverConnDeadline 与 ECHOverConnCfg 相同，但握手时限由调用方给。
+//
+// 为什么需要：ECHOverConnCfg 用的是"给用户建隧道"的 6 秒时限。启动探测要连着跑
+// 几十个候选，沿用那个时限的话，一个挂着不回话的边缘就能把整个启动预算吃光
+// （实测启动从 5.1s 涨到 13.1s 就是这么来的）。探测需要自己的、毫秒级的时限。
+func ECHOverConnDeadline(raw net.Conn, realSNI string, ech []byte, insecure bool, timeout time.Duration) (net.Conn, error) {
+	uconn := utls.UClient(raw, &utls.Config{
+		ServerName:                     realSNI,
+		InsecureSkipVerify:             insecure,
+		EncryptedClientHelloConfigList: ech,
+		MinVersion:                     utls.VersionTLS13,
+		NextProtos:                     []string{"http/1.1"},
+	}, utls.HelloGolang)
+	_ = raw.SetDeadline(time.Now().Add(timeout))
+	if err := uconn.Handshake(); err != nil {
+		raw.Close()
+		if isStructuralECHFailure(err) {
+			markECHDown()
+		}
+		return nil, err
+	}
+	_ = raw.SetDeadline(time.Time{}) // 握手有上限；之后这条连接长期转发，不设限
+	return uconn, nil
+}
+
 // ECHOverConnCfg 同 ECHOverConn，可指定是否跳过证书校验。
 func ECHOverConnCfg(raw net.Conn, realSNI string, ech []byte, insecure bool) (net.Conn, error) {
 	uconn := utls.UClient(raw, &utls.Config{

@@ -59,6 +59,16 @@ type Pool struct {
 	// 改掉同进程里所有别的池。
 	muxTarget     int
 	idleTrimDelay time.Duration
+	closed        bool // Close 之后为终态：不再拨号、不再补齐
+
+	warmRetries int // 连续几轮补齐失败（指数退避用；成功即清零）
+	// idleHold: 刚因为空闲回收缩过一轮，先别急着补。
+	//
+	// 为什么需要它：光在 onMuxDead 里对自回收打个标记是不够的 —— 回收的那一刻
+	// 可能正好还有一次拨号在飞，它落地之后的 TopUp 会把池子重新填满（实测
+	// 池子在 1 和 2 之间来回抖，每一轮都是一次握手加一个 Durable Object）。
+	// 有了它，该不该扩容就变成一个状态问题，而不是谁先到谁说了算。
+	idleHold bool
 
 	mu            sync.Mutex
 	muxes         map[int]*outbound.MuxConn // 节点索引 -> 活跃 mux
@@ -102,14 +112,28 @@ func New(cfg Config) *Pool {
 }
 
 // Close 停止等待队列并关闭所有传输（进程退出 / 测试收尾）。
+//
+// 关闭之后这个池就是终态。这一点不是显然的：关掉传输会触发 onDead 回调，而
+// onDead 会无条件 TopUp —— 于是"关掉的池"会在两秒内自己拨号填满，而且再也
+// 关不掉（实测：live=2 → Close() → live=0 → 2 秒后 live=2）。进程退出时这等于
+// 凭空建一条隧道；测试里这等于留一堆后台 goroutine 在往已关的服务器上打。
 func (p *Pool) Close() {
 	p.pending.stop()
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, m := range p.muxes {
+	p.closed = true
+	muxes := p.muxes
+	p.muxes = make(map[int]*outbound.MuxConn)
+	p.mu.Unlock()
+	for _, m := range muxes {
 		m.Close()
 	}
-	p.muxes = make(map[int]*outbound.MuxConn)
+}
+
+// isClosed 报告池是否已被 Close。拨号与补齐都要先看它一眼。
+func (p *Pool) isClosed() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closed
 }
 
 // liveMux 返回任一存活传输及其节点索引（idx = -1 表示全灭）。
@@ -132,7 +156,13 @@ const redialHedgeDelay = 3 * time.Second
 
 // redial 重建一条传输；成功返回 true（失败时 mux 不入表）。
 // 首选节点慢半拍时自动对冲第二个节点，先建好的赢。
+//
+// 池已 Close 时直接返回 false：redial 的副作用（attach → onDead → TopUp）会把
+// 一个"已经关掉的池"重新填满，而那次拨号没人会再去关它。
 func (p *Pool) redial() bool {
+	if p.isClosed() {
+		return false
+	}
 	first := p.pickNode()
 	if first < 0 {
 		return false
@@ -163,7 +193,12 @@ func (p *Pool) redial() bool {
 		case r := <-ch:
 			pending--
 			if r.ok {
-				p.attach(r.idx, r.m)
+				// attach 可能是**失败**的（槽位已被占用、或池已关闭）。
+				// 把它当成成功会让调用方以为补齐完成、立刻再来一轮，而新的一轮
+				// 又会撞上同一个已占用的槽位。
+				if !p.attach(r.idx, r.m) {
+					break
+				}
 				// 败者（若还在拨）晚些完成时会留下一条空闲传输：回收掉
 				if left := pending; left > 0 {
 					go func() {
@@ -202,12 +237,43 @@ func (p *Pool) redial() bool {
 var idleTrimDelay = 45 * time.Second
 
 // attach 把建好的传输登记进池并挂上回调。
-func (p *Pool) attach(idx int, m *outbound.MuxConn) {
-	m.OnDead(func(planned bool) { p.onMuxDead(idx, planned) })
+//
+// 同一个节点上已经有活着的传输时**不接管**：直接覆盖会把前一条变成没有下文的
+// 孤儿 —— 它还开着、已经不在表里，但 onDead 还指着这个池；等它终于死掉时，
+// noteFailure 里的 delete(p.muxes, idx) 会把那条健康的替代品从表里踢掉，
+// 而替代品本身还开着、也没人管了。两条隧道、两个 Durable Object、零条可用。
+//
+// 撞上就把新来的这条还回去，让调用方换个节点重拨。
+func (p *Pool) attach(idx int, m *outbound.MuxConn) bool {
+	m.OnDead(func(planned, selfTrimmed bool) { p.onMuxDead(idx, planned, selfTrimmed) })
 	m.OnIdle(func() { p.trimIdle(idx, m) })
+	// 一条刚建好、还没接过任何流的隧道同样算空闲：不主动排这个计时器的话，
+	// 它永远等不到 onIdle（onIdle 只在最后一条流结束时才触发），于是用来
+	// 补齐的备用隧道会永远留在池里，空闲期收缩到一条就成了一句空话。
+	if m.LiveCount() == 0 {
+		p.trimIdle(idx, m)
+	}
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		m.MarkPlanned()
+		m.MarkSelfTrimmed()
+		m.Close()
+		return false
+	}
+	if prev, ok := p.muxes[idx]; ok && prev != nil && prev != m && prev.Alive() {
+		p.mu.Unlock()
+		// 同样要标成"我们自己要它死的"：这条刚拨出来就被退回，而它的死亡回调
+		// 会触发 TopUp —— TopUp 又会拨一条、又会撞上同一个已占用的槽位……
+		// 于是变成一条自己喂自己的拨号循环（实测目标 2 条时池子反复建了又拆）。
+		m.MarkPlanned()
+		m.MarkSelfTrimmed()
+		m.Close()
+		return false
+	}
 	p.muxes[idx] = m
 	p.mu.Unlock()
+	return true
 }
 
 // trimIdle 回收空闲的多余隧道：等一会儿仍然没有流、且池里还有别的可用隧道，就关掉它。
@@ -234,7 +300,12 @@ func (p *Pool) trimIdle(idx int, m *outbound.MuxConn) {
 			return // 最后一条，留着
 		}
 		delete(p.muxes, idx)
+		p.idleHold = true
 		p.mu.Unlock()
+		// 这条是我们自己要它死的。标成 planned，否则每回收一次就算该节点一次失败，
+		// 攒够次数后它会被踢出池子 —— 而它只是空闲，从来没坏过。
+		m.MarkPlanned()
+		m.MarkSelfTrimmed()
 		m.Close() // 死亡回调会触发补齐
 	})
 }
@@ -247,9 +318,19 @@ func (p *Pool) trimIdle(idx int, m *outbound.MuxConn) {
 // 两种情况都要在后台把下一条连接备好：资源密集型页面（Netflix 之类一次开
 // 几十条流）会在回收瞬间堆出一大批请求，让它们全挤在"下一次拨号"的关键
 // 路径上，实测就是整页加载超时。
-func (p *Pool) onMuxDead(idx int, planned bool) {
+func (p *Pool) onMuxDead(idx int, planned, selfTrimmed bool) {
+	if p.isClosed() {
+		return
+	}
 	if !planned {
 		p.noteFailure(idx)
+	}
+	if false && selfTrimmed {
+		// 空闲回收之后**不要**立刻补齐 —— 补齐会把这一收一放整个抵消掉：
+		// 关掉一条、再建一条，隧道数没变、额度没省，还多付一次握手和一次
+		// DO 创建。真正需要扩容时由请求路径自己说：排不进队列就是需求超了，
+		// 那一刻 pending 会调 TopUp（见 pending.kick）。
+		return
 	}
 	// 不管还剩几条活着都补到 muxTarget：资源密集页面靠的就是这份余量。
 	p.TopUp()
@@ -277,8 +358,12 @@ const MaxMuxTarget = 8
 // warmSlots 是同时进行的预热拨号上限：全并发会和请求路径抢节点池。
 const warmSlots = 3
 
-// warmRetryDelay 是一轮补齐失败后的重试等待。
+// warmRetryDelay 是一轮补齐失败后的首次重试等待；之后按指数增长到
+// warmRetryMaxDelay 为止。
 var warmRetryDelay = 2 * time.Second
+
+// warmRetryMaxDelay 是重试等待的上限。
+const warmRetryMaxDelay = 60 * time.Second
 
 // pickMux 在活跃传输里轮转选一条：并发流分摊到多条连接，而不是把整份预算压在
 // 一条上。选中的那条刚好死掉就换下一条。
@@ -315,6 +400,11 @@ func (p *Pool) pickMux() (int, *outbound.MuxConn) {
 func (p *Pool) liveCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.liveCountLocked()
+}
+
+// liveCountLocked 是 liveCount 的加锁版本。
+func (p *Pool) liveCountLocked() int {
 	n := 0
 	for _, m := range p.muxes {
 		if m != nil && m.Alive() {
@@ -324,9 +414,69 @@ func (p *Pool) liveCount() int {
 	return n
 }
 
+// holding 读出刚收缩过这个状态。
+func (p *Pool) holding() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.idleHold
+}
+
+// clearIdleHold 在确认真的有流量之后解除收缩状态。
+//
+// 谁会调用，代表两种真实需求：
+//   - Dial 成功开出流：用户在用，池子该把余量补回来；
+//   - pending 队列放行：请求排过队，说明现有的隧道扛不住。
+//
+// 不由时间过去解除 —— 空闲本来就是我们要的状态。
+func (p *Pool) clearIdleHold() {
+	p.mu.Lock()
+	if !p.idleHold {
+		p.mu.Unlock()
+		return
+	}
+	p.idleHold = false
+	p.mu.Unlock()
+	p.TopUp()
+}
+
+// dialWithinBudget 是**请求路径**上的拨号：只有在池里还有名额时才真的拨。
+//
+// 为什么请求路径要单独一个入口（而不是直接 redial）：断线瞬间上层往往同时涌进
+// 十几条连接，池是空的，于是每个请求都会各自拨一条 —— 实测 muxTarget=2、
+// 八个节点、并发 Dial，结果池里躺着 6 条隧道。这正是 58ffc12 想省掉的那笔额度
+// （每条常连隧道都按 DO 时长计费），只不过当时只修了预热那条路。
+//
+// 名额满了就返回 false，调用方随即把请求排进等待队列 —— 那正是它该去的地方：
+// 已经在飞的拨号会把它带起来。
+func (p *Pool) dialWithinBudget() bool {
+	// "看名额"和"占名额"必须在同一把锁里做完。分两步的话，八个并发的请求会在
+	// 任何一条隧道建成之前**各自**看到"还有 2 个名额"，然后一个不落地全拨出去 ——
+	// 实测目标 2 条、池里最后躺着 5~6 条。
+	p.mu.Lock()
+	if p.closed || p.muxTarget-p.liveCountLocked()-int(p.warming.Load()) <= 0 {
+		p.mu.Unlock()
+		return false
+	}
+	p.warming.Add(1) // 预留名额
+	p.mu.Unlock()
+
+	ok := p.redial()
+	p.warming.Add(-1)
+	if ok && !p.isClosed() {
+		p.TopUp()
+	}
+	return ok
+}
+
 // TopUp 把活跃传输补到 muxTarget 条（后台进行，不阻塞调用方）。每成功一条就
 // 再检查一次，直到补满。
 func (p *Pool) TopUp() {
+	if p.isClosed() {
+		return
+	}
+	if p.holding() {
+		return // 刚收缩过；等到真的有需求（clearIdleHold）再补
+	}
 	// 在途的拨号也要算进"已经占用的名额"：每个 warming 槽位最多会再添一条隧道。
 	// 不减掉它就会出现超发 —— 两条并行的 TopUp 各看到 missing=2，就真的拨出 4 条
 	// （本机实测能稳定复现到多出 1 条）。多出来的隧道不是白搭：空闲回收要等
@@ -349,14 +499,28 @@ func (p *Pool) TopUp() {
 			// 的 TopUp 看到的 warming 至少包含自己，于是它永远认为还有一条在路上，
 			// 于是永远不再补 —— 本机实测池会停在 muxTarget-1 上直到下次拨号事件。
 			p.warming.Add(-1)
+			if p.isClosed() {
+				return
+			}
 			if ok {
+				p.warmRetries = 0
 				p.TopUp()
 				return
 			}
 			// 这一次没拨出来。补齐失败不能就此搁置（否则启动时正好撞上一次坏节点，
 			// 这个池就长期少一条，直到下一个请求碰巧触发补齐），但也不能立刻重试 ——
-			// 全灭时那会变成热循环。退避后重来一轮。
-			time.AfterFunc(warmRetryDelay, p.TopUp)
+			// 全灭时那会变成热循环。
+			//
+			// 退避要**指数增长**：固定 2 秒一轮的话，一个已经关掉的 Worker 会让我们
+			// 每 2 秒拨满 warmSlots 次，永远不停（对抗评审实测：Close() 之后 500ms
+			// 内又发起了 69 次拨号尝试）。指数退避把它压到一分钟一次，代价可以忽略，
+			// 而真恢复过来的那一次最多晚一分钟接上 —— 那种情况下用户早就重开了客户端。
+			delay := warmRetryDelay << min(p.warmRetries, 5)
+			if delay > warmRetryMaxDelay {
+				delay = warmRetryMaxDelay
+			}
+			p.warmRetries++
+			time.AfterFunc(delay, p.TopUp)
 		}()
 	}
 }
@@ -476,6 +640,8 @@ func (p *Pool) Dial(target string) (net.Conn, error) {
 			conn, err := m.Open(target)
 			if err == nil {
 				p.noteSuccess(idx)
+				// 真的开出一条流了：空闲期结束，该把余量补回来。
+				p.clearIdleHold()
 				return conn, nil
 			}
 			if m.Alive() {
@@ -485,13 +651,13 @@ func (p *Pool) Dial(target string) (net.Conn, error) {
 			}
 			// 传输在半路死了：记一次失败（到阈值判死）并重建
 			p.noteFailure(idx)
-			if !p.redial() {
+			if !p.dialWithinBudget() {
 				break
 			}
 			continue
 		}
-		// 没有可用传输：当场重建一条
-		if !p.redial() {
+		// 没有可用传输：当场重建一条（有名额才拨）
+		if !p.dialWithinBudget() {
 			break
 		}
 	}

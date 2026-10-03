@@ -116,7 +116,13 @@ func (d *dialPending) kick() {
 			if attempt > 0 {
 				time.Sleep(backoffFor(attempt))
 			}
-			ok := d.pool.redial()
+			// 先问"是不是已经有隧道了"，再问"要不要再拨一条"。
+			//
+			// 顺序反了会白等：请求排进队列是因为那一刻没有可用传输，而与它并发的
+			// 另一个请求很可能已经建好了一条。此时若只盯着"拨号成功"才放行，
+			// 队列会一直等到退避超时 —— 实测目标 2 条时，八个并发请求要等 10 秒，
+			// 而隧道从头到尾都是活的，只是名额满了不需要再拨。
+			ok := d.pool.liveCount() > 0 || d.pool.dialWithinBudget()
 			if ok {
 				d.mu.Lock()
 				d.attempt = 0
@@ -127,6 +133,9 @@ func (d *dialPending) kick() {
 				for _, req := range queued {
 					req.settle(nil)
 				}
+				// 排过队 = 需求确实超过了现有隧道扛得住的范围，这也是把池补回
+				// muxTarget 的正确时机（空闲期刚回收过隧道时不会误触发）。
+				d.pool.clearIdleHold()
 				return
 			}
 			d.mu.Lock()

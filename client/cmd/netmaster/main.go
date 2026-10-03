@@ -51,12 +51,18 @@ func passwordDefault(cfg config.Config) string {
 	return strings.TrimSpace(os.Getenv("PASSWORD"))
 }
 
-// tunnelDefault 返回 -tunnels 的缺省值：配置里写了就用它，否则是 selector 的
-// 内置默认。0 会让 selector 用它自己的缺省，但命令行帮助里要印出真实数字，
-// 所以这里就补齐。
+// tunnelDefault 返回 -tunnels 的缺省值：配置里**写了**就用它，否则用 selector
+// 的内置默认。
+//
+// 这里必须判 nil 而不是判值：`{"tunnels": 0}` 和 `{"tunnels": -3}` 都是写了，
+// 且都是无效配置，应该被后面的校验报错退出。之前写成 `n > 0` 时它们会静默变成
+// 4 条隧道 —— 用户以为自己配了 0（等于"别开隧道"），实际跑的是 4 条。
+//
+// 补齐到真实数字还有另一个理由：命令行帮助里要印出缺省值，用户才知道
+// 自己填的 2 是"少一半"而不是"随便一个数"。
 func tunnelDefault(cfg config.Config) int {
-	if n := cfg.TunnelsValue(); n > 0 {
-		return n
+	if cfg.Tunnels != nil {
+		return *cfg.Tunnels
 	}
 	return selector.DefaultMuxTarget
 }
@@ -410,15 +416,23 @@ func cmdServe(args []string) {
 	}
 	logger.Printf("rules: %d entries (%s, skipped %d lines)", router.Size(), router.Source(), router.SkippedLines())
 	pr := <-probed
-	if pr.Rejected > 0 {
-		// 这条要印出来：它对应的症状是"时好时坏"，而边缘不会告诉我们为什么。
-		// 有具体数字，用户报障时至少知道问题出在候选集而不是本机网络。
-		logger.Printf("[probe] %d entries -> %d nodes in %s (%d entry IPs rejected the WebSocket upgrade)",
-			len(all), len(pr.Nodes), pr.ProbeTook.Round(time.Millisecond), pr.Rejected)
-	} else {
-		logger.Printf("[probe] %d entries -> %d nodes in %s", len(all), len(pr.Nodes), pr.ProbeTook.Round(time.Millisecond))
-	}
+	// 两段耗时分别印出来：启动慢的时候，"哪一段慢"和"慢多少"才是能据此动手的信息，
+	// 一句"探测用了 10 秒"只会让人干瞪眼。
+	logger.Printf("[probe] %d entries -> %d nodes in %s (tcp %s, tls %s, ws upgrade %s, %d entry IPs refused)",
+		len(all), len(pr.Nodes), pr.ProbeTook.Round(time.Millisecond),
+		pr.ScreenTook.Round(time.Millisecond), pr.TLSTook.Round(time.Millisecond),
+		pr.UpgradeTook.Round(time.Millisecond), pr.Rejected)
 	nodes := pr.Nodes
+	// 被拒的入口明细只在显式要求时打：正常启动的用户不需要知道这些，
+	// 而排障的人需要能整段贴出来（"这些 IP 为什么不行"没有别的来源）。
+	if os.Getenv("NETMASTER_PROBE_DEBUG") != "" {
+		for _, e := range pr.TLSErrors {
+			logger.Printf("[probe] tls failed %s", e)
+		}
+		for _, r := range pr.Refused {
+			logger.Printf("[probe] refused %s:%d — %s", r.Node.Addr, r.Node.Port, r.Err)
+		}
+	}
 
 	pool := selector.New(selector.Config{
 		Nodes:    nodes,
