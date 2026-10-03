@@ -145,6 +145,31 @@ func (d *dialPending) kick() {
 	}()
 }
 
+// wake 在"传输已就绪"时立刻放行队列，不必等下一次轮询。
+//
+// 调用方是 Pool.attach —— 那是唯一确切的"一条传输刚刚可用"时刻。没有它的话，
+// 排队的请求要等 kick 循环的下一轮（退避 1s→2s→4s…，最坏能等到 wait 的 10s 超时），
+// 而这段时间里隧道明明已经好了。
+func (d *dialPending) wake() {
+	if d.pool.liveCount() == 0 {
+		return
+	}
+	d.mu.Lock()
+	if d.stopped || len(d.queue) == 0 {
+		d.mu.Unlock()
+		return
+	}
+	queued := d.queue
+	d.queue = nil
+	d.attempt = 0
+	d.mu.Unlock()
+	for _, req := range queued {
+		req.settle(nil)
+	}
+	// 排过队 = 需求超过了现有隧道扛得住的范围，这也是把池补回 muxTarget 的时机。
+	d.pool.clearIdleHold()
+}
+
 // stop 终止队列：所有等待者立即失败。
 func (d *dialPending) stop() {
 	d.mu.Lock()

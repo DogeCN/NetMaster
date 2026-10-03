@@ -205,7 +205,17 @@ func (p *Pool) redial() bool {
 
 	pending := 1
 	hedged := false
-	hedgeTimer := time.NewTimer(redialHedgeDelay)
+	// 冷启动（池里一条可用传输都没有）时**立刻**对冲，不等那 3 秒。
+	//
+	// 3 秒的对冲延迟是为"首选节点慢半拍"这种日常情形定的：正常情况下已经有别的
+	// 传输在跑，慢一点无所谓。但冷启动没有"慢半拍"可言 —— 第一条传输就是用户能不能
+	// 上网的分界线，而启动时往往只有服务端域名解析出的两三个候选，坏窗口里首选那个
+	// 可能正被阻断（实测挂着 TCP 拖死 TLS）。此时再等 3 秒纯属白等。
+	hedgeDelay := redialHedgeDelay
+	if p.liveCount() == 0 {
+		hedgeDelay = 0
+	}
+	hedgeTimer := time.NewTimer(hedgeDelay)
 	defer hedgeTimer.Stop()
 	for {
 		select {
@@ -292,6 +302,12 @@ func (p *Pool) attach(idx int, m *outbound.MuxConn) bool {
 	}
 	p.muxes[idx] = m
 	p.mu.Unlock()
+	// 新传输挂上了：立刻叫醒等待队列里的请求。
+	//
+	// 队列本身是轮询的（退避 1s→2s→…），而 wait 只等 pendingTimeout(10s) ——
+	// 于是"隧道其实已经好了、请求还在等下一轮轮询"是纯浪费。挂载是唯一确切的
+	// "有传输可用"时刻，在这里叫醒最省。
+	p.pending.wake()
 	return true
 }
 
@@ -772,28 +788,6 @@ func (p *Pool) Dial(target string) (net.Conn, error) {
 	return nil, errNoUsableExit
 }
 
-// dialNode 建立节点 idx 的 mux 并在其上打开 target。
-func (p *Pool) dialNode(idx int, target string) (net.Conn, error) {
-	p.mu.Lock()
-	m, ok := p.muxes[idx]
-	p.mu.Unlock()
-	if ok && m.Alive() {
-		if conn, err := m.Open(target); err == nil {
-			return conn, nil
-		}
-	}
-	m, err := p.dialMux(idx)
-	if err != nil {
-		return nil, err
-	}
-	p.attach(idx, m)
-	conn, err := m.Open(target)
-	if err != nil {
-		return nil, err
-	}
-	return conn, nil
-}
-
 // shouldDirect 给出该域名的直连先验：已学习的粘性 > geoip 判断（PRD：出口 IP
 // 稳定——同域一会儿直连一会儿代理会让按 IP 判定的登录态失效）。
 func (p *Pool) shouldDirect(host string) bool {
@@ -974,32 +968,34 @@ func (p *Pool) noteFailureLocked(idx int) {
 	}
 }
 
-// Verify 建立一次真实的传输层验证（TLS+WS+首帧认证）。部署是否健康，
-// 这一条是最直接的回答。
-func (p *Pool) Verify() (string, error) {
-	nodes := p.Nodes() // 快照：候选表可能被 AddNodes 追加
-	if len(nodes) == 0 {
-		return "", fmt.Errorf("selector: no nodes")
-	}
-	// 首流目标是 www.google.com:443：M0 实测（m0-findings.md E6/E7）平台禁拨 80
-	// 端口、example.com 已迁 CF 网段，两者任占一条这个验证都会被出口层拒绝。
-	// 443 + 非 CF 目标是直连路径上唯一稳定的组合；建流成功即同时验证了
-	// 传输层（TLS+WS+认证）与出站路径。
-	//
-	// 依次试前 3 个节点（按探测延迟排序）：单节点抽样会把"恰好分到一个坏 IP"
-	// 报成 tunnel failed，而浏览实际是好的——误报比不报更吓人。
-	var lastErr error
-	for i := 0; i < 3 && i < len(nodes); i++ {
-		if _, err := p.dialNode(i, "www.google.com:443"); err != nil {
-			lastErr = err
-			continue
+// VerifyOnLive 用**已经建好的**传输做端到端验证：传输层（TLS+WS+认证）由预热完成，
+// 这里验的是"出口真的能把流送出去"（M0 E6/E7：443 + 非 CF 目标才是稳定组合）。
+//
+// 与 Verify 的区别是**它自己不拨号**。Verify 会串行试最多 3 个节点，而坏窗口里一个
+// 挂着的 IP 能耗满拨号超时（实测 6s 级）—— 于是"预热"要等它试完才开始，而预热才是
+// 让用户请求能用上的那件事（最坏实测 18s 白白串在关键路径上）。这里改成等预热的
+// 结果：谁先建好就用谁，等待有上限。
+func (p *Pool) VerifyOnLive(target string, wait time.Duration) (string, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		if idx, m := p.liveMux(); m != nil {
+			conn, err := m.Open(target)
+			if err == nil {
+				_ = conn.Close()
+				return p.nodeAt(idx).Addr, nil
+			}
+			// 流被拒（0x01-0x03）是服务端裁决，换传输也是同一裁决，直接报出来。
+			if m.Alive() {
+				p.noteFailure(idx)
+				return "", err
+			}
+			p.noteFailure(idx)
 		}
-		return nodes[i].Addr, nil
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("selector: no live transport within %s", wait)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("selector: no nodes tried")
-	}
-	return "", lastErr
 }
 
 // Nodes 返回节点列表的**快照**（诊断用）。

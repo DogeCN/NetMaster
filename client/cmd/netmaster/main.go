@@ -599,8 +599,13 @@ func cmdServe(args []string) {
 				logger.Printf("entries: community gave nothing (%s); staying on server DNS", src)
 				return
 			}
-			pr := selector.Optimize(context.Background(), extra, host, cfg.InsecureEnabled())
-			added := pool.AddNodes(pr.Nodes)
+			// 直接进池，**不等探测**。
+			//
+			// 探测（TCP 筛查 + TLS + WS 升级）与"拨一条 mux"验的是同一件事，而后者
+			// 是必须付的成本：池子的拨号本来就带失败记忆（noteFailure → 判死 → 换一个）。
+			// 先探测一遍等于把这段成本串行付两次，代价是"候选已知"到"有可用传输"之间
+			// 白等两三秒 —— 而这段等待正好压在用户的第一个请求上。
+			added := pool.AddNodes(extra)
 			logger.Printf("entries: +%d from community (%s), pool now %d", added, src, pool.Len())
 			if tr != nil {
 				tr.FactInt("entries", pool.Len())
@@ -686,8 +691,17 @@ func cmdServe(args []string) {
 	// ClientHello 被 RST，其他域名正常），这是"连不上"的头号原因，失败时
 	// 直接把方向指给用户。
 	go func() {
+		// 先预热，再验证 —— 顺序是有代价的，不能反。
+		//
+		// 预热（TopUp）是"让请求能用"的那件事：它并行对冲拨号、建好的传输立刻挂进池子，
+		// 用户请求马上就能用上。而 Verify 只是"这个部署健不健康"的提示行。
+		// 原先是 Verify 在前，而它串行试最多 3 个节点、每个都可能耗满拨号超时
+		// （坏窗口实测 6s 级）—— 于是预热被硬生生推迟十几秒，首个请求只能干等。
+		// 现在改成：预热先跑，验证等它的结果（VerifyOnLive 不自己拨号）。
+		pool.Warm()
+
 		endVerify := tr.Begin("tunnel.verify", 10*time.Second)
-		if node, err := pool.Verify(); err != nil {
+		if node, err := pool.VerifyOnLive("www.google.com:443", 10*time.Second); err != nil {
 			endVerify()
 			tr.Mark("tunnel.failed", err.Error())
 			logger.Printf("tunnel failed: %v", err)
@@ -702,13 +716,6 @@ func cmdServe(args []string) {
 			tr.Mark("tunnel.ok", "via "+node)
 			logger.Printf("tunnel established via node %s", node)
 		}
-		// 补齐其余传输：每条连接的服务端建连预算约 30 次，资源密集页面一次
-		// 开 50+ 条流，单条连接必然中途被回收。多备几条把并发余量摊开。
-		//
-		// Verify 失败也要预热：Verify 只是"这个部署能不能连通"的提示，不该当闸门。
-		// 早先把它当闸门时，一次偶发的握手失败会让整轮零预热，首个请求只能付
-		// 一次十几秒的冷拨号（实测表现为首屏超时 + 一条 "proxy tunnel dead"）。
-		pool.Warm()
 	}()
 
 	waitForSignal()
