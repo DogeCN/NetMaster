@@ -101,3 +101,31 @@ jobs:
             exit 0
           fi
           printf '%s' "$PASSWORD_VALUE" | npx wrangler secret put PASSWORD
+
+      # 部署闸门：没有非 workers.dev 的自定义域就直接判失败。
+      #
+      # 为什么必须自动化：实测（PRD A10）*.workers.dev 在大陆被 SNI 阻断，客户端
+      # 连不上，而 workers.dev 也不发布 ECH 配置、客户端的 ECH 兜底无从启用。绑
+      # 自定义域是纯手工步骤，忘了就会"部署成功、大陆用户全部连不上"——而"部署成功"
+      # 这一项本身发现不了它。这一步把那个纯靠人记的项变成自动断言。
+      - name: Require a custom domain (mainland reachability gate)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" \
+            > domains.json
+          node -e '
+            const d = JSON.parse(require("fs").readFileSync("domains.json", "utf8"));
+            if (!d.success) { console.error("::error::Cloudflare API said failure: " + JSON.stringify(d.errors)); process.exit(1); }
+            const hosts = (d.result || []).map((r) => r.hostname).filter(Boolean);
+            console.log("worker domains: " + (hosts.join(", ") || "(none)"));
+            const custom = hosts.filter((h) => !h.endsWith(".workers.dev"));
+            if (!custom.length) {
+              console.error("::error::no custom domain bound. *.workers.dev is SNI-blocked in mainland China (PRD A10): mainland clients cannot connect at all.");
+              console.error("::error::bind one: Cloudflare dashboard -> Workers & Pages -> netmaster -> Settings -> Domains & Routes -> Add Custom Domain");
+              process.exit(1);
+            }
+            console.log("gate ok: " + custom.join(", "));
+          '

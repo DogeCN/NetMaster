@@ -94,9 +94,10 @@ integration/proxyip/race/router，带 `cloudflare:*` shim）→ 五平台 `go ve
 - [ ] Release 页面有 **7 个资产**：`_worker.js`、`wrangler.toml`、
       `netmaster-windows-amd64.exe`、`netmaster-linux-amd64`、`netmaster-linux-arm64`、
       `netmaster-darwin-amd64`、`netmaster-darwin-arm64`；
-- [ ] Release notes 是英文、包含"部署要看 KV 占位符"的说明（见 `.assist/C5.md` 的
-      notes 初稿；`release.yml` 里的模板若仍是中文，用
-      `gh release edit v0.2.0 --notes-file <英文稿>` 覆盖）。
+- [ ] Release notes 是英文、且包含"部署前要把 KV 占位符换成真实 id"的说明。
+      `release.yml` 不生成 notes，发布后手动补：
+      `gh release edit <tag> --notes-file <英文稿>`。
+      （判据自包含，不引用任何会话产物——`.assist/` 已不入库。）
 
 ## 4. 部署后验证（打 tag 之后再做一遍）
 

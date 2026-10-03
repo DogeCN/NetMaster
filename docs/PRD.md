@@ -642,8 +642,15 @@ M6 文档与部署脚本 一键部署脚本在全新账号跑通；README 快速
   - **learn 时机按类型分**：`http-connect` 的 CONNECT 2xx 即端到端验证，开流即 learn；
     `sni` 的 TCP 成功不构成验证（盲转发也能连），**隧道首字节到达才 learn**，3 秒
     首字节宽限超时则丢弃。正文的"成功路径写回 Router DO"自此才真正成立。
-  - 连带修掉一个隐藏雷：`session.js` 使用 `RELAY_TYPE_HTTP_CONNECT` 却从未 import——
-    首次路由命中会 ReferenceError（此前因 learn 恒 false 从未执行到）。
+  - 连带修掉一个**比 learn 惰性严重得多**的缺陷：`session.js` 使用
+    `RELAY_TYPE_HTTP_CONNECT` 却从未 import（`5d3f7e8` 引入，v0.2.0 的产物里仍在）。
+    ReferenceError 发生在比较表达式求值上，不在 learn 那一行，所以**竞速成功的每一条
+    ProxyIP 出口都会抛**（`race.type` 为 `undefined` → `undefined || "sni"` 取到 `"sni"` 后
+    求值右操作数即炸），且抛出点在 socket 建好之后、函数返回之前 ⇒ **socket 泄漏**（不回不关，
+    白烧子请求额度），调用链上没有任何 catch，客户端拿不到任何状态帧，只能等拨超时。
+    而按 E6/E7 能被 ProxyIP 服务的恰好只有 CF 承载目标，也就是全部外网目标。
+    （`v0.2.0` / `v0.2.1` / `v0.2.2` / `v0.2.3` 四个已发布 tag 的产物都含这个缺陷，
+    `a1bdf3e` 起修复。）
 - 单测：race 套件新增 winner携带 type / KV type 保留 / 未知 type 丢弃 / router hit 带
   type 四组断言。
 
@@ -694,3 +701,29 @@ M6 文档与部署脚本 一键部署脚本在全新账号跑通；README 快速
   首屏几十条并行子资源）时，10 秒内可能加载不完——同一页面预热后 2.4~3.7 秒通过，
   curl 单请求 0.76~2.3 秒通过，日志无任何隧道层错误。瓶颈是**单个公共 SNI 中继的并发
   吞吐**，不是连接可靠性。按 A7，自建 `http-connect` 中继（docs/relay.md）是根治手段。
+
+## A12. 第三轮审计核实与回应（A7）
+
+- 日期：2026-10-03。基线 `7be3278`（v0.2.4 发布前）。
+- **接受并更正**：A7 指出我在 A9 里把 `RELAY_TYPE_HTTP_CONNECT` 缺失 import 的后果写成
+  "learn 惰性"，实际是**每次 ProxyIP 出口都抛 ReferenceError**（比较表达式求值即炸，
+  socket 泄漏，调用链无 catch）。A9 已按此改写，并补记该缺陷存在于 v0.2.0–v0.2.3 四个
+  已发布 tag 的产物中（`a1bdf3e` 起修复）。
+- **不成立（已核实）**：A7 §4.4 认为 `refresh-relays.yml` / `acceptance.yml` 的 push 触发
+  "每次 push 都烧 Actions 分钟"。两者都有 `paths` 过滤：前者只在工作流文件本身变化时跑，
+  后者只在 `server/src/**`、`client/internal/outbound|selector/**` 等相关文件变化时跑。
+  今天的 push 触发 acceptance 正是因为改了 `server/src/session.js`。
+- **前提有误（已核实官方文档）**：A7 §4.2/§4.3 认为多隧道会把"DO 时长计费 ×4"。查
+  developers.cloudflare.com/durable-objects/platform/limits（2026-10-03）：**免费计划不按
+  duration 计费**，免费版限请求数/存储/CPU。所以成本不在账单上。但 pending timer 阻止
+  休眠这件事本身仍然成立（E4/E9），只是后果是"该休眠时没休眠"而非账单。§10 与
+  `limitations.md` 已补 DO duration 行并写明这一区分。
+- **已实施**：① `deploy.yml` 部署后强制校验存在非 `workers.dev` 的自定义域，没有就 fail
+  （A7 §4.1 的"靠人记就会漏"变成自动断言）；② 客户端空闲 45 秒后回收多余隧道、只留 1 条，
+  抵消多隧道的常驻成本（突发期的 4 条余量不受影响）；③ `release-checklist.md` 对已删除的
+  `.assist/C5.md` 的引用改为自包含判据（`.assist/` 不入库，引用必然失效）；④ 正文表名
+  `routes` → `routes_v2` 对齐实现。
+- **接受但本轮未做**：185 秒判死定时器改用 DO Alarm（需要跨 DO 的活跃隧道计数才能正确
+  分档空闲窗口，改动面比"客户端回收"大得多，且 Alarm 化后空闲会话从 185 秒变成 5 分钟才
+  关，驻留时间反而更长——属于产品取舍，不该顺手改）。当前策略：客户端在空闲期主动收缩，
+  等价效果由 `idleTrimDelay` 承担。

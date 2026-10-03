@@ -43,6 +43,8 @@ type MuxConn struct {
 	recycled atomic.Bool
 	// onDead 在传输终止时回调（planned=true 表示服务端主动回收）。
 	onDead func(planned bool)
+	// onIdle 在最后一条流结束时回调（空闲信号，用于回收多余隧道）。
+	onIdle func()
 	// ping/pong 判死（PRD §4.6）：30s 一发，连续 2 个周期没 Pong 判死。
 	lastPong atomic.Int64
 	pingOnce sync.Once
@@ -198,8 +200,18 @@ func (m *MuxConn) Open(target string) (net.Conn, error) {
 func (m *MuxConn) remove(id uint32) {
 	m.mu.Lock()
 	delete(m.streams, id)
+	empty := len(m.streams) == 0
 	m.mu.Unlock()
+	// 最后一条流结束：通知上层"我闲下来了"。空闲是多条隧道里最该被回收的那条
+	// ——服务端那侧的判死定时器会一直挂着阻止 DO 休眠（m0 E4/E9），空闲期全程
+	// 按 DO 时长计费，而突发流量期的并发余量只在有流量时才有意义。
+	if empty && m.onIdle != nil {
+		go m.onIdle()
+	}
 }
+
+// OnIdle 注册"最后一条流结束"的回调（用于回收多余的空闲隧道）。
+func (m *MuxConn) OnIdle(fn func()) { m.onIdle = fn }
 
 // writeOrdered 发开帧；若本连接还没发过首帧，则这次发首帧（连接级认证 +
 // 打开该流）。串行化保证并发 Open 时首帧只发一次且排最前。

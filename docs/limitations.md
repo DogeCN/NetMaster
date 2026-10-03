@@ -54,6 +54,7 @@
 | Router DO 条目 TTL | 1 小时 | `router.js` `ROUTE_TTL_MS` |
 | Router DO flush | 攒 5 秒或 50 条 | `router.js` |
 | 中继池刷新周期 | 每小时左右（GH Actions `schedule`） | `refresh-relays.yml` |
+| 并发隧道条数 / 空闲回收 | 4 条 / 45 秒 | `selector` `muxTarget` / `idleTrimDelay` |
 | 中继池探测：并发 / 超时 / 候选上限 | 8 / 3 秒 / 60 | `tools/refresh-relays.mjs` |
 | 客户端入口候选上限 | 64 | `main.go` `maxEntries` |
 | 客户端社区源等待上限 | 3 秒 | `main.go` `resolveEntries` |
@@ -73,6 +74,7 @@
 | SQLite 行写（免费版） | 100k 行/日 | 主要来源是 Router DO flush：同一 target 只留最新一条（`RouteQueue` 按 hash 去重），个人规模无压力 |
 | SQLite 行读（免费版） | 5M 行/日 | 每未命中流 1 读，会话级缓存摊薄 |
 | SQLite 存储 | 单 DO 10 GB；账户总计免费版 5 GB | 只存目标哈希（不含域名），用量 < 1 MB |
+| DO duration（GB-秒） | **免费计划不按 duration 计费**（该计费维度只存在于付费计划）。免费版按请求数/存储/CPU 限：单 DO 1000 req/s（软限）、CPU 默认 30s/请求（可配 5 分钟）、alarm handler 15 分钟墙上时间 | 空闲隧道的代价落在请求数与 CPU 上，不是账单。但服务端那个 185 秒判死定时器是 pending timer、会阻止 DO 休眠（m0 E4/E9），所以客户端在空闲期把多余隧道收掉、只留 1 条（`selector` 的 `idleTrimDelay`） |
 | KV 读 | ~10 ms、最终一致 | 竞速读 `proxyip:top`（每未命中流一次，不在每条流的路径上）；写入侧是 GH Actions 每小时一次，不占 Worker 配额 |
 | GH Actions 托管 runner | 私有仓库 2000 分钟/月（免费版），公开仓库免费 | 中继池刷新每轮约 1 分钟（含 checkout/setup-node），每小时一轮 ≈ 720 分钟/月 |
 
