@@ -28,9 +28,17 @@ const FIRST_BYTE_GRACE_MS = 3000;
 // 会话级出口缓存上限：只为省掉同连接内的重复查询，不是状态。
 const EGRESS_CACHE_MAX = 512;
 
-// CONNECT_BUDGET 是本会话一生允许的出站建连次数（耗尽后回收换新预算）。
-// 低于平台 50 子请求/调用的硬上限：直连路径 1 次 connect，DNS 未命中再 +1 DoH。
-const CONNECT_BUDGET = 30;
+// CONNECT_BUDGET 是本会话一生允许的**子请求**数（耗尽后回收换新预算）。
+//
+// 单位是子请求而不是"建连次数"：DO 之间的 fetch 与 connect 同池计费（m0 E8 的
+// 实测口径就是"fetch + connect"成对消耗），所以 Router DO 的 lookup/learn/forget
+// 也必须计入，否则真实消耗会显著高于计数，优雅回收来不及救、平台硬失败先到。
+//
+// 取 20 而不是更高：一次"新目标"的典型开销是 1 次 lookup + 1~2 次 connect
+// （竞速错峰，通常首个槽就赢）+ 1 次 learn ≈ 3~4 次子请求；20 的计数上限对应
+// 最坏约 40 次，留 10 次余量给 DoH、KV 调试写入等零散开销，稳稳落在平台的
+// 50 子请求/调用之内。
+const CONNECT_BUDGET = 20;
 
 class SessionDO {
   constructor(state, env) {
@@ -46,7 +54,7 @@ class SessionDO {
     this.closedIds = new Set(); // 近期已关流：迟到数据帧按原样丢弃，不误解析成开帧
     this.egress = new Map(); // target_hash -> { host, port }：本连接内的出口亲和
     this.directFailed = new Set(); // 直连被平台拒绝的目标（hash），本连接内不再重试
-    this.connectCount = 0; // 本激活期已消耗的出站连接数（≈子请求预算）
+    this.connectCount = 0; // 本激活期已消耗的子请求数（connect 与 DO fetch 都计）
     this.idleTimer = null;
     this.draining = false; // 预算见底且仍有在途流：等它们跑完再回收
     this.lastActivity = 0;
@@ -281,6 +289,7 @@ class SessionDO {
     const stub = this.routerStub(hash);
     if (!stub) return null;
     try {
+      this.charge("router/lookup");
       const res = await stub.fetch(`https://router/lookup?hash=${hash}`);
       if (!res.ok) return null;
       const row = await res.json();
@@ -301,9 +310,19 @@ class SessionDO {
     this.routerWrite(hash, "/forget", { hash });
   }
 
+  // charge 记一次子请求消耗（connect 与 DO fetch 同池）。Router DO 缺席时
+  // 不计——那次调用根本不会发生。
+  charge(what) {
+    this.connectCount++;
+    if (this.connectCount >= CONNECT_BUDGET) {
+      this.log(`subrequest budget ${this.connectCount} reached (last: ${what}), recycling session`);
+    }
+  }
+
   routerWrite(hash, path, body) {
     const stub = this.routerStub(hash);
     if (!stub) return;
+    this.charge(`router${path}`);
     stub
       .fetch(`https://router${path}`, {
         method: "POST",
@@ -356,9 +375,10 @@ class SessionDO {
     // 页面（Netflix 首屏 50+ 条流）必然撞到预算线，当场 close 会把正在传输的
     // 响应全部腰斩，浏览器整页失败重试；排空后这些流正常完成，客户端在下一条
     // 新流时才用上重连好的新连接（客户端有多条连接轮转，见 selector 的 muxTarget）。
-    if (++this.connectCount >= CONNECT_BUDGET) {
-      this.log(`connect budget ${this.connectCount} reached, recycling session`);
-      console.error(`[exit] budget recycled after ${this.connectCount} connects`);
+    this.charge("connect");
+    if (this.connectCount >= CONNECT_BUDGET) {
+      this.log(`subrequest budget ${this.connectCount} reached, recycling session`);
+      console.error(`[exit] budget recycled after ${this.connectCount} subrequests`);
       if (this.streams.size > 0) {
         this.draining = true;
         this.log(`draining ${this.streams.size} in-flight stream(s) before recycle`);

@@ -2,6 +2,10 @@
 server/_worker.js
 client/netmaster.exe
 client/netmaster
+# go build -o 在 Windows 上覆盖一个正在运行的 exe 时会先把它改名成 exe~，
+# 失败/被占用就留下这个残骸。它和 serve.lock 是同一类问题：12 MB 的构建残骸
+# 挂在被跟踪目录里，`git status` 就不干净，发布清单第 1 项过不了。
+client/netmaster.exe~
 server/node_modules/
 .wrangler/
 
@@ -12,6 +16,11 @@ server/wrangler.deploy.toml
 
 # 客户端配置可能含口令，不进版本库
 config.json
+
+# serve 的单实例锁文件。锁路径 = 与实际加载的 config.json 同目录（config.LockPath），
+# 开发态配置就在 client/ 里，不忽略的话一个 12 字节的 {"pid":N} 就会出现在
+# `git status --short` 里 —— 而发布清单第 1 项的判据正是"git status 无输出"。
+serve.lock
 
 # 凭据。wrangler.toml 要进版本库 —— 里面只有占位符，真实 KV namespace id 由
 # deploy 工作流解析后改写；真正的秘密走 GitHub Secrets 与 `wrangler secret put`。
@@ -33,3 +42,5 @@ refresh-relays.log
 
 # ZCode 本地工作区文件（顶部区块自动同步自 .gitignore，入库只会产生噪音）
 .zcodeignore
+serve.lock
+dom.json

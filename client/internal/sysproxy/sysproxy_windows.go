@@ -5,9 +5,11 @@ package sysproxy
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -213,13 +215,34 @@ func CleanupStale() (bool, error) {
 	if !ok {
 		return false, nil // 无状态文件，正常
 	}
-	if st.OwnerPID > 0 && processAlive(st.OwnerPID) {
+	if st.OwnerPID > 0 && processAlive(st.OwnerPID) && proxyListening(st.ProxyAddr) {
 		return false, nil // 活跃实例的接管状态，不是残留
 	}
 	if err := Restore(); err != nil {
 		return true, err
 	}
 	return true, nil
+}
+
+// proxyListening 报告记录的代理地址上是否真的还有人在听。
+//
+// 为什么需要这个判据：CleanupStale 原本只看"owner 进程是否存活"。但 owner 可以
+// 还活着、监听却已经没了 —— listener 建失败、srv.Close 已执行、进程卡在收尾、
+// 或者被人从调试器里detach。实测就撞到过这个组合：owner 进程在、watchdog 因为
+// "owner 还活着"拒绝还原，于是系统代理一直指向一个没人监听的端口（浏览器全废），
+// 而看门狗就在旁边看着。判断"是否在服务"比判断"是否在运行"更贴近要解决的问题。
+//
+// 用一次短超时 TCP 连接来探：连得上就说明有 accept 循环在。
+func proxyListening(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	c, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
 }
 
 func loadState() (savedState, bool) {

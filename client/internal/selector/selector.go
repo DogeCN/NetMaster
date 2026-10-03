@@ -163,12 +163,50 @@ func (p *Pool) redial() bool {
 	}
 }
 
-// attach 把建好的传输登记进池并挂上死亡回调。
+// idleTrimDelay 是"空闲多久之后把这条多余隧道收掉"的等待。
+//
+// 为什么需要：服务端每条连接都有一个 185 秒的判死定时器，而它是 pending timer
+// （会阻止 DO 休眠，m0 E4/E9），空闲期按 DO 时长计费（免费版有额度，但不是无限的）。
+// 并发余量只在**有流量**时才有价值：突发期保持 muxTarget 条，空闲期收缩到 1 条。
+// 变量而非常量：测试要把它降到毫秒级来断言回收行为（见 trim_idle_test.go）。
+var idleTrimDelay = 45 * time.Second
+
+// attach 把建好的传输登记进池并挂上回调。
 func (p *Pool) attach(idx int, m *outbound.MuxConn) {
 	m.OnDead(func(planned bool) { p.onMuxDead(idx, planned) })
+	m.OnIdle(func() { p.trimIdle(idx, m) })
 	p.mu.Lock()
 	p.muxes[idx] = m
 	p.mu.Unlock()
+}
+
+// trimIdle 回收空闲的多余隧道：等一会儿仍然没有流、且池里还有别的可用隧道，就关掉它。
+// 只剩最后一条时留着——否则客户端会陷入"必须重连才能上网"的状态。
+func (p *Pool) trimIdle(idx int, m *outbound.MuxConn) {
+	time.AfterFunc(idleTrimDelay, func() {
+		if m.LiveCount() > 0 {
+			return // 又来流量了
+		}
+		p.mu.Lock()
+		cur, ok := p.muxes[idx]
+		if !ok || cur != m {
+			p.mu.Unlock()
+			return // 已经换掉了
+		}
+		others := 0
+		for i, mm := range p.muxes {
+			if i != idx && mm != nil && mm.Alive() {
+				others++
+			}
+		}
+		if others == 0 {
+			p.mu.Unlock()
+			return // 最后一条，留着
+		}
+		delete(p.muxes, idx)
+		p.mu.Unlock()
+		m.Close() // 死亡回调会触发补齐
+	})
 }
 
 // onMuxDead 传输终止时的处理。

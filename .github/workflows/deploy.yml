@@ -117,15 +117,25 @@ jobs:
             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" \
             > domains.json
           node -e '
-            const d = JSON.parse(require("fs").readFileSync("domains.json", "utf8"));
+            const fs = require("fs");
+            const d = JSON.parse(fs.readFileSync("domains.json", "utf8"));
             if (!d.success) { console.error("::error::Cloudflare API said failure: " + JSON.stringify(d.errors)); process.exit(1); }
-            const hosts = (d.result || []).map((r) => r.hostname).filter(Boolean);
-            console.log("worker domains: " + (hosts.join(", ") || "(none)"));
-            const custom = hosts.filter((h) => !h.endsWith(".workers.dev"));
+            // 必须按 service（Worker 名）过滤：该端点返回**账户下全部 Worker** 的
+            // 自定义域，不过滤的话账户里任意别的 Worker 绑了域名就能让闸门假通过
+            // ——正好是它被造出来防的那个失败模式。
+            const worker = process.env.WORKER_NAME;
+            const mine = (d.result || []).filter((r) => r.service === worker);
+            console.log("worker domains for " + worker + ": " +
+              (mine.map((r) => r.hostname).join(", ") || "(none)"));
+            const custom = mine
+              .map((r) => r.hostname)
+              .filter((h) => h && !h.endsWith(".workers.dev"));
             if (!custom.length) {
-              console.error("::error::no custom domain bound. *.workers.dev is SNI-blocked in mainland China (PRD A10): mainland clients cannot connect at all.");
-              console.error("::error::bind one: Cloudflare dashboard -> Workers & Pages -> netmaster -> Settings -> Domains & Routes -> Add Custom Domain");
+              console.error("::error::no custom domain bound to this Worker. *.workers.dev is SNI-blocked in mainland China (PRD A10): mainland clients cannot connect at all.");
+              console.error("::error::bind one: Cloudflare dashboard -> Workers & Pages -> " + worker + " -> Settings -> Domains & Routes -> Add Custom Domain");
               process.exit(1);
             }
             console.log("gate ok: " + custom.join(", "));
           '
+        env:
+          WORKER_NAME: netmaster

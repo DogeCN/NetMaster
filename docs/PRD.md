@@ -391,14 +391,15 @@ docs/m0-findings.md）。所有实测结论已回写本表；架构按附录修�
 限制 现状 应对
 并发出站连接 【M0 实测 E2】DO 内 12 条并发 connect() 全部成功，"每请求 6 条"限制不适用于 DO 内 TCP socket 6 槽位竞速保留为预算控制而非性能上限
 connect() 禁连 CF IP 段、localhost、私网、端口 25；无 UDP 出站；禁回连自身（TCP Loop）；【M0 实测 E3】IPv6 出站不支持（IPv6 字面量与 NAT64 合成地址一律立即失败）→ NAT64 出口无法实现，需从架构中移除；【M0 实测 E6】80 端口一律禁拨（与目标是否域名、是否 CF 网段无关）；【M0 实测 E7】E6/E7 拒绝的错误文案相同，区分只能靠自行解析比对网段 ProxyIP 兜底成为 CF 承载目标的唯一出口；客户端私网强制 Direct；refresh-relays 剔除回指条目；直连路径先 DoH 解析再逐 IP 拨号（判定点在 IP 层）；验收目标一律 443 + 非 CF 托管
-免费版每日 100k 请求 【M0 实测 E1】WS 消息按 ≈1:1 计入请求，未观察到 20:1 折算（出站帧可能同样计费）mux 只省建连不省消息量；协议层吝啬帧数：数据帧尽量满 64KB、心跳只走 WS 协议层 Ping（不产生 DO 消息）
+免费版每日 100k 请求 【A8 更正 E1 措辞】pricing 页脚注：20:1 折算**只作用于 billing**，DO 的 analytics/指标反映实际用量 —— E1 在 analytics 桶里看不到折算是必然的，不能据此断言"平台没有折扣"。**限额按 billing 单位还是按实际请求执行，官方页未写明**。应对不变（帧尽量满 64KB、心跳走协议层 Ping）mux 只省建连不省消息量；协议层吝啬帧数：数据帧尽量满 64KB、心跳只走 WS 协议层 Ping（不产生 DO 消息）
 脚本体积 1 MB（压缩） v0.2.0 产物 _worker.js ≈ 59 KB，余量充足
 DO WS 接收消息 32 MiB 单帧 ≤ 64 KB（主动设计约束）
 SQLite 行写 免费版 100k 行/日；主要来源：Router DO flush 个人规模无压力
 SQLite 行读 免费版 5M 行/日；每未命中流 1 读（会话级缓存摊薄） 余量充足
-SQLite 存储 单 DO 10 GB；账户总存储免费版 5 GB NetMaster 用量（< 1 MB）远低于限档
-子请求 【M0 实测 E8】每 invocation 50 个（免费版），一条活跃 WS 会话是一次长驻 invocation —— 实际是"每条连接一生"的总额度（实测第 26 对 fetch+connect 耗尽）DNS 进程内缓存（TTL 5min）；直连失败记忆（本连接内）；成功建连 30 次后 close(1000,"budget") 优雅断开，客户端重连换新预算（客户端重连退避 + 等待队列是该机制成立的前提）
+SQLite 存储 A8 更正：免费版单 DO **1 GB**、账户总存储 5 GB（10 GB 是付费版数字） NetMaster 用量（< 1 MB）远低于限档
+子请求 【M0 实测 E8】A8 更正记账单位：DO 之间的 fetch 与 connect 同池计费，服务端按"子请求"记账（`session.js` 的 `charge()`：connect 与 router lookup/learn/forget 都计，阈值 20，对应最坏约 40 次、留 10 次余量）。每 invocation 50 个（免费版），一条活跃 WS 会话是一次长驻 invocation —— 实际是"每条连接一生"的总额度（实测第 26 对 fetch+connect 耗尽）DNS 进程内缓存（TTL 5min）；直连失败记忆（本连接内）；成功建连 30 次后 close(1000,"budget") 优雅断开，客户端重连换新预算（客户端重连退避 + 等待队列是该机制成立的前提）
 CPU Worker 10ms/请求；DO 30s/消息（未单独复核） 隧道逻辑落在 DO 内，I/O 密集
+DO duration（GB-秒） A8 更正：此前写"免费计划不按 duration 计费"是错的。**免费计划有额度 13,000 GB-s/日**（付费 400,000 GB-s/月）；按 pricing 页系数（1 秒 DO 时间 = 0.128 GB-s）≈ **28.2 DO·小时/天**，超额**该类操作硬失败**。且"能进入休眠的空闲 DO 不计 duration" ⇒ 阻止休眠（E4/E9）就是实打实烧额度 客户端空闲 45s 回收多余隧道（`selector` 的 `idleTrimDelay`）；`muxTarget=4` 在重度浏览时 4 条并行占用，逼近上限时降到 2 是一行改动
 DO 休眠与出站 socket 【M0 实测 E4】有出站 socket 的 DO 不休眠（挂起 I/O 阻止休眠），socket 关闭后才可休眠；空闲 socket 由对端在数十秒内关闭 "休眠期间流保活"不成立也无需成立：零流空闲 WS 走 Hibernation 不驻留内存；每流死亡走 CLOSE 正常处理
 可观测性 【M0 实测 E9】DO 内的 console 输出在 wrangler tail 上完全不可见（worker 入口可见；DO 间 fetch 可见）诊断走 KV 通道（debug:lastExit）；"是否发生"查 KV 时间戳不查 tail；新增诊断默认写 KV 不写 console
 KV 读 ~10ms、最终一致 竞速候选（proxyip:top）与调试通道使用，不在每帧热路径
@@ -714,8 +715,7 @@ M6 文档与部署脚本 一键部署脚本在全新账号跑通；README 快速
   后者只在 `server/src/**`、`client/internal/outbound|selector/**` 等相关文件变化时跑。
   今天的 push 触发 acceptance 正是因为改了 `server/src/session.js`。
 - **前提有误（已核实官方文档）**：A7 §4.2/§4.3 认为多隧道会把"DO 时长计费 ×4"。查
-  developers.cloudflare.com/durable-objects/platform/limits（2026-10-03）：**免费计划不按
-  duration 计费**，免费版限请求数/存储/CPU。所以成本不在账单上。但 pending timer 阻止
+  developers.cloudflare.com/durable-objects/platform/limits（2026-10-03）：**免费计划有 duration 额度 13,000 GB-s/日**（≈28.2 DO·小时/天，超额硬失败），不是"不计费"。当时我只查了 limits 页（该页确实没有 duration 行）就下了结论。但 pending timer 阻止
   休眠这件事本身仍然成立（E4/E9），只是后果是"该休眠时没休眠"而非账单。§10 与
   `limitations.md` 已补 DO duration 行并写明这一区分。
 - **已实施**：① `deploy.yml` 部署后强制校验存在非 `workers.dev` 的自定义域，没有就 fail
@@ -727,3 +727,43 @@ M6 文档与部署脚本 一键部署脚本在全新账号跑通；README 快速
   分档空闲窗口，改动面比"客户端回收"大得多，且 Alarm 化后空闲会话从 185 秒变成 5 分钟才
   关，驻留时间反而更长——属于产品取舍，不该顺手改）。当前策略：客户端在空闲期主动收缩，
   等价效果由 `idleTrimDelay` 承担。
+
+## A13. 第四轮审计回应（A8）：一次"文档声称已实施、代码里没有"的自摆乌龙
+
+- 日期：2026-10-03，基线 `1937709` → 本节。
+- **认错（最重要的一条）**：`1937709` 的 commit message、A12 的"已实施 ②"、
+  `limitations.md` 两处都把"客户端空闲回收多余隧道"写成**已实施**，而代码里只有
+  `MuxConn.OnIdle` 这个 setter，**没有任何调用方**——`trimIdle` / `idleTrimDelay` 根本不存在。
+  这是本项目里第二次出现"文档承诺了代码没做的事"（上一次是 `architecture.md:55,59` 的 learn
+  承诺）。区别在于：上次是无意，这次是**作为对审计的回应写成"已实施"**，性质更差。
+  已接线并验证（`git grep idleTrimDelay` 现在命中代码；运行期观察到隧道数从 4 收缩）。
+- **接受并更正：免费版 duration 额度**。A12 写的"免费计划不按 duration 计费"是错的——
+  我当时只查了 limits 页（该页确实没有 duration 行）就下了结论。pricing 页写明
+  **免费版 13,000 GB-s/日**、付费版 400,000 GB-s/月，且"能休眠的空闲 DO 不计 duration"。
+  按该页自己的系数（1 秒 DO 时间 = 0.128 GB-s）≈ **28.2 DO·小时/天**，超额是**硬失败**
+  （该类操作开始报错），不是账单。§10 / `limitations.md` 已按真实数字更正。
+  由此重新评估 `muxTarget = 4`：重度浏览时 4 条并行会明显逼近额度——已把"降到 2 是一行改动"
+  写进文档，让这个取舍显式化，而不是埋在代码里。
+- **已修的真 bug**：
+  - `instlock_unix.go` 的 unlink-then-flock 竞态：flock 属于 fd，`Close()` 当场放锁而路径
+    仍链着旧 inode，此时 B 能拿到同一 inode 并成功 flock，随后我们 unlink 就删掉了 B 正在
+    持有的锁路径，C 再新建 inode 也能"成功" ⇒ 两个实例同时持锁、互相抢系统代理。
+    修法：unix 上**不删**锁文件（flock 语义下真正的互斥是内核的，残留文件只是面包屑）。
+  - `connectCount` 只数 `connect()`，漏了 Router DO 的 fetch（两者同池计费）：打 30 个不同
+    的 CF 托管目标时真实消耗可达 ~90，平台硬失败会**先于**我们设计的 `close(1000,"budget")`
+    到场。修：新增 `charge()` 统一记账（connect + router lookup/learn/forget），阈值降到 20
+    （对应最坏约 40 次，留 10 次余量给 DoH 与调试写入）。
+  - 部署闸门没按 Worker 名过滤：`GET /accounts/{id}/workers/domains` 返回**账户下全部
+    Worker** 的自定义域（实测响应含 `service` 字段），账户里任意别的 Worker 绑了域名就能让
+    闸门假通过——正好是它被造出来防的失败模式。已按 `service === <worker>` 过滤，并用真实
+    响应验证过正反两例。
+  - `serve.lock` 未 gitignore：锁文件与 config.json 同目录，开发态落在被跟踪的 `client/`
+    里，一个 12 字节运行时文件就能让发布清单"工作区干净"那一项不通过。已加 ignore 并删掉
+    当前残留。
+- **更正文档措辞**：免费版单 DO 存储是 **1 GB**（10 GB 是付费版数字），§10 与
+  `limitations.md` 都曾写成 10 GB；20:1 折算**只作用于 billing**，DO analytics 反映实际
+  用量，所以 E1 在 analytics 桶里看不到折算是必然的，不能据此断言"平台没有折扣"
+  （应对措施不变）。限额究竟按 billing 单位还是按实际请求执行，官方页未写明，标为未定论。
+- **闸门性质说清**：`deploy.yml` 的自定义域检查在 `wrangler deploy` **之后**，它是
+  **检测**（把同一个 commit 的 run 标红）而非**阻止**这次部署发生。失败路径是 fail-closed：
+  API 不可读或 token 无权限都会 exit 1，不会静默通过。

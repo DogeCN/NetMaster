@@ -34,11 +34,24 @@ type Config struct {
 	// 客户端总是用 server 域名做 SNI，边缘返回的就是该域名的正规证书，校验
 	// 应当通过；只有自建网关用自签证书等场景才需要显式设为 true。
 	Insecure *bool `json:"insecure,omitempty"`
+	// NoECH 关闭对"客户端→Worker"这条链路隐藏 SNI 的 ECH。缺省（不写）= 启用。
+	//
+	// 为什么需要这个开关：ECH 的兜底原先只挂在 TLS 层（TLS 失败才退普通 TLS）。
+	// 但 ECH 会让 TLS 握手成功、而后续的 HTTP 升级落到别的站点，边缘回一个非 101
+	// 响应 —— 那时 TLS 层看不出异常，"ECH 失败就退普通 TLS"的兜底救不了，只能靠
+	// 每次都退化成重试。留一个能关掉它的开关，线上出现"偶发 bad handshake"时
+	// 才有办法做对照实验。
+	NoECH *bool `json:"no-ech,omitempty"`
 }
 
 // InsecureEnabled 返回证书校验开关的生效值。nil 视为 false（校验开启）。
 func (c Config) InsecureEnabled() bool {
 	return c.Insecure != nil && *c.Insecure
+}
+
+// ECHDisabled 返回 ECH 开关的生效值。nil 视为 false（ECH 启用）。
+func (c Config) ECHDisabled() bool {
+	return c.NoECH != nil && *c.NoECH
 }
 
 // LockPath 返回 serve 单实例锁文件的路径：与实际加载的 config.json 同目录；

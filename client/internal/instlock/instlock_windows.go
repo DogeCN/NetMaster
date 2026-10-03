@@ -18,8 +18,14 @@ import (
 // 也没有 PID 复用带来的误判（PID 探测会把复用了死进程 PID 的新进程当成
 // 持有者，实测踩过）。锁文件只用来给用户展示持有者 PID，不参与互斥。
 //
-// 互斥体名默认全局（一台机器一个 serve）。测试用 NETMASTER_LOCK_NAME
-// 换独立名字，否则测试会被本机正在运行的 serve 卡死。
+// 作用域说明（别被"全局"两个字误导）：默认名带 `Local\` 前缀，那是**会话作用域**
+// —— 同一台机器上、同一个用户的不同登录会话（两个 RDP、控制台 + RDP 等）各自看到
+// 自己的命名空间，于是能同时"获取成功"。而系统代理写在 HKCU，是按用户共享的，
+// 所以两个会话会真抢。改用 `Global\` 需要 SeCreateGlobalPrivilege（普通用户默认
+// 没有），因此这不是一个能顺手改掉的 bug，现状是明确的已知限制：多会话场景下
+// 单实例保护不生效。
+//
+// 测试用 NETMASTER_LOCK_NAME 换独立名字，否则测试会被本机正在运行的 serve 卡死。
 func mutexName() string {
 	if v := os.Getenv("NETMASTER_LOCK_NAME"); v != "" {
 		return `Local\` + v

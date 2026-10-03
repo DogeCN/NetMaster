@@ -242,7 +242,7 @@ func cmdNodes(args []string) {
 	logger := log.New(os.Stdout, "", log.Ltime)
 	nodes, src := resolveEntries(context.Background(), host)
 	logger.Printf("entries: %d (community: %s)", len(nodes), src)
-	pool := selector.New(selector.Config{Nodes: nodes, SNI: host, Password: pw, UseECH: true, Insecure: cfg.InsecureEnabled()})
+	pool := selector.New(selector.Config{Nodes: nodes, SNI: host, Password: pw, UseECH: !cfg.ECHDisabled(), Insecure: cfg.InsecureEnabled()})
 
 	router, rerr := rules.LoadRules(context.Background(), rules.Overrides{}, "", nil)
 	if rerr != nil {
@@ -322,6 +322,7 @@ func cmdServe(args []string) {
 	server, password := connFlags(fs, cfg)
 	manual := fs.Bool("manual", cfg.Manual, "don't take over the system proxy, just print listen addrs (config.json: manual)")
 	rulesFile := fs.String("rules", cfg.Rules, "custom rules file (config.json: rules)")
+	noECH := fs.Bool("no-ech", cfg.ECHDisabled(), "disable ECH SNI hiding on the client->worker hop (config.json: no-ech)")
 	fs.Parse(args)
 	host, pw := requireConn(*server, passwordValue(password, cfg))
 
@@ -367,7 +368,7 @@ func cmdServe(args []string) {
 		Nodes:    nodes,
 		SNI:      host,
 		Password: pw,
-		UseECH:   true,
+		UseECH:   !*noECH,
 		// 缺省校验证书（config.json 可设 "insecure": true 关闭）。标准部署下
 		// SNI 就是 server 域名，边缘返回该域名的正规证书，校验应当通过；
 		// 校验失败属于真实攻击面，宁可连不上让用户看见，也不静默放行。
@@ -468,10 +469,14 @@ func cmdServe(args []string) {
 			}
 		} else {
 			logger.Printf("tunnel established via node %s", node)
-			// 补齐其余传输：每条连接的服务端建连预算约 30 次，资源密集页面一次
-			// 开 50+ 条流，单条连接必然中途被回收。多备几条把并发余量摊开。
-			pool.Warm()
 		}
+		// 补齐其余传输：每条连接的服务端建连预算约 30 次，资源密集页面一次
+		// 开 50+ 条流，单条连接必然中途被回收。多备几条把并发余量摊开。
+		//
+		// Verify 失败也要预热：Verify 只是"这个部署能不能连通"的提示，不该当闸门。
+		// 早先把它当闸门时，一次偶发的握手失败会让整轮零预热，首个请求只能付
+		// 一次十几秒的冷拨号（实测表现为首屏超时 + 一条 "proxy tunnel dead"）。
+		pool.Warm()
 	}()
 
 	waitForSignal()
