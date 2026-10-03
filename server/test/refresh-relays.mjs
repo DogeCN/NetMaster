@@ -119,15 +119,18 @@ async function run() {
   // 盲转发中继的判据；网络不可达时整段 SKIP。
   {
     const probe = await probeRelay({ host: "www.cloudflare.com", port: 443 }, { timeoutMs: 5000 });
-    const reachable = probe.ok === true || !/ENOTFOUND|EAI_AGAIN/.test(probe.error || "");
-    if (!probe.ok && !/certificate|ENOTFOUND|EAI_AGAIN|timeout/i.test(probe.error || "")) {
+    // 网络不可达的表现有多种：解析失败、超时、连接被重置。**超时必须算"不可达"**——
+    // 它同样意味着握手没完成，不能反过来断言"必须是证书错误"，否则在受限网络里
+    // （直连 cloudflare.com 常常超时）这一段恒红。
+    const netDown = /ENOTFOUND|EAI_AGAIN|timeout|ETIMEDOUT|ECONNRESET|EPIPE/i.test(probe.error || "");
+    if (!probe.ok && netDown) {
       console.log(`  SKIP: network unavailable (${probe.error})`);
     } else if (probe.ok) {
       ok(true, "real SNI relay (valid cert) -> usable", JSON.stringify(probe));
     } else {
       ok(/certificate/i.test(probe.error || ""), "bogus SNI (fallback cert) -> rejected", JSON.stringify(probe));
     }
-    ok(reachable !== undefined, "probe completes");
+    ok(typeof probe.ok === "boolean", "probe completes (ok is a boolean either way)");
     const rRefused = await probeRelay({ host: "127.0.0.1", port: 1 }, { timeoutMs: 1000 });
     ok(rRefused.ok === false, "closed port -> not usable", JSON.stringify(rRefused));
 
