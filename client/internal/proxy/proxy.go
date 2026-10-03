@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"netmaster/internal/profile"
 	"netmaster/internal/rules"
 )
 
@@ -48,6 +49,21 @@ type Config struct {
 	// RetryViaProxy 在"尝试性直连"被判定阻断后改用代理重连（见 relayWithReplay）。
 	// 默认走 Pool.RetryProxy；测试可注入替身。
 	RetryViaProxy func(host string) (net.Conn, error)
+	// DirectDial 分片直连重试时的拨号（见 tryFragmentedDirect）。
+	// 留空则用 net.DialTimeout；测试可注入替身。
+	DirectDial func(host string) (net.Conn, error)
+	// IsHTTPS 判定一个 CONNECT 目标是否走"首段探测 + 重放"。留空 = 只认 443。
+	//
+	// 为什么留这个口子：测试无法在 127.0.0.1 上占用 443，而这一整条链路（分片、
+	// 重放、改道）只在 HTTPS 上启用。没有它，端到端用例就只能去连真实的目标 ——
+	// 那是把单元测试变成网络测试。
+	IsHTTPS func(host string) bool
+	// Trace 分段耗时采集器。留空即不采集（internal/profile.Trace 的零值是
+	// nil，全部方法都是空操作），因此热路径上不需要任何 if。
+	//
+	// 装它的理由：改道与分片这些路径只在**出事时**才留下一行日志，成功的那次
+	// 完全不留痕迹。于是"正常情况到底花了多久"无从回答，而那恰恰是优化要看的地方。
+	Trace *profile.Trace
 	// Logger
 	Logger *log.Logger
 	// DialTimeout 单次建连超时
@@ -131,11 +147,21 @@ func (s *Server) Close() error {
 	return err
 }
 
+// aliveCounter 是"池里还有几个没被判死的节点"的可选能力面。selector.Pool 实现。
+//
+// 为什么用可选接口而不是加进 Exiter：Exiter 是导出契约，加方法会波及所有实现方；
+// 而这里的默认答案（退化成 Len()）对老实现是完全正确的老行为，类型断言拿不到就
+// 退回它，不需要任何人配合。proxy 里 FragDirecter 也是同一个套路。
+type aliveCounter interface {
+	Alive() int
+}
+
 // dial 按路由决策建连。
 //
 // 返回的 tentativeDirect 表示"这是一次尝试性的直连"：TCP 连上了，但不代表这个站
 // 真能直连（GFW 常在看到 TLS SNI 后才发 RST）。调用方应据此决定要不要走
-// relayWithReplay。规则明确要求直连的（比如局域网、.cn 名单）不算尝试性。
+// relayWithReplay。规则明确要求直连的（比如局域网、.cn 名单）不算尝试性 ——
+// 那是用户自己写的规则，失败就该失败，不由我们替他改道。
 func (s *Server) dial(host string) (conn net.Conn, tentativeDirect bool, err error) {
 	_, portStr, splitErr := net.SplitHostPort(host)
 	port := uint16(0)
@@ -150,20 +176,45 @@ func (s *Server) dial(host string) (conn net.Conn, tentativeDirect bool, err err
 	}
 	switch action {
 	case rules.Direct:
-		// 规则明确要求直连：不是"尝试性直连"，失败就直接失败（规则用户自己担责）。
 		c, derr := net.DialTimeout("tcp", host, s.cfg.DialTimeout)
 		return c, false, derr
 	default: // proxy
-		if s.cfg.Pool == nil || s.cfg.Pool.Len() == 0 {
+		if !s.hasUsableExit() {
 			if s.cfg.DirectFallback {
+				// 这条分支**就是**"尝试性直连"的定义：我们没有把握它通，
+				// 只是没有可用的出口了才退回来试。所以 tentativeDirect 必须为 true
+				// —— 否则调用方不会走 relayWithReplay，整条"被阻断→分片→改道"的
+				// 链路就一次都不会执行（这正是它此前一直惰性的原因）。
 				c, derr := net.DialTimeout("tcp", host, s.cfg.DialTimeout)
-				return c, false, derr
+				return c, derr == nil, derr
 			}
-			return nil, false, errors.New("proxy action but no node pool")
+			return nil, false, errors.New("proxy action but no usable exit")
 		}
 		c, derr := s.cfg.Pool.Dial(host)
 		return c, false, derr
 	}
+}
+
+// hasUsableExit 判断代理侧还有没有可用的出口。
+//
+// 判据是"没被判死的节点数"而不是"池子里的节点数"（见 selector.Pool.Alive 的
+// 说明）：池里躺着一批死节点时，Len() 依然大于 0，于是直连兜底永远不触发。
+func (s *Server) hasUsableExit() bool {
+	if s.cfg.Pool == nil {
+		return false
+	}
+	if a, ok := s.cfg.Pool.(aliveCounter); ok {
+		return a.Alive() > 0
+	}
+	return s.cfg.Pool.Len() > 0
+}
+
+// httpsish 判定目标是否走"首段探测 + 重放"这条链路。见 Config.IsHTTPS。
+func (s *Server) httpsish(host string) bool {
+	if s.cfg.IsHTTPS != nil {
+		return s.cfg.IsHTTPS(host)
+	}
+	return isHTTPSPort(host)
 }
 
 // relay 双向转发，直到任一侧关闭。
@@ -181,6 +232,20 @@ func (s *Server) relay(a, b net.Conn, _ string) {
 	<-done
 	<-done
 }
+
+// forwardBodyLimit 是明文 HTTP 转发时允许的请求体上限。
+//
+// 超限返回 413，而不是截断后照发 —— 截断会让源站按 Content-Length 空等，超时挂死。
+const forwardBodyLimit = 1 << 20
+
+// forwardDrainLimit 是回 413 之前愿意替客户端抽干的字节数。
+//
+// 不是无限抽：不然"发一个不读完的超大 body"就能把连接占住不放。超出这个量就直接
+// 关掉，那一跳客户端会看到连接重置 —— 它本来也在越界，可以接受。
+const forwardDrainLimit = 4 << 20
+
+// drainGrace 是上面那次抽干的总时限，防止慢速客户端把代理的 goroutine 钉住。
+const drainGrace = 5 * time.Second
 
 // ---------------- HTTP ----------------
 
@@ -233,16 +298,34 @@ func (s *Server) handleHTTPConn(c net.Conn) {
 		httpErr(c, 400, "bad request")
 		return
 	}
+	// ⚠️ 这里**不能**预先把 body 抽干。原来两个分支都有
+	// `io.Copy(io.Discard, io.LimitReader(req.Body, 1<<20))`，把请求体读掉扔进垃圾桶，
+	// 随后 req.Write(up) 又照着 req 重新序列化 —— Content-Length 头还在，body 却是
+	// 0 字节。源站于是按声明的长度继续等，等到超时。
+	//
+	// GET 没有 body 所以看不出来，于是它能一直活着；而 POST/PUT/PATCH 与一切 API
+	// 调用 100% 损坏。（顺带：LimitReader 对 >1MB 的 body 是**截断**，与 ≤1MB 的
+	// **丢弃**是两种不同的坏法。）
+	//
+	// 现在只做上限判定：超限就明说 413，而不是发一个长度对不上的请求出去。
+	//
+	// 413 之前必须先把 body 抽干：带着未读的接收缓冲关连接，TCP 会发 RST，
+	// 客户端收到的是"连接被重置"而不是 413 —— 那就等于没明说。抽干量另有上限，
+	// 不然恶意客户端能靠"发一个不读完的超大 body"把这条连接占住。
+	if req.ContentLength > forwardBodyLimit {
+		c.SetReadDeadline(time.Now().Add(drainGrace))
+		_, _ = io.CopyN(io.Discard, req.Body, forwardDrainLimit)
+		c.SetReadDeadline(time.Time{})
+		httpErr(c, 413, "request body too large")
+		return
+	}
 	if req.URL.Port() == "" {
 		// 原样保留 scheme 默认端口
-		_, _ = io.Copy(io.Discard, io.LimitReader(req.Body, 1<<20))
 		if req.URL.Scheme == "https" {
 			host = net.JoinHostPort(host, "443")
 		} else {
 			host = net.JoinHostPort(host, "80")
 		}
-	} else {
-		_, _ = io.Copy(io.Discard, io.LimitReader(req.Body, 1<<20))
 	}
 	up, _, err := s.dial(host)
 	if err != nil {
@@ -274,11 +357,11 @@ func (s *Server) tunnel(client net.Conn, host string) {
 	defer up.Close()
 	fmt.Fprintf(client, "HTTP/1.1 200 Connection Established\r\n\r\n")
 
-	if tentativeDirect && isHTTPSPort(host) {
+	if tentativeDirect && s.httpsish(host) {
 		s.relayWithReplay(client, up, host)
 		return
 	}
-	if !tentativeDirect && s.cfg.Pool != nil && isHTTPSPort(host) {
+	if !tentativeDirect && s.cfg.Pool != nil && s.httpsish(host) {
 		s.relayWithProxyReplay(client, up, host)
 		return
 	}
@@ -319,11 +402,11 @@ func (s *Server) handleSocksConn(c net.Conn) {
 	defer up.Close()
 	// reply 成功（bound addr 填 0.0.0.0:0）
 	c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) //nolint:errcheck
-	if tentativeDirect && isHTTPSPort(host) {
+	if tentativeDirect && s.httpsish(host) {
 		s.relayWithReplay(c, up, host)
 		return
 	}
-	if !tentativeDirect && s.cfg.Pool != nil && isHTTPSPort(host) {
+	if !tentativeDirect && s.cfg.Pool != nil && s.httpsish(host) {
 		s.relayWithProxyReplay(c, up, host)
 		return
 	}
