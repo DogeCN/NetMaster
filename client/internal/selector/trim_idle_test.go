@@ -13,16 +13,15 @@ import (
 	"netmaster/internal/outbound"
 )
 
-// miniWS 是一个最小的协议对端：接受 WS 升级、回 STATUS 0x00 后保持连接。
+// muxHandler 是最小协议对端的实现：回 STATUS 0x00 后保持连接。
 // 够用来造出真实的 MuxConn（空闲回调只在真实连接上才会触发）。
 //
 // 帧布局的关键点：连接上的**第一条消息是首帧** AUTH(16)|TS(8)|STREAM_ID(4)|ATYP|ADDR|PORT，
 // stream id 在**偏移 24**；之后才是开帧 STREAM_ID(4)|ATYP|ADDR|PORT，id 在偏移 0。
 // （写错这个偏移会让对端永远等不到响应——这个测试最初就是这么失败的。）
-func miniWS(t *testing.T) (*httptest.Server, string) {
-	t.Helper()
+func muxHandler() http.Handler {
 	up := websocket.Upgrader{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := up.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -52,7 +51,12 @@ func miniWS(t *testing.T) (*httptest.Server, string) {
 				byte(id >> 24), byte(id >> 16), byte(id >> 8), byte(id), 0x00,
 			})
 		}
-	}))
+	})
+}
+
+func miniWS(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	srv := httptest.NewServer(muxHandler())
 	return srv, "ws" + strings.TrimPrefix(srv.URL, "http")
 }
 

@@ -137,12 +137,13 @@ usage: netmaster <serve|nodes|restore> [flags]
 
 | 子命令 | 作用 | 主要 flag |
 |---|---|---|
-| `serve` | 起本地代理、接管系统代理、退出还原 | `--server` `--password` `--manual` `--rules` |
+| `serve` | 起本地代理、接管系统代理、退出还原 | `--server` `--password` `--manual` `--rules` `--no-ech` `--tunnels` |
 | `nodes` | 持续发请求，实时观察自适应选路 | `--server` `--password` `--target` `--ipcheck` |
 | `restore` | 手动还原系统代理（serve 被强杀后用） | 无 |
 
 `serve` 的 flag：`--server <domain>`、`--password <pw>`、`--manual`（不接管系统代理，
-只打印监听地址）、`--rules <file>`（自定义分流规则文件）。
+只打印监听地址）、`--rules <file>`（自定义分流规则文件）、`--no-ech`（关掉客户端→
+Worker 这段链路的 SNI 隐藏）、`--tunnels <1-8>`（同时保持几条隧道）。
 
 `nodes` 的 flag：`--target <url>`（默认 `https://www.google.com/`）、
 `--ipcheck <url>`（发请求到该 URL 并统计观察到的出口 IP 分布）。
@@ -160,7 +161,8 @@ usage: netmaster <serve|nodes|restore> [flags]
   "server": "<你的 Worker 域名>",
   "password": "<部署时设置的 PASSWORD>",
   "manual": false,
-  "rules": ""
+  "rules": "",
+  "tunnels": 4
 }
 ```
 
@@ -170,7 +172,14 @@ usage: netmaster <serve|nodes|restore> [flags]
 | `password` | string | 首帧 HMAC-SHA256 的密钥，不出网络 |
 | `manual` | bool | true 时不接管系统代理，只打印监听地址 |
 | `rules` | string | 自定义分流规则文件路径（Clash RULE-SET 格式，动作按文件名推断）；留空用内置规则集 |
-| `latencyToleranceMs` | int | 出口优选容差（当前版本仅供配置解析，出口选择逻辑尚未消费） |
+| `tunnels` | int | 同时保持几条到边缘的隧道，1–8，省略时 4 |
+| `no-ech` | bool | true 时关掉客户端→Worker 这段链路的 SNI 隐藏（默认开启）。仅在遇到偶发 bad handshake、需要对照实验时才需要改 |
+| `insecure` | bool | true 时不校验边缘证书（默认校验）。只给自建网关用自签证书的场景 |
+
+`tunnels` 为什么值得调：资源密集的页面（视频、图片流）一次会开几十条连接，多几条
+隧道才不至于在服务端回收连接的瞬间整页超时（每条隧道一生约 30 次出站建连的预算）。
+但每条常连隧道都按 Cloudflare DO 时长计费，免费版有每日上限。日常浏览留默认的 4
+就行；如果你的账号额度吃紧、且主要做低频浏览，降到 2 能明显省额度。
 
 查找顺序：`./config.json`，然后 `%AppData%/netmaster/config.json`（Linux/macOS 为
 `os.UserConfigDir()`）。两个位置都没有不是错误——全部配置也可以由 flag 给出。文件

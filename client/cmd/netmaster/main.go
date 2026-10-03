@@ -51,6 +51,16 @@ func passwordDefault(cfg config.Config) string {
 	return strings.TrimSpace(os.Getenv("PASSWORD"))
 }
 
+// tunnelDefault 返回 -tunnels 的缺省值：配置里写了就用它，否则是 selector 的
+// 内置默认。0 会让 selector 用它自己的缺省，但命令行帮助里要印出真实数字，
+// 所以这里就补齐。
+func tunnelDefault(cfg config.Config) int {
+	if n := cfg.TunnelsValue(); n > 0 {
+		return n
+	}
+	return selector.DefaultMuxTarget
+}
+
 // normalizeServer 接受裸域名，也宽容 scheme/路径（剥掉即可）。
 // 客户端自己解析域名、自己建 TLS，scheme 是内部事务。
 func normalizeServer(s string) string {
@@ -333,8 +343,12 @@ func cmdServe(args []string) {
 	manual := fs.Bool("manual", cfg.Manual, "don't take over the system proxy, just print listen addrs (config.json: manual)")
 	rulesFile := fs.String("rules", cfg.Rules, "custom rules file (config.json: rules)")
 	noECH := fs.Bool("no-ech", cfg.ECHDisabled(), "disable ECH SNI hiding on the client->worker hop (config.json: no-ech)")
+	tunnels := fs.Int("tunnels", tunnelDefault(cfg), "simultaneous proxy tunnels, 1-8; more helps busy pages but burns the free DO time quota (config.json: tunnels)")
 	fs.Parse(args)
 	host, pw := requireConn(*server, passwordValue(password, cfg))
+	if *tunnels < 1 || *tunnels > selector.MaxMuxTarget {
+		fatal(fmt.Sprintf("tunnels must be between 1 and %d, got %d", selector.MaxMuxTarget, *tunnels))
+	}
 
 	// 单实例（PRD §6.5 step 1）：两个 serve 会互相抢系统代理。锁只拦"接管系统
 	// 代理"的实例——--manual 不碰系统代理，允许多开（诊断/并行观察是正当需求）。
@@ -413,10 +427,12 @@ func cmdServe(args []string) {
 		// 缺省校验证书（config.json 可设 "insecure": true 关闭）。标准部署下
 		// SNI 就是 server 域名，边缘返回该域名的正规证书，校验应当通过；
 		// 校验失败属于真实攻击面，宁可连不上让用户看见，也不静默放行。
-		Insecure: cfg.InsecureEnabled(),
+		Insecure:  cfg.InsecureEnabled(),
+		MuxTarget: *tunnels,
 	})
 	pool.SetDialTimeout(15 * time.Second)
 	pool.SetGeo(geo)
+	logger.Printf("tunnels: %d simultaneous connections to the edge", pool.MuxTarget())
 
 	// 3. 分流规则已在入口候选之后与探测并行加载完毕（见上）。
 

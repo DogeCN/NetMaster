@@ -54,7 +54,7 @@
 | Router DO 条目 TTL | 1 小时 | `router.js` `ROUTE_TTL_MS` |
 | Router DO flush | 攒 5 秒或 50 条 | `router.js` |
 | 中继池刷新周期 | 每小时左右（GH Actions `schedule`） | `refresh-relays.yml` |
-| 并发隧道条数 / 空闲回收 | 4 条 / 45 秒 | `selector` `muxTarget` / `idleTrimDelay` |
+| 并发隧道条数 / 空闲回收 | 4 条 / 45 秒 | `selector` `DefaultMuxTarget` / `idleTrimDelay`（条数可由 config.json 的 `tunnels` 改成 1–8） |
 | 中继池探测：并发 / 超时 / 候选上限 | 8 / 3 秒 / 60 | `tools/refresh-relays.mjs` |
 | 客户端入口候选上限 | 64 | `main.go` `maxEntries` |
 | 客户端社区源等待上限 | 3 秒 | `main.go` `resolveEntries` |

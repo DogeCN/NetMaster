@@ -28,6 +28,13 @@ type Config struct {
 	Password string
 	UseECH   bool
 	Insecure bool
+	// MuxTarget 同时保持的传输条数。0 = DefaultMuxTarget。
+	// 面向用户的入口是 config.json 的 "tunnels"（见 cmd/netmaster）。
+	MuxTarget int
+	// IdleTrimDelay 空闲多久之后回收多余隧道。0 = 包内默认值。
+	// 只在测试里注入：它是内部的额度保护参数，不该出现在用户的配置文件里
+	// （用户的正常心智里只有"几条隧道"，没有"空闲多久收"）。
+	IdleTrimDelay time.Duration
 }
 
 // directBlockedTTL 是"该域名禁用直连"的冷却时长。
@@ -46,6 +53,12 @@ type Pool struct {
 
 	dialTimeout time.Duration // 直连拨号超时；0 = 默认 15s
 	geo         GeoResolver
+
+	// muxTarget / idleTrimDelay 是并发余量的两个旋钮，取值见 Config 的同名字段。
+	// 存进 Pool 而不是继续读包级变量：包级变量没法按实例配置，改一个池会连带
+	// 改掉同进程里所有别的池。
+	muxTarget     int
+	idleTrimDelay time.Duration
 
 	mu            sync.Mutex
 	muxes         map[int]*outbound.MuxConn // 节点索引 -> 活跃 mux
@@ -75,6 +88,14 @@ func New(cfg Config) *Pool {
 		fragDirect:    make(map[string]time.Time),
 		fails:         make(map[int]int),
 		dead:          make(map[int]bool),
+		muxTarget:     cfg.MuxTarget,
+		idleTrimDelay: cfg.IdleTrimDelay,
+	}
+	if p.muxTarget <= 0 {
+		p.muxTarget = DefaultMuxTarget
+	}
+	if p.idleTrimDelay <= 0 {
+		p.idleTrimDelay = idleTrimDelay
 	}
 	p.pending = newDialPending(p)
 	return p
@@ -176,7 +197,8 @@ func (p *Pool) redial() bool {
 // 为什么需要：服务端每条连接都有一个 185 秒的判死定时器，而它是 pending timer
 // （会阻止 DO 休眠，m0 E4/E9），空闲期按 DO 时长计费（免费版有额度，但不是无限的）。
 // 并发余量只在**有流量**时才有价值：突发期保持 muxTarget 条，空闲期收缩到 1 条。
-// 变量而非常量：测试要把它降到毫秒级来断言回收行为（见 trim_idle_test.go）。
+// 变量而非常量：测试要把它降到毫秒级来断言回收行为（见 trim_idle_test.go）；
+// Config.IdleTrimDelay 优先于它（per-pool 覆盖，New 在构造时定下）。
 var idleTrimDelay = 45 * time.Second
 
 // attach 把建好的传输登记进池并挂上回调。
@@ -191,7 +213,7 @@ func (p *Pool) attach(idx int, m *outbound.MuxConn) {
 // trimIdle 回收空闲的多余隧道：等一会儿仍然没有流、且池里还有别的可用隧道，就关掉它。
 // 只剩最后一条时留着——否则客户端会陷入"必须重连才能上网"的状态。
 func (p *Pool) trimIdle(idx int, m *outbound.MuxConn) {
-	time.AfterFunc(idleTrimDelay, func() {
+	time.AfterFunc(p.idleTrimDelay, func() {
 		if m.LiveCount() > 0 {
 			return // 又来流量了
 		}
@@ -242,7 +264,15 @@ func (p *Pool) onMuxDead(idx int, planned bool) {
 //
 // 分摊到多条连接不破坏出口 IP 稳定性：出口由服务端的 Router DO 映射决定
 // （v0.2.1 修复后跨会话生效），入口连接换了，映射照旧命中同一条中继。
-const muxTarget = 4
+//
+// 导出成 DefaultMuxTarget：config.json 的 "tunnels" 缺省时用它，命令行帮助里
+// 也要把这个数印出来，用户才知道自己填的 2 是"少一半"而不是"随便一个数"。
+const DefaultMuxTarget = 4
+
+// MaxMuxTarget 是接受的上限。免费版 DO 有 13,000 GB-s/日的时长额度，而每条常连
+// 隧道都会按 DO 时长计费（空且能休眠的不计），所以条数不是"越多越稳"而是
+// 一笔要算的账。超上限直接拒绝启动，好过静默开一堆隧道把额度花光。
+const MaxMuxTarget = 8
 
 // warmSlots 是同时进行的预热拨号上限：全并发会和请求路径抢节点池。
 const warmSlots = 3
@@ -294,7 +324,7 @@ func (p *Pool) liveCount() int {
 // TopUp 把活跃传输补到 muxTarget 条（后台进行，不阻塞调用方）。每成功一条就
 // 再检查一次，直到补满。
 func (p *Pool) TopUp() {
-	missing := muxTarget - p.liveCount()
+	missing := p.muxTarget - p.liveCount()
 	if missing <= 0 {
 		return
 	}
@@ -404,6 +434,9 @@ func (p *Pool) directTimeout() time.Duration {
 }
 
 func (p *Pool) Len() int { return len(p.nodes) }
+
+// MuxTarget 返回这个池实际生效的隧道条数（诊断/启动日志用）。
+func (p *Pool) MuxTarget() int { return p.muxTarget }
 
 func hostOf(target string) string {
 	host, _, err := net.SplitHostPort(target)
@@ -541,7 +574,12 @@ func (p *Pool) fragDirectFreshLocked(host string) bool {
 //
 // 由 proxy 层在"明文首段被拦、但分片重试成功"时调用。顺带清掉该域名的直连冷却：
 // 既然分片这条路已验证可行，再按冷却强制走代理就是白白多付一跳。
+//
+// ⚠️ 入参统一过 hostOf：proxy 侧拿到的是 CONNECT 目标，形如 "example.com:443"；
+// 而 shouldDirect / DialAuto 这一侧读写的是不带端口的键。不归一的话，
+// 写进去的条目永远读不回来 —— 记忆与冷却都会静默失效（评审 R-KEY 抓到的就是这条）。
 func (p *Pool) NoteFragDirect(host string) {
+	host = hostOf(host)
 	p.mu.Lock()
 	p.fragDirect[host] = time.Now()
 	delete(p.directBlocked, host)
@@ -550,6 +588,7 @@ func (p *Pool) NoteFragDirect(host string) {
 
 // NeedsFragDirect 查该域名是否已记住需要分片直连（实现 proxy.FragDirecter）。
 func (p *Pool) NeedsFragDirect(host string) bool {
+	host = hostOf(host)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.fragDirectFreshLocked(host)
@@ -616,6 +655,7 @@ func (p *Pool) RetryProxy(target string) (net.Conn, error) {
 // 时长比本文件其它记忆都长：只有真被墙、且分片也没救回来的域名才会走到这里，
 // 所以"落到代理"本身就是一个强信号。
 func (p *Pool) NoteProxyConfirmed(host string) {
+	host = hostOf(host) // 同 NoteFragDirect：入参可能带端口，键必须归一
 	p.mu.Lock()
 	p.directBlocked[host] = time.Now()
 	p.mu.Unlock()

@@ -5,7 +5,9 @@
 // 优先级天然成立，不需要任何合并逻辑。
 //
 // 可配置项与 serve 的 flag 一一对应（名字去掉 --）：server / password /
-// manual / rules。nodes / restore 同样读取 server / password。
+// manual / rules / no-ech / tunnels。insecure 只有配置项没有 flag（自我签名
+// 证书场景太窄，不值得占一行命令行帮助）。nodes / restore 同样读取 server /
+// password。
 //
 // 查找顺序：./config.json，然后 %AppData%/netmaster/config.json
 // （os.UserConfigDir）。两个位置都不存在不是错误 —— 所有配置也都可以由
@@ -42,6 +44,23 @@ type Config struct {
 	// 每次都退化成重试。留一个能关掉它的开关，线上出现"偶发 bad handshake"时
 	// 才有办法做对照实验。
 	NoECH *bool `json:"no-ech,omitempty"`
+	// Tunnels 是同时保持的代理隧道条数。缺省（不写）= 4。
+	//
+	// 为什么开放它：条数直接决定免费版的 DO 时长额度花得多快（每条常连隧道都
+	// 按 DO 时长计费），而额度上限只能按"别人怎么用"估。有人网络差、4 条会
+	// 撞额度，愿意降到 2 换额度；有人只做低频浏览，1 条就够。
+	//
+	// 只接受 1..8：不写就用默认；写了超范围由调用方报错退出，而不是静默夹到
+	// 边界 —— 静默夹取会让人以为自己真的跑在 8 条上。
+	Tunnels *int `json:"tunnels,omitempty"`
+}
+
+// TunnelsValue 返回配置里写的隧道条数；没写（nil）返回 0，由调用方按"用默认"处理。
+func (c Config) TunnelsValue() int {
+	if c.Tunnels == nil {
+		return 0
+	}
+	return *c.Tunnels
 }
 
 // InsecureEnabled 返回证书校验开关的生效值。nil 视为 false（校验开启）。

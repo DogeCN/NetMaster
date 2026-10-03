@@ -39,7 +39,7 @@ func TestConfigHasNoRetiredFields(t *testing.T) {
 	if err := json.Unmarshal([]byte(sampleFull), &m); err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]bool{"server": true, "password": true, "manual": true, "rules": true}
+	want := map[string]bool{"server": true, "password": true, "manual": true, "rules": true, "tunnels": true}
 	for k := range m {
 		if _, ok := want[k]; !ok {
 			t.Errorf("config.json carries %q but Config has no such field — is a doc/flag out of sync?", k)
@@ -63,8 +63,33 @@ const sampleFull = `{
   "server": "nm.example.com",
   "password": "pw",
   "manual": false,
-  "rules": ""
+  "rules": "",
+  "tunnels": 2
 }`
+
+// tunnels 缺省必须是"未设置"而不是某个数：调用方靠 0 来区分"用默认"和
+// "用户真的写了 0"，而 0 本身是无效配置（cmd 层会报错退出）。
+func TestTunnels(t *testing.T) {
+	chdirTemp(t)
+
+	writeConfig(t, `{"server":"a.example","password":"p","tunnels":2}`)
+	cfg, _, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := cfg.TunnelsValue(); got != 2 {
+		t.Errorf("tunnels = %d, want 2", got)
+	}
+
+	writeConfig(t, `{"server":"a.example","password":"p"}`)
+	cfg, _, err = Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := cfg.TunnelsValue(); got != 0 {
+		t.Errorf("unset tunnels = %d, want 0 (caller falls back to the built-in default)", got)
+	}
+}
 
 // 未知字段不报错：老配置文件里带 latencyToleranceMs 也要能读（只是被忽略），
 // 否则一次升级就把用户的配置变成"文件损坏"。
