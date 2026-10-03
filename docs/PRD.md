@@ -265,7 +265,9 @@ NAT64[0], ProxyIP[0], NAT64[1], ProxyIP[1], …
 · 直连：Session DO 内 connect() 目标。
 · NAT64：仅支持 /96 前缀（RFC 6052）。域名目标需先经 DoH 解析出 IPv4，再合成 IPv6。解析结果随路径写入 Router DO 缓存。不让客户端预解析，保持“域名原样传递”。
   · DoH 通过 fetch() 发起，走 Worker 的 HTTP 出站通道，不受 connect() 禁连清单（含 CF IP 段）约束；若 fetch 1.1.1.1 在特定 PoP 受限，回退 dns.google 或 security.cloudflare-dns.com 等备选 DoH 端点。
-· ProxyIP：HTTP CONNECT，本版仅实现这一种。KV 节点条目预留 type 字段（默认 "http-connect"）。
+· ProxyIP：中继出口，按 KV 条目的 `type` 分两种握手（B3 修订，原文"本版仅实现 HTTP CONNECT"与实现不符）：
+  · `sni`（默认，公共池全是这种）：TCP 连到中继后透传 ClientHello，由中继按 SNI 路由到目标——隧道里不出现 CONNECT。
+  · `http-connect`（自建 VPS 中继）：对中继发 HTTP CONNECT 建隧道。
 
 不使用链式代理。
 
@@ -457,7 +459,7 @@ M6 文档与部署脚本 一键部署脚本在全新账号跑通；README 快速
 ## 15. 术语
 
 · NAT64：IPv4/IPv6 转换网关，仅支持 /96 前缀。
-· ProxyIP：第三方 HTTP CONNECT 反向代理 IP。
+· ProxyIP：第三方中继（公共池为 SNI 路由型，自建可为 HTTP CONNECT 型），见 §7.4 与 A1。
 · Durable Objects（DO）：Cloudflare 单实例强一致的有状态边缘对象。
 · Hibernation：DO 的 WebSocket 休眠 API，空闲连接不驻留内存、不计时长。
 · Session DO：承载单条 WS 会话的 DO，每连接一个。
@@ -488,7 +490,8 @@ M6 文档与部署脚本 一键部署脚本在全新账号跑通；README 快速
   `64:ff9b::/96`、Trex `2001:67c:2b::/96`、nat64.net `2a00:1098:2b::/96` 四个前缀全部如此，
   IPv4 对照组 4ms 成功。不是前缀选择问题，是运行时能力缺失。
 - 修订：NAT64 出口从架构中移除。Cloudflare 承载目标的出口**只剩 ProxyIP 中继一类**
-  （`connect()` → 中继 → HTTP CONNECT）。
+  （`connect()` → 中继 → 隧道；握手方式按中继 `type`：公共池 SNI 透传、自建 HTTP CONNECT，
+  见 §7.4 的 B3 修订）。
 - 连带修订：竞速槽位不再是"NAT64 / ProxyIP 交错"，而是**全部为 ProxyIP 候选**，参数
   （6 槽 / 1.5s / 3s / 120ms）不变；Cron 不再维护 NAT64 前缀池，只维护 ProxyIP 池
   （`proxyip:top`）；"剔除回指条目"逻辑保留。
@@ -624,3 +627,22 @@ M6 文档与部署脚本 一键部署脚本在全新账号跑通；README 快速
   把 ClientHello 路由到带过期证书的后端（按连接或按时间轮换），单次探测探不到。
   改进方向（未实施）：refresh-relays 对每条中继做多次 TLS 探测、或记录探测所用
   servername 的完整证书校验链。
+
+## A9. Router DO 学习路径修复：type 全链路保留 + SNI 首字节验证后 learn（覆盖 §7.2、§7.3）
+
+- 日期：2026-10-03。
+- 依据（审计 B1）：实现里中继的 `type` 字段在 KV 解析（`parseRelayEntries`）、候选组装
+  （`buildCandidates`）两处被丢弃，竞速赢家 `type` 恒 `undefined`，session.js 的
+  `(race.type || "sni") === "http-connect"` 恒 false —— **Router DO 的 learn 在生产从未
+  发生过**，`routes_v2` 永远是空表，§7.2 的跨会话复用整条落空。且 `routes_v2` 空表让这个
+  缺陷完全静默：lookup 未命中只是多付一次竞速，没有任何报错。
+- 修订：
+  - `type` 从 KV JSON 条目一路保留到竞速赢家与会话缓存（egress Map 也存 type——
+    原实现里缓存命中的 http-connect 中继会被当 SNI 拨，握手方式直接错）。
+  - **learn 时机按类型分**：`http-connect` 的 CONNECT 2xx 即端到端验证，开流即 learn；
+    `sni` 的 TCP 成功不构成验证（盲转发也能连），**隧道首字节到达才 learn**，3 秒
+    首字节宽限超时则丢弃。正文的"成功路径写回 Router DO"自此才真正成立。
+  - 连带修掉一个隐藏雷：`session.js` 使用 `RELAY_TYPE_HTTP_CONNECT` 却从未 import——
+    首次路由命中会 ReferenceError（此前因 learn 恒 false 从未执行到）。
+- 单测：race 套件新增 winner携带 type / KV type 保留 / 未知 type 丢弃 / router hit 带
+  type 四组断言。

@@ -38,33 +38,36 @@ level66 / well-known / Trex / nat64.net 四个前缀、多个目标全部如此�
 竞速按这个顺序组装候选（`race.js` 的 `buildCandidates`），去重后截断到槽位数：
 
 ```
-① Router DO 命中映射（可选，命中时排第一）
-② KV 的 Cron top4（key: proxyip:top，RACE_KV_TOP = 4）
+① Router DO 命中映射（仅测试注入路径；生产上 Router 命中在 openExit ② 就直接拨了，
+   不会走到竞速）
+② KV 的 refresh-relays top4（key: proxyip:top，RACE_KV_TOP = 4）
 ③ 内置兜底列表补齐到槽位数
 ④ orderByHealth：把 TTL 内刚失败过的挪到尾部，其余保持原顺序
 ```
 
 第 ④ 步刻意只做一件事——别把刚被拒绝的候选塞进 120ms 内就要启动的前几槽——不重排 KV 的
-名次（那是 Cron 按 EWMA 算出来的）。
+名次（那是 refresh-relays 按"成功率 desc → 延迟 asc"算出来的，PRD 附录 A6）。
 
 ### 内置兜底列表
 
 `server/src/proxyip.js` 的 `FALLBACK_RELAY_HOSTS`，9 条 CMLiussss 域名型条目
 （HK / JP / KR / DE / Aliyun / Oracle / DigitalOcean / Vultr / Multacom）。
 
-硬编的是"从哪拿列表"，列表本身由 Cron 拉取后写进 KV（见下节）。兜底列表的职责只是"源不可达
-时仍有得试"——社区源是个人维护的公益服务，说死就死。
-
-另有 `server/src/cron.js` 的 `BUILTIN_RELAYS`（6 条 CMLiussss），那是 **Cron 探测池**的兜底：
-Cron 拉源失败时拿它去测，测出来的排名再写进 KV。
+硬编的是"从哪拿列表"，列表本身由 GitHub Actions 的 refresh-relays 拉取、探测后写进 KV
+（Worker Cron 已移除，PRD 附录 A6）。兜底列表的职责只是"源不可达时仍有得试"——社区源是
+个人维护的公益服务，说死就死。它同时也是探测池的兜底：refresh-relays 拉源失败时拿它去测。
 
 ### KV 池格式
 
-`cron.js` 写进 `proxyip:top` 的是 JSON 数组，元素是对象：
+`server/tools/refresh-relays.mjs` 写进 `proxyip:top` 的是 JSON 数组，元素是对象：
 
 ```json
-[{"host":"ProxyIP.HK.CMLiussss.net","port":443,"type":"http-connect","ms":182,"score":1274.0}]
+[{"host":"ProxyIP.Vultr.CMLiussss.net","port":443,"type":"sni","ms":1084}]
 ```
+
+`type` 是中继的握手方式：公共池全是 `sni`（TLS ClientHello 路由），自建 VPS 中继是
+`http-connect`。它决定 `dialRelay` 的握手方式，也决定 Session 何时把该映射 learn 进
+Router DO（http-connect 的 CONNECT 2xx 即验证；sni 要等隧道首字节）。
 
 读取端是 `race.js` 的 `parseRelayEntries()`，宽容解析以下三种都行：
 
@@ -118,7 +121,8 @@ ProxyIP.US.CMLiussss.net:443
 
 1. 找一台不在 Cloudflare 网段内的主机（VPS 即可，出口 IP 干净）；
 2. 在它上面跑一个只接受 `CONNECT host:port` 的 HTTP 代理，转发到目标，只认 443；
-3. 把 `host:443` 加进 Cron 的中继池源，让它随 `proxyip:top` 进 KV；
+3. 把 `host:443` 写进 refresh-relays 的候选源（workflow 环境变量或源列表），让它经
+   `proxyip:top` 进 KV；
 4. 务必做访问控制——一个开放的 CONNECT 代理会被当成开放代理扫描滥用。
 
 自建条目会和其他候选一起进入竞速，命中后由 Router DO 记住（`egress_type = http-connect`），

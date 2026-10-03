@@ -52,13 +52,20 @@ Workers `connect()` 对 IPv6 字面量与 NAT64 合成地址一律立即失败�
 ```
 ① 直连 connect()                     成功即用（永远优先，不多付一跳）
    └ 失败
-② 会话级内存缓存（egress Map）       命中且能连通 → 用，并 learn 到 Router DO
+② 会话级内存缓存（egress Map）       命中且能连通 → 用（learn 在建立缓存的那条流上已做）
    └ 未命中 / 连通失败 → 删缓存
 ③ Router DO lookup(GET /lookup)      命中且未过 TTL → 用，并写回会话缓存
    └ 未命中 / 连通失败 → forget（立刻删，别让下一条流再踩同一脚）
-④ 竞速 startRace()                   候选 ≤6，任一成功即用，并 learn
+④ 竞速 startRace()                   候选 ≤6，任一成功即用；learn 按类型分时机（见下）
    └ 全失败 → STATUS 0x03
 ```
+
+**learn 的时机按中继类型分**（type 由 KV 条目一路带到竞速赢家）：
+
+- `http-connect`：CONNECT 2xx 就是端到端验证，开流即 learn。
+- `sni`：TCP 连通不构成验证（盲转发也能连），**隧道首字节到达才 learn**（`pumpOutbound`
+  里的 `learnPending`）；3 秒首字节宽限超时则 forget 并丢弃。这是 Router DO 唯一的
+  跨会话复用来源——没有它，每个新会话都要为同一目标重付一轮竞速的子请求预算。
 
 要点：
 

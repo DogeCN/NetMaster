@@ -3,7 +3,8 @@
 // 替代 Worker Cron（免费版 cron 只有整点触发且不可靠，实测过）。跑在 GitHub Actions
 // runner 上：不受 Workers 的 50 子请求预算约束，也不占 DO 时长。
 //
-// 用法（CI）：
+// 用法（CI；经 socket 链路摸平台模块的测试都要挂 shim，本脚本自身用不到
+// cloudflare:sockets，直跑即可，但 test/refresh-relays.mjs 需要挂）：
 //   CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... node tools/refresh-relays.mjs
 //   DRY_RUN=1 node tools/refresh-relays.mjs        只打印要写的内容，不写 KV
 //   RELAY_KV_NAMESPACE_ID=... node tools/...        缺省时用 API 按 title=netmaster 查
@@ -12,9 +13,9 @@
 // 红着）；1 = 源全挂 / 探测池为空 / 写 KV 失败 / 缺配置。
 //
 // 消费端是 race.js 的 parseRelayEntries：写进去的字段必须与它逐字段对得上，所以
-// 写入格式由 buildTop 单独构造（type 字段 race.js 不读，但 cron.js 写过、运维看得懂）。
+// 写入格式由 buildTop 单独构造（type 字段决定 dialRelay 的握手方式与 learn 时机，
+// 见 race.js 的 parseRelayEntries / session.js 的 openExit）。
 
-import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -132,32 +133,48 @@ export function filterSelf(pool, workerHost) {
 // TCP 能建、握手必炸（worker 侧实测，用这种中继 CF-hosted 成功率 0%）。只有
 // 证书校验通过，才能证明这条中继端到端可用。CMLiussss 域名型是真 SNI 路由
 // （worker 实测 20/20），ipdb 的部分裸 IP 是盲转发。
+//
+// 为什么默认握手 PROBE_TIMES 次（A8 补充证据 2 的探测盲区）：部分中继把
+// ClientHello 按连接轮换路由到不同后端，其中有的后端挂着过期证书——单次探测
+// 可能恰好落在好后端上放行，隧道流量却反复落在坏后端上（线上实测连续两轮
+// 20/20 "certificate has expired" 而 KV 未变）。连续 N 次全部通过才认合格。
 import tls from "node:tls";
 
-export function probeRelay(relay, { timeoutMs = PROBE_TIMEOUT_MS, target = PROBE_TARGET } = {}) {
+export const PROBE_TIMES = Number(process.env.PROBE_TIMES || 2);
+
+export function probeRelay(relay, { timeoutMs = PROBE_TIMEOUT_MS, target = PROBE_TARGET, times = PROBE_TIMES } = {}) {
   const t0 = Date.now();
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (ok, error) => {
-      if (settled) return;
-      settled = true;
+  const once = () =>
+    new Promise((resolve) => {
+      let settled = false;
+      const finish = (ok, error) => {
+        if (settled) return;
+        settled = true;
+        try {
+          sock?.destroy();
+        } catch {}
+        resolve({ ok, error: error || null });
+      };
+      const timer = setTimeout(() => finish(false, "timeout"), timeoutMs);
+      let sock;
       try {
-        sock?.destroy();
-      } catch {}
-      resolve({ host: relay.host, port: relay.port, ok, ms: Date.now() - t0, error: error || null });
-    };
-    const timer = setTimeout(() => finish(false, "timeout"), timeoutMs);
-    let sock;
-    try {
-      // tls.connect 默认校验证书：目标域名的证书对不上就 rejected —— 正是要的判据
-      sock = tls.connect({ host: relay.host, port: relay.port, servername: target.host });
-    } catch (e) {
-      finish(false, String(e.message || e));
-      return;
+        // tls.connect 默认校验证书：目标域名的证书对不上就 rejected —— 正是要的判据
+        sock = tls.connect({ host: relay.host, port: relay.port, servername: target.host });
+      } catch (e) {
+        finish(false, String(e.message || e));
+        return;
+      }
+      sock.once("error", (e) => finish(false, String(e.message || e.code)));
+      sock.once("secureConnect", () => finish(true, null));
+    });
+  return (async () => {
+    for (let i = 0; i < Math.max(1, times); i++) {
+      const r = await once();
+      if (!r.ok) return { host: relay.host, port: relay.port, ok: false, ms: Date.now() - t0, error: r.error };
     }
-    sock.once("error", (e) => finish(false, String(e.message || e.code)));
-    sock.once("secureConnect", () => finish(true, null));
-  });
+    // ms 用总耗时：多次握手的中继在排序里自然靠后，宁可错杀也别放进池子
+    return { host: relay.host, port: relay.port, ok: true, ms: Date.now() - t0, error: null };
+  })();
 }
 
 // probeAll 固定并发地探测整个池（保持入参顺序，方便对照输出）。

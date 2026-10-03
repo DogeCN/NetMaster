@@ -188,12 +188,22 @@ func main() {
 	}
 }
 
-// connFlags 声明 server/password 两个 flag，默认值来自 config.json 与环境变量
-// （优先级 flag > config.json > 环境变量由这里的默认值顺序保证）。
+// connFlags 声明 server/password 两个 flag。server 的默认值来自 config.json 与
+// 环境变量；password 刻意注册成空默认 —— flag 包会把默认值打进 -h 输出，部署
+// 口令不该躺在任何人的终端回滚缓冲里。真实值在解析后由 passwordValue 给出
+// （优先级不变：flag > config.json > 环境变量）。
 func connFlags(fs *flag.FlagSet, cfg config.Config) (server, password *string) {
 	server = fs.String("server", serverDefault(cfg), "server domain (config.json: server)")
-	password = fs.String("password", passwordDefault(cfg), "deployment password (config.json: password)")
+	password = fs.String("password", "", "deployment password (config.json: password; value hidden from -h)")
 	return server, password
+}
+
+// passwordValue 解析口令的真实值。
+func passwordValue(flagVal *string, cfg config.Config) string {
+	if flagVal != nil && *flagVal != "" {
+		return *flagVal
+	}
+	return passwordDefault(cfg)
 }
 
 // cmdNodes 持续通过本地代理发请求，实时看这条链路能不能通、通得多快。
@@ -212,7 +222,7 @@ func cmdNodes(args []string) {
 	target := fs.String("target", "https://www.google.com/", "URL to fetch through the proxy, repeatedly")
 	ipcheck := fs.String("ipcheck", "", "if set, fetch this URL and print the observed egress IP distribution")
 	fs.Parse(args)
-	host, pw := requireConn(*server, *password)
+	host, pw := requireConn(*server, passwordValue(password, cfg))
 
 	logger := log.New(os.Stdout, "", log.Ltime)
 	nodes, src := resolveEntries(context.Background(), host)
@@ -298,7 +308,7 @@ func cmdServe(args []string) {
 	manual := fs.Bool("manual", cfg.Manual, "don't take over the system proxy, just print listen addrs (config.json: manual)")
 	rulesFile := fs.String("rules", cfg.Rules, "custom rules file (config.json: rules)")
 	fs.Parse(args)
-	host, pw := requireConn(*server, *password)
+	host, pw := requireConn(*server, passwordValue(password, cfg))
 
 	logger := log.New(os.Stdout, "", log.Ltime)
 	if cfgPath != "" {

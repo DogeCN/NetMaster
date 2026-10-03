@@ -45,6 +45,8 @@ console.log('--- 配置与解析 ---');
 	ok(parseRelayEntries('["a.example:443","b.example"]').length === 2, 'JSON array of strings');
 	ok(parseRelayEntries('{"relays":["a.example:443"]}').length === 1, 'object with relays[]');
 	ok(parseRelayEntries('{"relays":[{"host":"a.example","port":8080}]}')[0].port === 8080, 'object entries');
+	ok(parseRelayEntries('{"relays":[{"host":"a.example","port":443,"type":"sni"}]}')[0].type === 'sni', 'KV entry type preserved (B1)');
+	ok(parseRelayEntries('{"relays":[{"host":"a.example","port":443,"type":"bogus"}]}')[0].type === undefined, 'unknown type dropped -> dialRelay defaults');
 	ok(parseRelayEntries('a.example:443\n# 注释\n\nb.example:443').length === 2, 'plain text + comments');
 	ok(parseRelayEntries('a.example:443\na.example:443').length === 1, 'duplicates dropped');
 	ok(parseRelayEntries('b.example')[0].port === 443, 'port defaults to 443');
@@ -65,10 +67,11 @@ console.log('--- 候选组装 ---');
 		'no KV binding -> fallback list only');
 
 	const withRouter = await buildCandidates(
-		{ env: kv, routerLookup: async () => ({ host: 'r.example', port: 443 }) },
+		{ env: kv, routerLookup: async () => ({ host: 'r.example', port: 443, type: 'http-connect' }) },
 		raceConfig(kv.env)
 	);
 	ok(withRouter[0].host === 'r.example' && withRouter[0].viaRouter === true, 'router hit is candidate 0 / viaRouter');
+	ok(withRouter[0].type === 'http-connect', 'router hit carries its type');
 
 	const dead = await buildCandidates(
 		{ env: kv, routerLookup: async () => { throw new Error('router down'); } },
@@ -89,6 +92,7 @@ console.log('--- 竞速：选出赢家 ---');
 	const ms = Date.now() - t0;
 	ok(!r.error, 'race resolves with a winner', r.error || '');
 	ok(r.relay === good.key, 'winner is the reachable relay', r.relay);
+	ok(r.type === 'http-connect', 'winner carries candidate type (B1: session learns from it)', r.type);
 	ok(r.viaRouter === false, 'not via router');
 	ok(ms >= 20, `slot 1 waited for its stagger slot (${ms}ms)`);
 	r.socket.close();

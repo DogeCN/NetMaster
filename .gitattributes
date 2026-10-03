@@ -1,0 +1,4 @@
+# 统一换行：gofmt 门要求工作区是 LF（Windows 上 CRLF 会让 gofmt -l 全量误报）
+*.go text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf

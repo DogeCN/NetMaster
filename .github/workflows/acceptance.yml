@@ -75,15 +75,23 @@ jobs:
         run: go test ./internal/outbound/ -run TestLiveCFHosted -v -count=1 -timeout 600s
 
       # 中继健康排名是否还在（由 refresh-relays 每小时写入；Cron 移除后 KV 只有这一个键）。
+      # namespace id 走 repo variable（与 refresh-relays.yml 的 vars.NETMASTER_KV_ID 同源）：
+      # id 是标识符不是凭据，但 wrangler.toml 的占位符策略是"真值不入库"，这里别再硬编——
+      # namespace 重建后硬编的那份会静默指向空池。
       - name: KV health snapshot
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          NETMASTER_KV_ID: ${{ vars.NETMASTER_KV_ID }}
         run: |
+          if [ -z "$NETMASTER_KV_ID" ]; then
+            echo "vars.NETMASTER_KV_ID is not set — add it in repo Settings → Variables"
+            exit 1
+          fi
           for key in proxyip:top; do
             printf '%-14s ' "$key"
             curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/2ff6b8ebe80c4715b643ed46b45d8d09/values/$key" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/$NETMASTER_KV_ID/values/$key" \
               || echo "(read failed)"
             echo
           done

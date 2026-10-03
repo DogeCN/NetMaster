@@ -13,6 +13,11 @@ on:
   push:
     tags: ['v*']
 
+# 同 tag 的并发 run 互斥：两个 run 同时"删旧 Release 再建"会互相踩掉资产。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 

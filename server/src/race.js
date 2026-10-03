@@ -11,6 +11,8 @@
 import {
   dialRelay,
   RELAY_PORT,
+  RELAY_TYPE_HTTP_CONNECT,
+  RELAY_TYPE_SNI,
   connectViaProxyIP,
   fallbackRelays,
   orderByHealth,
@@ -51,7 +53,12 @@ export function parseRelayEntries(text) {
   const push = (v) => {
     let r = null;
     if (typeof v === "string") r = parseRelay(v);
-    else if (v && typeof v.host === "string") r = parseRelay(`${v.host}:${v.port || RELAY_PORT}`);
+    else if (v && typeof v.host === "string") {
+      r = parseRelay(`${v.host}:${v.port || RELAY_PORT}`);
+      // type 必须跟着走：dialRelay 按 type 分发，session.js 按 type 决定 learn
+      // 时机（B1：丢了会恒 undefined，Router DO 在生产永远学不到东西）。
+      if (r && (v.type === RELAY_TYPE_HTTP_CONNECT || v.type === RELAY_TYPE_SNI)) r.type = v.type;
+    }
     if (!r) return;
     const key = `${r.host}:${r.port}`;
     if (seen.has(key)) return;
@@ -93,12 +100,14 @@ export async function buildCandidates(ctx = {}, cfg = raceConfig(ctx.env)) {
     const key = `${c.host}:${c.port}`;
     if (!c.host || seen.has(key)) return;
     seen.add(key);
-    out.push({ host: c.host, port: c.port, viaRouter: !!viaRouter });
+    // type 一路带到赢家：session.js 靠它决定 learn 时机（B1：丢了恒 undefined，
+    // Router DO 在生产永远学不到东西）。缺省 sni 与 dialRelay 的缺省一致。
+    out.push({ host: c.host, port: c.port, type: c.type || "sni", viaRouter: !!viaRouter });
   };
   if (typeof ctx.routerLookup === "function") {
     try {
       const hit = await ctx.routerLookup();
-      if (hit && hit.host) push(parseRelay(`${hit.host}:${hit.port || RELAY_PORT}`), true);
+      if (hit && hit.host) push({ ...parseRelay(`${hit.host}:${hit.port || RELAY_PORT}`), type: hit.type }, true);
     } catch {
       // Router DO 不可用：当作未命中，继续用 KV/兜底。
     }

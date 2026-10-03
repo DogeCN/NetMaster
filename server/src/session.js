@@ -11,7 +11,7 @@
 // 背压（PRD §4.7）：客户端→目标方向每流缓冲上限 1 MiB，超过即 CLOSE 该流，
 // 不影响其他流。
 
-import { dialRelay, parseRelay, RELAY_TYPE_SNI } from './proxyip.js';
+import { dialRelay, parseRelay, RELAY_TYPE_SNI, RELAY_TYPE_HTTP_CONNECT } from './proxyip.js';
 import { startRace } from './race.js';
 import { targetHash, routerName, routerShardId } from './router.js';
 
@@ -142,7 +142,13 @@ class SessionDO {
     const f = parseFirstFrame(data);
     if (!f || !validStreamId(f.streamId) || !tsWithinWindow(f.ts, Math.floor(Date.now() / 1000))) {
       this.log("first frame rejected (structure/ts/stream-id)");
-      if (f) this.send(encodeResponse(f.streamId, STATUS_BAD));
+      if (f) {
+        this.send(encodeResponse(f.streamId, STATUS_BAD));
+      } else {
+        // 结构层面就解析不出来，没有合法 stream id 可引用 —— 用保留的 0 号回 0x01，
+        // 让客户端也能拿到 STATUS 而不是只看到裸 close（PRD §11 的"非法均回 0x01"）。
+        this.send(encodeResponse(0, STATUS_BAD));
+      }
       try { ws.close(1008, ""); } catch {}
       return;
     }
@@ -189,6 +195,7 @@ class SessionDO {
     if (!f || !validStreamId(f.streamId)) {
       this.log(`open frame rejected (bad format / stream id ${id})`);
       this.send(encodeResponse(id, STATUS_BAD));
+      this.send(encodeCloseControl(id)); // 0x01 后补 CLOSE：PRD §11 "静默关闭"的两段式
       return;
     }
     await this.openStream(f.streamId, f.host, f.port);
@@ -247,12 +254,14 @@ class SessionDO {
       this.env.KV?.put("debug:lastExit", `${new Date().toISOString()} ${host}:${port} race: ${race.error} | direct: ${direct.error}`).catch?.(() => {});
       return { error: `${direct.error}; ${race.error}` };
     }
-    const relay = parseRelay(race.relay);
+    const relay = { ...parseRelay(race.relay), type: race.type || RELAY_TYPE_SNI };
     this.rememberEgress(hash, relay);
-    if ((race.type || RELAY_TYPE_SNI) === RELAY_TYPE_HTTP_CONNECT) {
-      this.learn(hash, RELAY_TYPE_HTTP_CONNECT, race.relay);
+    if (relay.type === RELAY_TYPE_HTTP_CONNECT) {
+      // CONNECT 2xx 是端到端验证，立即 learn。SNI 型的 TCP 成功不构成验证
+      // （盲转发也能连），要等首字节 —— 见 openStream 里 rec.learnPending。
+      this.learn(hash, relay.type, race.relay);
     }
-    return { socket: race.socket, hash, relay };
+    return { socket: race.socket, hash, relay, learnPending: relay.type !== RELAY_TYPE_HTTP_CONNECT };
   }
 
   routerStub(hash) {
@@ -301,7 +310,9 @@ class SessionDO {
 
   rememberEgress(hash, relay) {
     this.egress.delete(hash); // 重插以刷新 LRU 顺序
-    this.egress.set(hash, { host: relay.host, port: relay.port });
+    // type 必须入缓存：mem 命中时 dialRelay 按 type 分发，丢了会把
+    // http-connect 中继当 SNI 拨（握手方式不对，连不上）。
+    this.egress.set(hash, { host: relay.host, port: relay.port, type: relay.type || RELAY_TYPE_SNI });
     if (this.egress.size > EGRESS_CACHE_MAX) {
       this.egress.delete(this.egress.keys().next().value);
     }
@@ -311,7 +322,9 @@ class SessionDO {
 
   async openStream(id, host, port) {
     if (this.streams.has(id)) {
-      this.send(encodeResponse(id, STATUS_BAD)); // 流 ID 重复
+      // 流 ID 重复：0x01 之后补 CLOSE，客户端的等待者才能完整收尾
+      this.send(encodeResponse(id, STATUS_BAD));
+      this.send(encodeCloseControl(id));
       return;
     }
     const atyp = host.includes(":") ? ATYP_IPV6 : /^(\d{1,3}\.){3}\d{1,3}$/.test(host) ? ATYP_IPV4 : ATYP_DOMAIN;
@@ -347,12 +360,15 @@ class SessionDO {
       writing: false,
       hash: ex.hash || null,
       firstByteTimer: null,
+      learnPending: !!ex.learnPending, // SNI 型：首字节才是端到端验证，到点才 learn
+      relayId: ex.relay ? `${ex.relay.host}:${ex.relay.port}` : null,
     };
     if (rec.hash) {
       // 出口学到的映射先乐观记下，3 秒内没有首字节就承认学错了。
       rec.firstByteTimer = setTimeout(() => {
         rec.firstByteTimer = null;
         this.log(`stream ${id} no first byte in ${FIRST_BYTE_GRACE_MS}ms, forgetting route`);
+        rec.learnPending = false;
         this.egress.delete(rec.hash);
         this.forget(rec.hash);
       }, FIRST_BYTE_GRACE_MS);
@@ -376,6 +392,12 @@ class SessionDO {
           // 首字节到了：出口路径成立，撤掉 3 秒失效定时器。
           clearTimeout(rec.firstByteTimer);
           rec.firstByteTimer = null;
+          if (rec.learnPending) {
+            // SNI 中继此刻被端到端证实（数据真的穿过了隧道），写入 Router DO
+            // 供跨会话复用——这是竞速 6 槽预算之外唯一的复用来源。
+            rec.learnPending = false;
+            this.learn(rec.hash, RELAY_TYPE_SNI, rec.relayId);
+          }
         }
         let buf = value;
         while (buf.length > MAX_PAYLOAD) {
