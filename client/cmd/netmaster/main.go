@@ -395,19 +395,13 @@ func cmdServe(args []string) {
 		logger.Printf("[geoip] CN ranges ready: %d (%s)", size, from)
 	})
 
-	// 2. IP 优选（PRD §6.6）：并发做真实 TLS 握手（同拨号路径），取最快 16 个进池。
+	// 2. IP 优选（PRD §6.6）：先并发做真实 TLS 握手（同拨号路径），再对最快的
+	//    一批做真实 WS 升级 —— 后半段剔的是"握手正常但升级被边缘拒"的 IP。
 	//    全流程 ≤ 10s，超预算就用已到手的结果 —— 优选是优化，不是能不能用的前提。
-	//    规则集拉取与它**并行**：两者都是网络 I/O，串行等于把两段等待叠起来
+	//    规则加载与它**并行**：两者都是网络 I/O，串行等于把两段等待叠起来
 	//    （规则源最坏 3s + 探测最坏 10s），而用户在这段时间里什么都做不了。
-	type probeResult struct {
-		nodes []entry.Node
-		took  time.Duration
-	}
-	probed := make(chan probeResult, 1)
-	go func() {
-		n, took := selector.Optimize(context.Background(), all, host, cfg.InsecureEnabled())
-		probed <- probeResult{nodes: n, took: took}
-	}()
+	probed := make(chan selector.OptResult, 1)
+	go func() { probed <- selector.Optimize(context.Background(), all, host, cfg.InsecureEnabled()) }()
 	//规则只用内置集：不拉订阅、不读磁盘缓存（见 rules.BuiltinOnly 的理由）。
 	rulesOverrides := rulesOverridesFromFile(*rulesFile)
 	router, rerr := rules.BuiltinOnly(rulesOverrides.Custom, geo)
@@ -416,8 +410,15 @@ func cmdServe(args []string) {
 	}
 	logger.Printf("rules: %d entries (%s, skipped %d lines)", router.Size(), router.Source(), router.SkippedLines())
 	pr := <-probed
-	logger.Printf("[probe] %d entries -> %d nodes in %s", len(all), len(pr.nodes), pr.took.Round(time.Millisecond))
-	nodes := pr.nodes
+	if pr.Rejected > 0 {
+		// 这条要印出来：它对应的症状是"时好时坏"，而边缘不会告诉我们为什么。
+		// 有具体数字，用户报障时至少知道问题出在候选集而不是本机网络。
+		logger.Printf("[probe] %d entries -> %d nodes in %s (%d entry IPs rejected the WebSocket upgrade)",
+			len(all), len(pr.Nodes), pr.ProbeTook.Round(time.Millisecond), pr.Rejected)
+	} else {
+		logger.Printf("[probe] %d entries -> %d nodes in %s", len(all), len(pr.Nodes), pr.ProbeTook.Round(time.Millisecond))
+	}
+	nodes := pr.Nodes
 
 	pool := selector.New(selector.Config{
 		Nodes:    nodes,

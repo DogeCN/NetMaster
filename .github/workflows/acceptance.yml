@@ -14,8 +14,8 @@ on:
     paths:
       - ".github/workflows/acceptance.yml"
       - "server/src/**"
-      - "client/internal/outbound/**"
-      - "client/internal/selector/**"
+      - "client/**"
+      - ".github/workflows/release.yml"
   workflow_dispatch:
     inputs:
       worker:
@@ -29,6 +29,45 @@ permissions:
   contents: read
 
 jobs:
+  # 客户端编译 + 单测。每次推 main 都要过这一关。
+  #
+  # 为什么单独加：客户端单测原先只在 tag 推送时跑（release.yml）。于是"编译不过的
+  # main"可以一路畅通无阻地活着 —— 本轮就实测到两次：一次是提交引用了只在别人
+  # 工作区里的符号，一次是同一类问题的另一处。两次都只有靠人肉发现。
+  #
+  # -race 在 ubuntu 上有 gcc 可用，本地 Windows 没有 C 工具链跑不了；这一关正好
+  # 补上那部分覆盖（selector/outbound/proxy 都是并发重灾区）。
+  client:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Vet
+        working-directory: client
+        run: go vet ./...
+
+      - name: gofmt
+        working-directory: client
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::not gofmt-clean:"; echo "$out"; exit 1
+          fi
+
+      - name: Unit tests
+        working-directory: client
+        run: go test ./... -count=1 -timeout 600s
+
+      - name: Unit tests (race detector)
+        working-directory: client
+        run: go test ./... -count=1 -race -timeout 900s
+
   probe:
     runs-on: ubuntu-latest
     steps:
