@@ -78,8 +78,9 @@ runner 上，不在 Worker 里。要看它的输出去 Actions 的 run 页面：
 | `no server: pass --server or set it in config.json / NETMASTER_SERVER` | 没给域名 | 填 config.json 或加 `--server` |
 | `no password: pass --password or set it in config.json / NETMASTER_PASSWORD` | 没给口令 | 同上 |
 | `no entries: server domain unresolvable and community sources unreachable` | 域名解析不出来 **且** 三个社区源也全挂 | 先查域名绑定和本机 DNS |
-| `entries: N (community: none)` | 社区源全挂且无缓存，只剩域名 DNS 解析出的候选 | 能连就不要紧；N=0 才致命 |
-| `entries: N (community: cache)` | 社区源这次没拉到，用了上次缓存 | 正常，网络恢复后自动改用 `net` |
+| `entries: N (server DNS; community still pending)` | 只等到了服务端域名的 DNS 候选就先就绪了（这是常态，不是问题） | 社区源在后台并入，几秒后会补一行 `entries: +M from community` |
+| `entries: +M from community (src), pool now K` | 社区优选已并入池子 | 正常；M=0 时说明社区源这次没给可用条目 |
+| `entries: community gave nothing (src); staying on server DNS` | 社区源全挂，只剩域名 DNS 的候选 | 能连就不要紧；只有服务端域名也解析不出来才致命 |
 | `tunnel failed: …` | 传输层建不起来 | 看上面"连不上"三件事 |
 | `server rejected stream: target forbidden (0x02)` | 目标是私网 / CF 网段 / 端口 25 | 设计如此；私网应走客户端直连规则 |
 | `server rejected stream: all exits failed (0x03)` | 直连失败且中继全挂 | 看服务端 tail 里的 race slot 失败原因 |

@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -555,13 +556,59 @@ func (p *Pool) Warm() { p.TopUp() }
 // dialMux 建立节点 idx 的传输（不登记进池）。
 func (p *Pool) dialMux(idx int) (*outbound.MuxConn, error) {
 	client := &outbound.Client{
-		Node:     p.nodes[idx],
+		Node:     p.nodeAt(idx),
 		SNI:      p.sni,
 		Password: p.password,
 		UseECH:   p.useECH,
 		Insecure: p.insecure,
 	}
 	return outbound.DialMux(client)
+}
+
+// nodeAt 取第 idx 个候选。
+//
+// 必须持锁：候选表在启动之后仍会增长（见 AddNodes），而 dialMux 跑在拨号
+// goroutine 里、与那次 append 并发。
+func (p *Pool) nodeAt(idx int) entry.Node {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.nodes[idx]
+}
+
+// AddNodes 把新一批候选并进池子（按 addr:port 去重），返回真正新增的条数，
+// 并触发一次补齐。
+//
+// 为什么需要它：入口候选分两批到 —— 服务端域名的 DNS 解析是毫秒级的，社区优选
+// 列表要一两秒。启动路径先用前者把隧道立起来（用户不必等社区源），后者到了再并进来，
+// 于是"启动那一刻的候选表"不再是终局，池子能越用越宽。
+//
+// 只 append、不删除、不重排：候选的 index 是 dead/fails 两张表的键，也是
+// dialMux 的入参，重排会让"这个 index 是哪个节点"在并发中改变。
+func (p *Pool) AddNodes(nodes []entry.Node) int {
+	if len(nodes) == 0 {
+		return 0
+	}
+	key := func(n entry.Node) string { return net.JoinHostPort(n.Addr, strconv.Itoa(int(n.Port))) }
+	p.mu.Lock()
+	seen := make(map[string]bool, len(p.nodes)+len(nodes))
+	for _, n := range p.nodes {
+		seen[key(n)] = true
+	}
+	added := 0
+	for _, n := range nodes {
+		k := key(n)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		p.nodes = append(p.nodes, n)
+		added++
+	}
+	p.mu.Unlock()
+	if added > 0 && !p.isClosed() {
+		p.TopUp()
+	}
+	return added
 }
 
 // pickNode 随机选一个未判死的节点；全判死时全部复活（池耗尽后仍要能继续用）。
@@ -637,7 +684,11 @@ func (p *Pool) directTimeout() time.Duration {
 	return p.dialTimeout
 }
 
-func (p *Pool) Len() int { return len(p.nodes) }
+func (p *Pool) Len() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.nodes)
+}
 
 // Alive 返回**当前还没被判死**的节点数。
 //
@@ -677,7 +728,7 @@ func hostOf(target string) string {
 // 快路径：任一存活传输直接开流。传输全灭（或建流途中断链）时不立刻把失败
 // 丢给用户，而是排进等待队列等重连 —— 断线瞬间上层往往正有一批连接在建立。
 func (p *Pool) Dial(target string) (net.Conn, error) {
-	if len(p.nodes) == 0 {
+	if p.Len() == 0 {
 		return nil, errNoUsableExit
 	}
 	for attempt := 0; attempt < 2; attempt++ {
@@ -926,7 +977,8 @@ func (p *Pool) noteFailureLocked(idx int) {
 // Verify 建立一次真实的传输层验证（TLS+WS+首帧认证）。部署是否健康，
 // 这一条是最直接的回答。
 func (p *Pool) Verify() (string, error) {
-	if len(p.nodes) == 0 {
+	nodes := p.Nodes() // 快照：候选表可能被 AddNodes 追加
+	if len(nodes) == 0 {
 		return "", fmt.Errorf("selector: no nodes")
 	}
 	// 首流目标是 www.google.com:443：M0 实测（m0-findings.md E6/E7）平台禁拨 80
@@ -937,12 +989,12 @@ func (p *Pool) Verify() (string, error) {
 	// 依次试前 3 个节点（按探测延迟排序）：单节点抽样会把"恰好分到一个坏 IP"
 	// 报成 tunnel failed，而浏览实际是好的——误报比不报更吓人。
 	var lastErr error
-	for i := 0; i < 3 && i < len(p.nodes); i++ {
+	for i := 0; i < 3 && i < len(nodes); i++ {
 		if _, err := p.dialNode(i, "www.google.com:443"); err != nil {
 			lastErr = err
 			continue
 		}
-		return p.nodes[i].Addr, nil
+		return nodes[i].Addr, nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("selector: no nodes tried")
@@ -950,5 +1002,14 @@ func (p *Pool) Verify() (string, error) {
 	return "", lastErr
 }
 
-// Nodes 返回节点列表（诊断用）。
-func (p *Pool) Nodes() []entry.Node { return p.nodes }
+// Nodes 返回节点列表的**快照**（诊断用）。
+//
+// 快照而不是内部切片：候选表会被 AddNodes 追加，把内部切片交出去就等于让调用方
+// 在无锁的情况下与那次 append 赛跑。
+func (p *Pool) Nodes() []entry.Node {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]entry.Node, len(p.nodes))
+	copy(out, p.nodes)
+	return out
+}

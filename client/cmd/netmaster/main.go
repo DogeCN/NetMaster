@@ -239,6 +239,66 @@ func resolveEntries(ctx context.Context, server string) ([]entry.Node, string) {
 	return nodes, src
 }
 
+// reportProbe 把一次探测的结果写进启动日志。
+//
+// ECH 的成败必须说在启动日志里：它的失败是**静默**的 —— 握手失败被判成结构性故障、
+// 把 ECH 熔断 60 秒，之后每次拨号都退回明文 SNI，用户照样能上网却不知道自己以为被
+// 隐着的服务端域名一直明文在外面。实测这个事实藏了整整一个版本，所以这里明说。
+//
+// 两段耗时也分别印出来：启动慢的时候，"哪一段慢"和"慢多少"才是能据此动手的信息，
+// 一句"探测用了 10 秒"只会让人干瞪眼。
+func reportProbe(logger *log.Logger, tr *profile.Trace, host string, insecure bool, total int, pr selector.OptResult) {
+	switch {
+	case !pr.ECHConfigured:
+		logger.Printf("[ech] no ECH config published for this domain - connections will use a visible SNI")
+	case !pr.ECHWorked:
+		logger.Printf("[ech] ECH handshake failed on every attempt - connections fall back to a VISIBLE SNI " +
+			"(see docs: ECH must be enabled on the Cloudflare zone; until then the server domain is in the clear)")
+	default:
+		logger.Printf("[ech] SNI hidden by ECH")
+	}
+	logger.Printf("[probe] %d entries -> %d nodes in %s (tcp %s, tls %s, ws upgrade %s, %d entry IPs refused)",
+		total, len(pr.Nodes), pr.ProbeTook.Round(time.Millisecond),
+		pr.ScreenTook.Round(time.Millisecond), pr.TLSTook.Round(time.Millisecond),
+		pr.UpgradeTook.Round(time.Millisecond), pr.Rejected)
+	if tr != nil {
+		tr.FactInt("nodes", len(pr.Nodes))
+		tr.FactInt("refused", pr.Rejected)
+	}
+	// 被拒的入口明细只在显式要求时打：正常启动的用户不需要知道这些，
+	// 而排障的人需要能整段贴出来（"这些 IP 为什么不行"没有别的来源）。
+	if os.Getenv("NETMASTER_PROBE_DEBUG") == "" {
+		return
+	}
+	for _, e := range pr.TLSErrors {
+		logger.Printf("[probe] tls failed %s", e)
+	}
+	for _, r := range pr.Refused {
+		logger.Printf("[probe] refused %s:%d — %s", r.Node.Addr, r.Node.Port, r.Err)
+	}
+	// 把被拒的串行重探一遍，分成"真的建不了隧道"和"被我们自己的并发打出来的"。
+	// 没有这个拆分的话，被拒条数是个被污染的上界，拿它算"该不该做升级验证"
+	// 的账一定会算错 —— 详见 selector.RecheckRefused 的说明。
+	if len(pr.Refused) == 0 {
+		return
+	}
+	// 重探前先等一会儿（可选）：要区分"这个 IP 本来就建不了隧道"与
+	// "Worker 那边的限流窗口还没过去"，必须等窗口过去再问。
+	if d := recheckDelay(); d > 0 {
+		logger.Printf("[probe] waiting %s before the serial re-probe", d)
+		time.Sleep(d)
+	}
+	rc := selector.RecheckRefused(context.Background(), pr.Refused, host, insecure, recheckRounds)
+	logger.Printf("[probe] recheck: %d still refused, %d were our own concurrency's fault (serial re-probe, %d rounds each)",
+		len(rc.StillRefused), len(rc.FalsePos), rc.Rounds)
+	for _, r := range rc.StillRefused {
+		logger.Printf("[probe] really refused %s:%d — %s", r.Node.Addr, r.Node.Port, r.Err)
+	}
+	for _, r := range rc.FalsePos {
+		logger.Printf("[probe] false positive %s:%d (refused in the concurrent pass, fine alone)", r.Node.Addr, r.Node.Port)
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		// 无参数 = 双击启动：直接 serve，用法说明走 -h / help。
@@ -448,15 +508,33 @@ func cmdServe(args []string) {
 		logger.Printf("config: %s", cfgPath)
 	}
 
-	// 1. 入口候选（每次启动都尝试刷新社区源；有界等待，失败退缓存）
+	// 1. 入口候选分两批到。服务端域名的 DNS 解析是毫秒级的，社区优选列表要一两秒
+	//    （实测每源 0.5–1.4s，整体 3s 预算）。启动路径**只等前者**：探测、建隧道、
+	//    就绪都不该被社区源拖住 —— 用户在这段时间里什么都做不了。后者到了在后台
+	//    探测、并进池子（selector.Pool.AddNodes）。
 	entriesStart := time.Now()
-	all, src := resolveEntries(context.Background(), host)
-	tr.Mark("entries", fmt.Sprintf("%d candidates from %s", len(all), src))
-	logger.Printf("entries: %d (community: %s)", len(all), src)
+	dnsNodes := entry.FromServer(context.Background(), host)
+	if len(dnsNodes) > dnsHeadroom {
+		dnsNodes = dnsNodes[:dnsHeadroom]
+	}
+	communityPending := true
+	if len(dnsNodes) == 0 {
+		// 域名一个 IP 都解析不出来：退回"等社区源"的老路径。空池子比慢启动更糟 ——
+		// Dial 在没有候选时直接失败，用户看到的是整页打不开。
+		logger.Printf("entries: server domain did not resolve; waiting for community sources")
+		dnsNodes, _ = resolveEntries(context.Background(), host)
+		communityPending = false
+	}
+	tr.Mark("entries.dns", fmt.Sprintf("%d candidates from server DNS", len(dnsNodes)))
+	if communityPending {
+		logger.Printf("entries: %d (server DNS; community still pending)", len(dnsNodes))
+	} else {
+		logger.Printf("entries: %d (community, server DNS empty)", len(dnsNodes))
+	}
 	// 节点池的**实际成员**是耗时的一部分：探测耗的是被选中的那批，不同的成员
 	// 意味着不同的网络路径。不登记它，"这次快了 2 秒"就可能是"这次池子更好"。
 	if tr != nil {
-		tr.FactInt("entries", len(all))
+		tr.FactInt("entries", len(dnsNodes))
 		tr.FactInt("entry-fetch-ms", int(time.Since(entriesStart).Milliseconds()))
 	}
 
@@ -472,14 +550,9 @@ func cmdServe(args []string) {
 		logger.Printf("[geoip] CN ranges ready: %d (%s)", size, from)
 	})
 
-	// 2. IP 优选（PRD §6.6）：先并发做真实 TLS 握手（同拨号路径），再对最快的
-	//    一批做真实 WS 升级 —— 后半段剔的是"握手正常但升级被边缘拒"的 IP。
-	//    全流程 ≤ 10s，超预算就用已到手的结果 —— 优选是优化，不是能不能用的前提。
-	//    规则加载与它**并行**：两者都是网络 I/O，串行等于把两段等待叠起来
-	//    （规则源最坏 3s + 探测最坏 10s），而用户在这段时间里什么都做不了。
-	probed := make(chan selector.OptResult, 1)
-	go func() { probed <- selector.Optimize(context.Background(), all, host, cfg.InsecureEnabled()) }()
-	//规则只用内置集：不拉订阅、不读磁盘缓存（见 rules.BuiltinOnly 的理由）。
+	// 2. 规则加载（只用内置集：不拉订阅、不读磁盘缓存，见 rules.BuiltinOnly 的理由）。
+	//    它仍在关键路径上：分流规则要在监听开始时就位。原来与它并行的探测已经挪到
+	//    就绪之后的后台（见下面的 probeDNS）。
 	endRules := tr.Begin("rules.load", 500*time.Millisecond)
 	rulesOverrides := rulesOverridesFromFile(*rulesFile)
 	router, rerr := rules.BuiltinOnly(rulesOverrides.Custom, geo)
@@ -490,71 +563,11 @@ func cmdServe(args []string) {
 	endRules()
 	logger.Printf("rules: %d entries (%s, skipped %d lines)", router.Size(), router.Source(), router.SkippedLines())
 
-	// 探测预算：selector 内部的全流程预算是 10s，这里留 12s 的告警线。
-	// 超了不是 bug，是"入口质量或链路变了"的信号 —— 正是要它自己跳出来的那种事。
-	endProbe := tr.Begin("probe.total", 12*time.Second)
-	pr := <-probed
-	endProbe()
-	tr.Mark("probe.done", fmt.Sprintf("%d/%d nodes", len(pr.Nodes), len(all)))
-	if tr != nil {
-		tr.FactInt("nodes", len(pr.Nodes))
-		tr.FactInt("refused", pr.Rejected)
-	}
-	// 两段耗时分别印出来：启动慢的时候，"哪一段慢"和"慢多少"才是能据此动手的信息，
-	// 一句"探测用了 10 秒"只会让人干瞪眼。
-	// ECH 的成败必须说在启动日志里。
-	//
-	// 它的失败是**静默**的：握手失败会被判成结构性故障、把 ECH 熔断 60 秒，然后
-	// 每次拨号都退回明文 SNI —— 用户照样能上网，但完全不知道自己以为被隐着的
-	// 服务端域名一直明文在外面。实测确认过：ECH 从来没成功过，而这个事实藏了
-	// 整整一个版本。所以这里明说。
-	switch {
-	case !pr.ECHConfigured:
-		logger.Printf("[ech] no ECH config published for this domain - connections will use a visible SNI")
-	case !pr.ECHWorked:
-		logger.Printf("[ech] ECH handshake failed on every attempt - connections fall back to a VISIBLE SNI " +
-			"(see docs: ECH must be enabled on the Cloudflare zone; until then the server domain is in the clear)")
-	default:
-		logger.Printf("[ech] SNI hidden by ECH")
-	}
-	logger.Printf("[probe] %d entries -> %d nodes in %s (tcp %s, tls %s, ws upgrade %s, %d entry IPs refused)",
-		len(all), len(pr.Nodes), pr.ProbeTook.Round(time.Millisecond),
-		pr.ScreenTook.Round(time.Millisecond), pr.TLSTook.Round(time.Millisecond),
-		pr.UpgradeTook.Round(time.Millisecond), pr.Rejected)
-	nodes := pr.Nodes
-	// 被拒的入口明细只在显式要求时打：正常启动的用户不需要知道这些，
-	// 而排障的人需要能整段贴出来（"这些 IP 为什么不行"没有别的来源）。
-	if os.Getenv("NETMASTER_PROBE_DEBUG") != "" {
-		for _, e := range pr.TLSErrors {
-			logger.Printf("[probe] tls failed %s", e)
-		}
-		for _, r := range pr.Refused {
-			logger.Printf("[probe] refused %s:%d — %s", r.Node.Addr, r.Node.Port, r.Err)
-		}
-		// 把被拒的串行重探一遍，分成"真的建不了隧道"和"被我们自己的并发打出来的"。
-		// 没有这个拆分的话，被拒条数是个被污染的上界，拿它算"该不该做升级验证"
-		// 的账一定会算错 —— 详见 selector.RecheckRefused 的说明。
-		if len(pr.Refused) > 0 {
-			// 重探前先等一会儿（可选）：要区分"这个 IP 本来就建不了隧道"与
-			// "Worker 那边的限流窗口还没过去"，必须等窗口过去再问。
-			if d := recheckDelay(); d > 0 {
-				logger.Printf("[probe] waiting %s before the serial re-probe", d)
-				time.Sleep(d)
-			}
-			rc := selector.RecheckRefused(context.Background(), pr.Refused, host, cfg.InsecureEnabled(), recheckRounds)
-			logger.Printf("[probe] recheck: %d still refused, %d were our own concurrency's fault (serial re-probe, %d rounds each)",
-				len(rc.StillRefused), len(rc.FalsePos), rc.Rounds)
-			for _, r := range rc.StillRefused {
-				logger.Printf("[probe] really refused %s:%d — %s", r.Node.Addr, r.Node.Port, r.Err)
-			}
-			for _, r := range rc.FalsePos {
-				logger.Printf("[probe] false positive %s:%d (refused in the concurrent pass, fine alone)", r.Node.Addr, r.Node.Port)
-			}
-		}
-	}
-
+	// 3. 节点池：先用服务端 DNS 那几个候选把隧道立起来，**不等探测**。
+	//    探测的产物（按延迟排序、剔掉升级被拒的）对这几个"自己域名的 A 记录"意义有限，
+	//    而它要花一秒上下；坏候选由池子自己的失败记忆处理（noteFailure → 判死 → 换一个）。
 	pool := selector.New(selector.Config{
-		Nodes:    nodes,
+		Nodes:    dnsNodes,
 		SNI:      host,
 		Password: pw,
 		UseECH:   !*noECH,
@@ -568,7 +581,32 @@ func cmdServe(args []string) {
 	pool.SetGeo(geo)
 	logger.Printf("tunnels: %d simultaneous connections to the edge", pool.MuxTarget())
 
-	// 3. 分流规则已在入口候选之后与探测并行加载完毕（见上）。
+	// 3a. 社区优选：后台拉取 → 探测 → 并进池子。
+	//
+	// 失败只是"没有额外候选"：可用性由服务端 DNS 那条路保证（它不依赖任何第三方）。
+	// 这也是为什么它可以放到后台 —— 社区源的价值是"多几个 IP 抗封锁"，不是"能不能用"。
+	if communityPending {
+		go func() {
+			commCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			lists, src := entry.CommunityLists(commCtx)
+			limit := maxEntries - pool.Len()
+			if limit < 0 {
+				limit = 0
+			}
+			extra := entry.Interleave(lists, limit)
+			if len(extra) == 0 {
+				logger.Printf("entries: community gave nothing (%s); staying on server DNS", src)
+				return
+			}
+			pr := selector.Optimize(context.Background(), extra, host, cfg.InsecureEnabled())
+			added := pool.AddNodes(pr.Nodes)
+			logger.Printf("entries: +%d from community (%s), pool now %d", added, src, pool.Len())
+			if tr != nil {
+				tr.FactInt("entries", pool.Len())
+			}
+		}()
+	}
 
 	// 4. 监听端口自动选择：先试 8080/1080，被占则顺延。用户通常不需要知道
 	//    端口号 —— 系统代理自动指向选定值；--manual 下端口只用来打印。
@@ -628,6 +666,19 @@ func cmdServe(args []string) {
 	logger.Printf("ready in %s. browse normally; Ctrl+C or close this window to stop (system proxy is restored).",
 		time.Since(appStart).Round(time.Millisecond))
 	tr.Mark("ready", fmt.Sprintf("after %s", time.Since(appStart).Round(time.Millisecond)))
+
+	// 就绪之后才对服务端 DNS 那几个候选做一次探测。
+	//
+	// 它的产物不是"过滤候选"（这几个本来就要用），而是启动日志里那两行判据：ECH 当前
+	// 是哪一态、以及 [probe] 的三段耗时。放在后台，用户不必等它 —— 而它也不再挡在
+	// "隧道能不能建起来"前面（建隧道由下面的 Verify/Warm 直接做）。
+	go func() {
+		endProbe := tr.Begin("probe.total", 12*time.Second)
+		pr := selector.Optimize(context.Background(), dnsNodes, host, cfg.InsecureEnabled())
+		endProbe()
+		tr.Mark("probe.done", fmt.Sprintf("%d/%d nodes", len(pr.Nodes), len(dnsNodes)))
+		reportProbe(logger, tr, host, cfg.InsecureEnabled(), len(dnsNodes), pr)
+	}()
 
 	// 首次连通验证：一次真实的传输层建连（TLS+WS+auth），在后台跑，
 	// 结果出来补一行日志 —— 部署是否健康，这一行就是最直接的回答。
