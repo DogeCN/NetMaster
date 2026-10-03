@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -101,14 +100,6 @@ func echoServer(t *testing.T) string {
 		}
 	}()
 	return ln.Addr().String()
-}
-
-func httpGet(t *testing.T, conn net.Conn, host string) string {
-	t.Helper()
-	req, _ := http.NewRequest("GET", "http://"+host+"/", nil)
-	req.Write(conn) //nolint:errcheck
-	data, _ := io.ReadAll(io.LimitReader(conn, 64<<10))
-	return string(data)
 }
 
 func TestProtoE2EEchoRoundtrip(t *testing.T) {

@@ -371,8 +371,6 @@ type MuxStream struct {
 	tmu   sync.Mutex
 	timer *time.Timer
 	fired bool // 计时器已触发过：此后的清零/重设都不再复活这条流
-
-	wmu sync.Mutex
 }
 
 func newMuxStream(m *MuxConn, id uint32) *MuxStream {
@@ -398,10 +396,19 @@ func (s *MuxStream) remoteClose() {
 }
 
 func (s *MuxStream) markDead(cause error) {
-	// dead 必须置位：Read 的循环条件依赖它。只 broadcast 不置位的话，
-	// Wait 醒来发现 rbuf 仍空、dead 仍 false，会继续睡回去 —— 整个流挂死。
-	s.dead.Store(true)
+	// 顺序要紧：先写 err，再置 dead。
+	//
+	// Read 在 rmu 下读 s.err（它跟 setErr 用的 errOnce 不是同一把锁，本来就没有
+	// happens-before）。唯一把两者连起来的就是这个原子操作 —— Go 1.19 起原子
+	// 操作是顺序一致的，"A 的效果被 B 观察到"蕴含 A synchronizes-before B。
+	// 反过来写（先 dead.Store(true) 再 setErr）就成了 release 在前、数据写在后：
+	// 读到 dead==true 的那个读者并没有被保证看到 err，于是可能拿到一个裸 io.EOF
+	// 而不是真正的原因（"mux: pong timeout" 之类），排查时完全看不出发生过什么。
+	//
+	// dead 必须置位：Read 的循环条件依赖它。只 broadcast 不置位的话，Wait 醒来
+	// 发现 rbuf 仍空、dead 仍 false，会继续睡回去 —— 整个流挂死。
 	s.setErr(cause)
+	s.dead.Store(true)
 	s.rcond.Broadcast()
 	s.mux.remove(s.id)
 }
