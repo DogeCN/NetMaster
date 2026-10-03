@@ -9,48 +9,47 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/windows"
 )
 
-// Windows 没有 flock，用 O_EXCL 建锁文件 + PID 活性探测：锁文件存在但
-// 持有进程已死（上次强杀/断电没来得及清理）视为陈旧锁，清掉重拿。
+// Windows 用命名互斥体：内核在持有进程死亡时自动释放，没有"陈旧锁"，
+// 也没有 PID 复用带来的误判（PID 探测会把复用了死进程 PID 的新进程当成
+// 持有者，实测踩过）。锁文件只用来给用户展示持有者 PID，不参与互斥。
+const mutexName = `Local\netmaster-serve`
+
 func Acquire(path string) (func(), int, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, 0, err
 	}
-	for attempt := 0; attempt < 2; attempt++ {
-		pid := os.Getpid()
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-		if err == nil {
-			b, _ := json.Marshal(map[string]int{"pid": pid})
-			_, _ = f.Write(b)
-			f.Close()
-			return func() { os.Remove(path) }, pid, nil
-		}
-		if !errors.Is(err, os.ErrExist) {
-			return nil, 0, err
-		}
-		holder := readPID(path)
-		if holder > 0 && processAlive(holder) {
-			return nil, holder, ErrLocked
-		}
-		// 陈旧锁或读不出 PID：删掉重来一次。删完仍被抢（极小竞态）就走下一轮
-		// 的 O_EXCL 失败分支报 ErrLocked。
-		_ = os.Remove(path)
+	name, err := syscall.UTF16PtrFromString(mutexName)
+	if err != nil {
+		return nil, 0, err
 	}
-	return nil, readPID(path), ErrLocked
-}
+	h, err := windows.CreateMutex(nil, true, name)
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		// 互斥体已存在 = 已有实例（拿到的句柄指向既有互斥体，关掉即可）
+		if h != 0 {
+			_ = windows.CloseHandle(h)
+		}
+		return nil, readPID(path), ErrLocked
+	}
+	if err != nil {
+		return nil, 0, err
+	}
 
-// processAlive 探测进程是否存活。OpenProcess 失败时区分"不存在"与
-// "无权访问"——后者（ERROR_ACCESS_DENIED）说明进程在，只是不是本用户的。
-func processAlive(pid int) bool {
-	h, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(pid))
-	if err == nil {
-		_ = windows.CloseHandle(h)
-		return true
+	pid := os.Getpid()
+	if f, ferr := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644); ferr == nil {
+		b, _ := json.Marshal(map[string]int{"pid": pid})
+		_, _ = f.Write(b)
+		f.Close()
 	}
-	return errors.Is(err, windows.ERROR_ACCESS_DENIED)
+	return func() {
+		_ = windows.ReleaseMutex(h)
+		_ = windows.CloseHandle(h)
+		_ = os.Remove(path)
+	}, pid, nil
 }
 
 func readPID(path string) int {

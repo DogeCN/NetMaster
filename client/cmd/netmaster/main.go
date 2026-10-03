@@ -442,9 +442,18 @@ func cmdServe(args []string) {
 
 	// 首次连通验证：一次真实的传输层建连（TLS+WS+auth），在后台跑，
 	// 结果出来补一行日志 —— 部署是否健康，这一行就是最直接的回答。
+	// *.workers.dev 在中国大陆被 SNI 阻断（实测同一 CF IP：workers.dev 的
+	// ClientHello 被 RST，其他域名正常），这是"连不上"的头号原因，失败时
+	// 直接把方向指给用户。
 	go func() {
 		if node, err := pool.Verify(); err != nil {
 			logger.Printf("tunnel failed: %v", err)
+			if strings.HasSuffix(host, ".workers.dev") {
+				logger.Println("hint: *.workers.dev domains are SNI-blocked in mainland China (and ECH is not published for them).")
+				logger.Println("      bind a custom domain to the Worker in the Cloudflare dashboard")
+				logger.Println("      (Workers & Pages -> netmaster -> Settings -> Domains & Routes -> Add Custom Domain),")
+				logger.Println("      then put that domain in config.json as \"server\". See docs/deployment.md.")
+			}
 		} else {
 			logger.Printf("tunnel established via node %s", node)
 		}

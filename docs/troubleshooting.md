@@ -32,11 +32,19 @@ printf '%s' '你的口令' | npx wrangler secret put PASSWORD
 首帧带 Unix 秒时间戳，服务端校验 **±300 秒**。客户端机器时钟偏了 5 分钟以上，所有连接都
 会以 `0x01` 被拒——症状和"密码错了"一模一样。先对表。
 
-### 3. 域名有没有绑上
+### 3. 域名有没有绑上 / 是不是 workers.dev
 
 Worker 只部署到 `workers.dev`，**custom domain 要你自己绑**。没绑域名时客户端的
 `--server` 无解可解析，启动会直接报
 `no entries: server domain unresolvable and community sources unreachable`。
+
+绑了域名但填的是 `*.workers.dev`（或只按部署输出用了 workers.dev 域名）：**大陆网络下
+SNI 阻断，客户端永远连不上**。实测（2026-10-03）：同一个 CF 边缘 IP，ClientHello 带
+workers.dev 域名被 RST（`tls: EOF` / `connection was forcibly closed`），换其他域名
+正常；workers.dev 的 HTTPS RR 不发布 ECH 配置，客户端的 ECH 兜底也启用不了。解法：
+控制台给 Worker 加 Custom Domain（Workers & Pages → netmaster → Settings →
+Domains & Routes → Add Custom Domain），config.json 的 `server` 填这个域名。
+客户端检测到 `*.workers.dev` 且验证失败时会打印这条提示。
 
 ## 看服务端日志
 

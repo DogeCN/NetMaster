@@ -646,3 +646,18 @@ M6 文档与部署脚本 一键部署脚本在全新账号跑通；README 快速
     首次路由命中会 ReferenceError（此前因 learn 恒 false 从未执行到）。
 - 单测：race 套件新增 winner携带 type / KV type 保留 / 未知 type 丢弃 / router hit 带
   type 四组断言。
+
+## A10. *.workers.dev 在中国大陆被 SNI 阻断——custom domain 是大陆用户的必做步骤（覆盖 §3.1）
+
+- 日期：2026-10-03，来源：v0.2.1 发布前的真机验收（大陆家庭宽带）。
+- 实测：同一 CF 边缘 IP（104.18.33.154），ClientHello 的 SNI 为
+  `*.workers.dev` 一律被 RST（<1s，`errno 10054`）；同一 IP 换
+  `www.cloudflare.com` / `www.speedtest.net` 等 SNI 握手正常。即阻断对象是
+  SNI 明文里的 workers.dev 后缀，与 IP 无关。
+- ECH 兜底不可用：workers.dev 的 HTTPS RR **不发布 `ech` 参数**（实测阿里 DoH
+  type=65 应答无 ech=），客户端的 ECH 路径无从启用。
+- 影响与对策：全新部署若只用 workers.dev 域名，大陆用户**永远连不上**。部署文档与
+  README 已把"绑定 custom domain"标为必做步骤；客户端在 `*.workers.dev` 验证失败时
+  打印定向提示（`tunnel failed` 之后附解法）。
+- 本验证即使用 custom domain（nm.0xa.cc.cd）完成：serve 4.6s 就绪、境外目标全部
+  200、空闲 185s 回收后重连透明（首请求 0.98s）、强杀进程后看门狗 <6s 还原系统代理。

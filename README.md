@@ -61,6 +61,12 @@ KV 里的中继健康排名（`proxyip:top`）由 GitHub Actions 的 `refresh-re
    路由，是客户端能连上它的**全部前提**——Worker 只部署到 `workers.dev`，域名不归
    项目管。
 
+   > **`*.workers.dev` 在中国大陆被 SNI 阻断，客户端直连必失败**（实测：同一 CF
+   > 边缘 IP，ClientHello 带 workers.dev 域名即被 RST，换其他域名正常；且
+   > workers.dev 不发布 ECH 配置，客户端的 ECH 兜底也无从启用）。绑定自己的
+   > 域名是大陆用户的必做步骤，不是可选优化。症状对照：客户端日志
+   > `tunnel failed: ... connection was forcibly closed / tls: EOF`。
+
 **方式 B：本地一键脚本（推荐给不用 CI 的人）。**
 
 ```bash
