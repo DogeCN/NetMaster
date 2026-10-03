@@ -67,6 +67,23 @@ func tunnelDefault(cfg config.Config) int {
 	return selector.DefaultMuxTarget
 }
 
+// recheckRounds 是 NETMASTER_PROBE_DEBUG 下每个被拒候选串行重探几轮。
+const recheckRounds = 3
+
+// recheckDelay 读 NETMASTER_PROBE_RECHECK_DELAY（秒），用来把重探推迟到限流窗口
+// 之后 —— 这是区分"本来就坏"与"我们自己打的"唯一靠得住的办法。
+func recheckDelay() time.Duration {
+	v := os.Getenv("NETMASTER_PROBE_RECHECK_DELAY")
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return time.Duration(n) * time.Second
+}
+
 // normalizeServer 接受裸域名，也宽容 scheme/路径（剥掉即可）。
 // 客户端自己解析域名、自己建 TLS，scheme 是内部事务。
 func normalizeServer(s string) string {
@@ -431,6 +448,26 @@ func cmdServe(args []string) {
 		}
 		for _, r := range pr.Refused {
 			logger.Printf("[probe] refused %s:%d — %s", r.Node.Addr, r.Node.Port, r.Err)
+		}
+		// 把被拒的串行重探一遍，分成"真的建不了隧道"和"被我们自己的并发打出来的"。
+		// 没有这个拆分的话，被拒条数是个被污染的上界，拿它算"该不该做升级验证"
+		// 的账一定会算错 —— 详见 selector.RecheckRefused 的说明。
+		if len(pr.Refused) > 0 {
+			// 重探前先等一会儿（可选）：要区分"这个 IP 本来就建不了隧道"与
+			// "Worker 那边的限流窗口还没过去"，必须等窗口过去再问。
+			if d := recheckDelay(); d > 0 {
+				logger.Printf("[probe] waiting %s before the serial re-probe", d)
+				time.Sleep(d)
+			}
+			rc := selector.RecheckRefused(context.Background(), pr.Refused, host, cfg.InsecureEnabled(), recheckRounds)
+			logger.Printf("[probe] recheck: %d still refused, %d were our own concurrency's fault (serial re-probe, %d rounds each)",
+				len(rc.StillRefused), len(rc.FalsePos), rc.Rounds)
+			for _, r := range rc.StillRefused {
+				logger.Printf("[probe] really refused %s:%d — %s", r.Node.Addr, r.Node.Port, r.Err)
+			}
+			for _, r := range rc.FalsePos {
+				logger.Printf("[probe] false positive %s:%d (refused in the concurrent pass, fine alone)", r.Node.Addr, r.Node.Port)
+			}
 		}
 	}
 
