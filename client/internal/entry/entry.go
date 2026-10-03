@@ -14,7 +14,6 @@ package entry
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -158,31 +157,38 @@ func Community(ctx context.Context) (nodes []Node, source string) {
 	return Merge(lists...), src
 }
 
-// fragClient 是拉取订阅用的 HTTP 客户端：TLS 握手之后（也就是连接建立之后），
+// fragClient 是拉取订阅用的 HTTP 客户端：TLS 握手之前（也就是连接建立之前），
 // 把前若干字节的**写**分片发出。
 //
-// 为什么需要：这三个源全是被墙域名。ClientHello 里的明文 SNI 会让连接在发出之后被
-// RST，而 crypto/tls 自己写 ClientHello，我们碰不到那些字节 —— 只能在底层 TCP 连接上
-// 包一层 tlsfrag.Conn。这也是为什么共享包要同时提供 Write（代理路径：整段 ClientHello
-// 已在手）与 Conn（本路径：字节由 TLS 栈写出）两个入口。
+// 为什么需要：这几个源是被墙域名。ClientHello 里的明文 SNI 会让连接在发出之后被
+// RST，而 crypto/tls 自己写 ClientHello，我们碰不到那些字节 —— 只能在**底层 TCP 连接**
+// 上包一层 tlsfrag.Conn，让 TLS 栈的每一次写都经过它。
+//
+// ⚠️ 因此这一层必须挂在 **DialContext**（裸 TCP）上，**不能**挂 DialTLSContext。
+//
+// 后者看起来等价，实际完全无效：Transport 先调用它、由它内部完成整个 TLS 握手，
+// ClientHello 早已被 crypto/tls 一次性写出；等我们拿到 conn 再包 tlsfrag.Conn 时，
+// 被打散的只是**握手之后**的 HTTP 请求字节 —— 对 SNI 阻断零作用，还平白多付约 400ms。
+// 挂 DialContext 时 Transport 会在我们返回的连接之上自己做 addTLS，ClientHello
+// 才真正经过 tlsfrag.Conn。
+//
+// 代价：设了自定义 DialContext 之后，Transport 只对"非代理的 HTTPS 请求"调用它，
+// 判定看的是**代理**的 scheme；设 https_proxy 时它拿到的还是代理地址，而分片对
+// 代理连接没有意义。所以这里显式 Proxy: nil，放弃环境代理 —— 这三个源本来就要求直连。
 //
 // 只影响**写**方向：阻断发生在客户端发出的方向，读方向不需要动。
 var fragClient = &http.Client{
 	Timeout: fetchTimeout,
 	Transport: &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
-		ForceAttemptHTTP2:   false, // 自定义了 DialTLSContext，不再尝试 h2 升级
+		Proxy:               nil, // 见上：自定义 DialContext 与环境代理互斥
+		ForceAttemptHTTP2:   false,
 		MaxIdleConnsPerHost: 1,
 		IdleConnTimeout:     30 * time.Second,
 		TLSHandshakeTimeout: fetchTimeout,
-		DialContext: (&net.Dialer{
-			Timeout:   fetchTimeout,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		// TLS 仍由标准库完成（证书照常校验，没有设 InsecureSkipVerify），
-		// 只在它之下把写打散。
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			d := &tls.Dialer{NetDialer: &net.Dialer{Timeout: fetchTimeout}}
+		// 只拨 TCP，不做 TLS：证书校验与 SNI 由 Transport 随后的 addTLS 正常完成
+		//（没有设 InsecureSkipVerify），TLS 栈写出的首段正好穿过 tlsfrag.Conn。
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			d := &net.Dialer{Timeout: fetchTimeout}
 			c, err := d.DialContext(ctx, network, addr)
 			if err != nil {
 				return nil, err
