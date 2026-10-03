@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"netmaster/internal/entry"
 )
@@ -93,5 +94,70 @@ func TestOptimizePassesThroughGoodEdges(t *testing.T) {
 	}
 	if len(got.Nodes) != 2 {
 		t.Fatalf("node pool = %d entries, want 2", len(got.Nodes))
+	}
+}
+
+// hangingUpgradeEdge 是最难缠的那类边缘：**TLS 握手完全正常**（所以第一阶段探测
+// 会把它排进前列），升级请求发过去之后一个字节都不回。实测里这类比直接拒绝更常见，
+// 也更贵 —— 直接拒绝至少是秒回的。
+func hangingUpgradeEdge(t *testing.T) int {
+	t.Helper()
+	release := make(chan struct{})
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		<-release // 永远不写响应
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+	_, port := srvAddr(t, srv)
+	return port
+}
+
+// TestOptimizeUpgradeStageIsTimeBounded 钉住升级阶段的时间上限。
+//
+// 这条是被一次真实启动量出来的：第一版让升级走 outbound.DialWS（TCP+TLS 6s、
+// 握手 8s），实测启动从 5.1s 涨到 13.1s —— 探测整整用满 10s 预算，而这段时间
+// 用户什么都干不了，只能看着浏览器打不开。挂死的边缘只要有一个就能吃掉整个预算。
+//
+// 断言用的是"远小于旧时限"的量级，所以只要有人把超时调回秒级就会红。
+func TestOptimizeUpgradeStageIsTimeBounded(t *testing.T) {
+	// 上面那条用例自己把时限压到 300ms，所以它证明的是"升级阶段读的是这个变量"。
+	// 默认值本身要单独钉：把它调回秒级不会让任何用例变红，而那正是 13.1s 那次
+	// 启动的真实原因。
+	if probeUpgradeTimeout > 3*time.Second {
+		t.Fatalf("probeUpgradeTimeout is %v; a probe stage budget is not a place for seconds "+
+			"(see the 13.1s startup in the commit that introduced it)", probeUpgradeTimeout)
+	}
+
+	old := probeUpgradeTimeout
+	probeUpgradeTimeout = 300 * time.Millisecond
+	defer func() { probeUpgradeTimeout = old }()
+
+	_, goodHost, goodPort := acceptingEdge(t)
+	deadPort := hangingUpgradeEdge(t)
+
+	var nodes []entry.Node
+	for i := 0; i < 3; i++ {
+		nodes = append(nodes, nodeFor("127.0.0.1", deadPort))
+	}
+	nodes = append(nodes, nodeFor(goodHost, goodPort))
+
+	start := time.Now()
+	got := Optimize(context.Background(), nodes, "example.com", true)
+	took := time.Since(start)
+
+	// 旧实现下这一波至少要 6 秒（tlsutil 的 dialPhaseTimeout）。给 2.5s 上限。
+	if took > 2500*time.Millisecond {
+		t.Errorf("probe took %v: a dead entry edge is allowed to eat the whole startup budget", took)
+	}
+	var kept bool
+	for _, n := range got.Nodes {
+		if n.Port == uint16(goodPort) {
+			kept = true
+		}
+	}
+	if !kept {
+		t.Error("the one working edge was dropped because dead ones timed out slowly")
 	}
 }

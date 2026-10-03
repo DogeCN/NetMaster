@@ -4,13 +4,18 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"netmaster/internal/entry"
-	"netmaster/internal/outbound"
 )
 
 // IP 优选（PRD §6.6）：并行测候选入口的 TLS 握手延迟，取最快的 TopN 作为节点池
@@ -41,9 +46,19 @@ const (
 	// `SESSION.get()` 建一个 DO（见 server/src/index.js）。全量验 = 每次启动凭空
 	// 建几十个用不上的 DO。取一个略高于 probeTopN 的前缀，是因为这个阶段本来
 	// 就是"择优"：排在第 20 名之后的候选，就算升级能过也轮不到它进池。
-	probeUpgradeCandidates = 24
-	probeUpgradeTimeout    = 4 * time.Second
+	probeUpgradeCandidates = 20
+	// probeUpgradeTimeout 是单个候选的"TCP + TLS + 升级"时限。
+	//
+	// 2.5s 不是拍脑袋：拨号侧把握手探测也定在 2.5s，两边一致意味着"探测说它快"
+	// 和"拨号觉得它快"是同一个判断，不会出现"探测放进来了、拨号却要等更久"的落差。
+	//
+	// 这条是实测逼出来的：第一版让升级阶段走 outbound.DialWS（TLS 阶段 6s、
+	// 握手 8s），启动从 5.1s 直接涨到 13.1s，探测整整用满 10s 预算。
 )
+
+// probeUpgradeTimeout 是变量而非常量：测试要把它压到毫秒级，才能在秒级用例里
+// 钉住"升级阶段不会把启动预算吃光"这件事。
+var probeUpgradeTimeout = 2500 * time.Millisecond
 
 // OptResult 是启动优选的结果。Rejected 单独拎出来是因为它对应一个用户能看见的
 // 症状（"时好时坏"）：这些 IP 的 TLS 完全正常，只有真的建隧道时才会被边缘拒绝。
@@ -220,14 +235,66 @@ func upgradeOK(ctx context.Context, ranked []ProbeResult, sni string, insecure b
 	return passed, rejected
 }
 
-// upgradeProbe 对单个候选做一次完整拨号：TLS 握手 + WS 升级，只要求拿到 101。
+// upgradeProbe 对单个候选做一次完整拨号：TCP + TLS + WS 升级，只要求拿到 101。
+//
+// 为什么不直接用 outbound.DialWS：它的超时是为"给用户建隧道"定的（TLS 阶段 6 秒、
+// 握手 8 秒）。探测要跑几十个候选，用那套超时的话，一波挂着不回的边缘就能把整个
+// 启动预算吃光 —— 实测正是这样：加了升级这一阶段之后，启动从 5.1s 涨到 13.1s，
+// 探测整整用满 10s 预算。这里自带一套按毫秒计的时限，与 TLS 阶段对称。
 func upgradeProbe(ctx context.Context, node entry.Node, sni string, insecure bool) error {
-	c := &outbound.Client{Node: node, SNI: sni, Insecure: insecure}
-	wc, err := c.DialWS()
+	addr := net.JoinHostPort(node.Addr, fmt.Sprint(node.Port))
+	raw, err := net.DialTimeout("tcp", addr, probeUpgradeTimeout)
 	if err != nil {
 		return err
 	}
-	return wc.Close()
+	defer raw.Close()                                        //nolint:errcheck
+	_ = raw.SetDeadline(time.Now().Add(probeUpgradeTimeout)) //nolint:errcheck
+
+	hsCtx, cancel := context.WithTimeout(ctx, probeUpgradeTimeout)
+	defer cancel()
+	tlsConn := tls.Client(raw, &tls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: insecure, //nolint:gosec // 探测层只筛路径，校验在拨号层
+		NextProtos:         []string{"http/1.1"},
+	})
+	if err := tlsConn.HandshakeContext(hsCtx); err != nil {
+		return err
+	}
+
+	// 与 outbound.DialWS 同一个技巧：把已经握好手的连接交给 gorilla，
+	// 否则它看到 wss 会再做一次 TLS 握手。
+	u := url.URL{Scheme: "wss", Host: addr, Path: "/"}
+	header := http.Header{}
+	header.Set("Host", sni)
+	d := websocket.Dialer{
+		NetDialTLSContext: func(context.Context, string, string) (net.Conn, error) { return tlsConn, nil },
+		HandshakeTimeout:  probeUpgradeTimeout,
+	}
+	ws, resp, err := d.Dial(u.String(), header)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
+		return fmt.Errorf("ws upgrade: %w%s", err, upgradeDiag(resp))
+	}
+	return ws.Close()
+}
+
+// upgradeDiag 把边缘的非 101 响应压成一行，与 outbound.wsDiag 同样的用途：
+// 用户报障时能直接贴出"这个 IP 为什么被拒"，而边缘本身不会告诉你。
+func upgradeDiag(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+	msg := strings.TrimSpace(string(body))
+	if len(msg) > 120 {
+		msg = msg[:120] + "..."
+	}
+	if msg == "" {
+		return fmt.Sprintf(" (edge said %s)", resp.Status)
+	}
+	return fmt.Sprintf(" (edge said %s: %s)", resp.Status, msg)
 }
 
 // Summary 把探测结果压成一行日志（最快/最慢/失败数）。
