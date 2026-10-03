@@ -767,3 +767,42 @@ M6 文档与部署脚本 一键部署脚本在全新账号跑通；README 快速
 - **闸门性质说清**：`deploy.yml` 的自定义域检查在 `wrangler deploy` **之后**，它是
   **检测**（把同一个 commit 的 run 标红）而非**阻止**这次部署发生。失败路径是 fail-closed：
   API 不可读或 token 无权限都会 exit 1，不会静默通过。
+
+## A14. 换账号重建部署（2026-10-04）：旧账号被测试打爆，新账号从零起
+
+- 日期：2026-10-04。触发原因：前几轮压测（多进程 × 20 路并发、反复重连、`PROFILE=1`）
+  把**旧账号**的 Durable Object 日额度用尽，于是"部署健康但请求全失败"这种最难查的
+  状态出现了。用户换了一套凭据（新账号 `47f2730c…`），要求从零重建、域名自己绑。
+- **旧账号的教训（值得记）**：额度耗尽时，服务端表现是**边缘仍在认证、开流无响应**，
+  客户端只能等满 `streamReadyTimeout`(20s) —— 与"中继池挂了"完全同形。本轮的 20s 抖动
+  里就混着这一类，所以**压测必须与生产部署隔离**（用独立 worker 或独立账号），
+  否则测出来的数字既污染基线、又烧掉线上额度。
+- **新账号从零做了这些**（都不入库，属运行环境）：
+  - 建 KV namespace `netmaster` = `bb88d68bd8b34e8c9879b11d00ce47e9`（部署工作流按名字
+    解析，所以先手工建好它就会直接复用）；
+  - 更新仓库 secrets：`CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` / `PASSWORD`
+    （旧值是 10-01 的，会部署到已经限额的旧账号——**这是本轮最容易踩空的一步**）；
+  - 更新仓库 variable `NETMASTER_KV_ID`（`acceptance.yml` 的 KV 健康快照读它，
+    不更新就会去读旧账号的空池）；
+  - `gh workflow run deploy.yml` → worker `netmaster` 部署成功
+    （`netmaster.dogecn.workers.dev`），PASSWORD secret 已透传。
+- **验收（对 `netmaster.dogecn.workers.dev`，CI 干净网络）**：协议套件 7 套全 PASS
+  （crypto 14 / protocol 54 / integration 25 / proxyip 28 / race 45 / router 52 /
+  refresh-relays 45）；live 直连出口 HTTP 200；单 WS 并发 **20/20**；4 条 WS 分摊
+  **20/20**；**CF 托管目标 20/20（100%）**——比旧账号同期（45–65%、两轮 0/20）干净得多。
+- **未完成：自定义域还没绑。** 新 token 只有 Workers 脚本权限：`GET …/workers/domains`
+  可读（200），但 `POST …/workers/domains` 返回 **405 `Method not allowed for this
+  authentication scheme`**，`/zones/<id>/dns_records` 与 `/zones/<id>/workers/routes`
+  都是 403。旧 token 同样没有 DNS 权限。所以域名绑定要么在控制台点一次，要么给 token
+  补 `Workers Custom Domains: Edit`（+ `Zone DNS: Edit`）：
+  - zone `1nf.cc.cd`（`7f356704053d46409bd7b3374643daaf`）→ 建议主机名
+    `proxy.1nf.cc.cd`，service `netmaster`，environment `production`；
+  - 绑上之前 `deploy.yml` 的闸门必然红（这是它的设计意图，不是回归），
+    而 `*.workers.dev` 在大陆被 SNI 阻断（A10），**实机不可用**。
+- **网络路径的记录**：本机对 `api.cloudflare.com` 的 TLS 被中间人干扰
+  （`SEC_E_UNTRUSTED_ROOT` / `SEC_E_CERT_EXPIRED`），直连 API 不可用。可用的两条路：
+  ① 经项目自己的代理（`netmaster serve --manual` + `-x http://127.0.0.1:8080`，
+  但代理进程必须常驻，父 shell 退出会把它带走）；② Node 24 的
+  `NODE_USE_ENV_PROXY=1` + `HTTPS_PROXY`（**curl 的 schannel 会在 POST 上偶发
+  `SEC_E_INTERNAL_ERROR`，node 的 fetch 走 OpenSSL，稳定**）。`wrangler` 自己的代理
+  支持在这条链路上不工作（`fetch failed`），所以本地不做 wrangler 部署，交给 CI。
