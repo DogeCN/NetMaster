@@ -150,6 +150,11 @@ func rulesOverridesFromFile(path string) rules.Overrides {
 // 12 并发探测 64 个仍在秒级完成，代价可接受。
 const maxEntries = 64
 
+// dnsHeadroom 是服务端域名解析结果先占的名额。DNS 源排在最前且"永远可用"
+// （社区源挂了它还得兜底），但也不能让它吃掉整个预算——实测它通常只回 1~4 个 A 记录，
+// 给 16 个名额足够，宽了就是浪费社区源的位置。
+const dnsHeadroom = 16
+
 func resolveEntries(ctx context.Context, server string) ([]entry.Node, string) {
 	commCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
@@ -157,19 +162,24 @@ func resolveEntries(ctx context.Context, server string) ([]entry.Node, string) {
 	// 串行的话慢的那类直接拖慢启动。
 	var (
 		wg      sync.WaitGroup
-		comm    []entry.Node
+		lists   [][]entry.Node
 		src     string
 		fromSrv []entry.Node
 	)
 	wg.Add(2)
-	go func() { defer wg.Done(); comm, src = entry.Community(commCtx) }()
+	go func() { defer wg.Done(); lists, src = entry.CommunityLists(commCtx) }()
 	go func() { defer wg.Done(); fromSrv = entry.FromServer(commCtx, server) }()
 	wg.Wait()
 
-	nodes := entry.Merge(fromSrv, comm)
-	if len(nodes) > maxEntries {
-		nodes = nodes[:maxEntries]
+	// 名额按源轮转交错分配，不按到达顺序盲截：社区源响应时间差异大（协助者实测
+	// 522 / 896 / 1395ms）且单源条目数可以超过上限本身（pages.dev 150 > 64），
+	// 盲截会让"每次启动活下来的那批"随机变化 —— 节点池不可复现，任何前后对比都
+	// 失去意义。DNS 源排在最前且必须全收，单独先占一段名额。
+	head := fromSrv
+	if len(head) > dnsHeadroom {
+		head = head[:dnsHeadroom]
 	}
+	nodes := append(head, entry.Interleave(lists, maxEntries-len(head))...)
 	if len(nodes) == 0 {
 		fatal("no entries: server domain unresolvable and community sources unreachable")
 	}
@@ -244,7 +254,7 @@ func cmdNodes(args []string) {
 	logger.Printf("entries: %d (community: %s)", len(nodes), src)
 	pool := selector.New(selector.Config{Nodes: nodes, SNI: host, Password: pw, UseECH: !cfg.ECHDisabled(), Insecure: cfg.InsecureEnabled()})
 
-	router, rerr := rules.LoadRules(context.Background(), rules.Overrides{}, "", nil)
+	router, rerr := rules.BuiltinOnly(nil, nil)
 	if rerr != nil {
 		logger.Fatal("rules: ", rerr)
 	}
@@ -384,8 +394,9 @@ func cmdServe(args []string) {
 		n, took := selector.Optimize(context.Background(), all, host, cfg.InsecureEnabled())
 		probed <- probeResult{nodes: n, took: took}
 	}()
+	//规则只用内置集：不拉订阅、不读磁盘缓存（见 rules.BuiltinOnly 的理由）。
 	rulesOverrides := rulesOverridesFromFile(*rulesFile)
-	router, rerr := rules.LoadRules(context.Background(), rulesOverrides, "default", geo)
+	router, rerr := rules.BuiltinOnly(rulesOverrides.Custom, geo)
 	if rerr != nil {
 		fatal("load rules: " + rerr.Error())
 	}
