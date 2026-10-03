@@ -40,7 +40,7 @@ Prerequisites:
 What it does:
   1. npm ci
   2. node build.mjs          -> server/_worker.js
-  3. import check on _worker.js
+  3. syntax check on _worker.js
   4. resolve/create the KV namespace 'netmaster'
   5. copy wrangler.toml -> wrangler.deploy.toml with the real namespace id
   6. wrangler deploy -c wrangler.deploy.toml
@@ -120,11 +120,17 @@ run npm ci
 run node build.mjs
 
 # _worker.js 是拼接产物：build.mjs 只做字符串拼接，语法错误会一路带到部署之后
-# 才以 Worker 启动失败的形式暴露。这里 import 一次，让它在部署前就炸出来。
+# 才以 Worker 启动失败的形式暴露。这里校验一次，让它在部署前就炸出来。
+#
+# 用 `node --check` 而不是 `import('./_worker.js')`：产物顶层有 cloudflare:* 平台
+# import（socket.js 的 connect、session.js 的 DurableObject），Node 的 ESM 加载器
+# 根本不认识这个 scheme，会抛 ERR_UNSUPPORTED_ESM_URL_SCHEME —— 那是"Node 不支持",
+# 不是"产物坏了"。原来的 import 检查因此必然失败，等于这条部署路径从来跑不通。
+# 与 ci.yml 的 build 门保持一致：那里也是 node --check。
 if [ "$dry_run" -eq 0 ]; then
-  node -e "import('./_worker.js').then(() => console.log('bundle loads OK'))"
+  node --check _worker.js && echo "bundle syntax OK"
 else
-  printf '$ %s\n' "node -e \"import('./_worker.js')...\"  # bundle load check"
+  printf '$ %s\n' "node --check _worker.js   # bundle syntax check"
 fi
 
 # --- 4. KV namespace ---
@@ -180,6 +186,30 @@ else
     echo "== wrangler.deploy.toml written (KV id $kv_id); wrangler.toml untouched =="
   else
     printf '$ %s\n' "sed \"s/^id = \\\"$placeholder\\\"/id = \\\"<KV_ID>\\\"/\" wrangler.toml > wrangler.deploy.toml"
+  fi
+fi
+
+# --- 5b. 可选：打开服务端 profile ---
+#
+# PROFILE=1 scripts/deploy.sh 会在**临时配置**上追加 [vars] PROFILE = "1"，
+# 于是 SessionDO 开始把分段耗时写进 KV（键 profile:<目标>:<分钟>，TTL 1 小时）。
+# 客户端侧对应的是环境变量 NETMASTER_PROFILE=1，见 tools/profile.mjs。
+#
+# 为什么只改临时配置、不改 wrangler.toml：
+#   1. profile 要花 KV 写配额。它是排障开关，不该留在入库配置里变成常开 ——
+#      否则每次部署都在为一个没人看的功能写 KV。
+#   2. wrangler.toml 里 keep_vars = false，语义是"删掉 Worker 上有、本文件里没有
+#      的变量"。如果只在控制台的 Variables 里加 PROFILE，下一次 wrangler deploy
+#      会把它悄悄删掉，而本地验证时明明是好的 —— 这种"部署一次就没了"最难查。
+#      写进实际部署的那份配置就没这个问题。
+if [ "$dry_run" -eq 0 ]; then
+  if [ "${PROFILE:-}" = "1" ]; then
+    printf '\n[vars]\nPROFILE = "1"\n' >> "$toml_tmp"
+    echo "== profile ON (KV keys profile:<target>:<minute>, ttl 1h) =="
+  fi
+else
+  if [ "${PROFILE:-}" = "1" ]; then
+    printf '$ %s\n' "printf '\\n[vars]\\nPROFILE = \"1\"\\n' >> wrangler.deploy.toml"
   fi
 fi
 

@@ -2,3 +2,12 @@
 *.go text eol=lf
 *.mjs text eol=lf
 *.js text eol=lf
+
+# 这几个原先漏了。后果不是 CI 挂掉 —— blob 本身一直是 LF，CI 全新 checkout 拿到
+# 的就是 LF —— 而是本机（core.autocrlf=true）工作区被塞成 CRLF：shell 脚本在
+# Windows 上直接 bash 会报 `$'\r': command not found`，yml 也会被改成混合行尾，
+# 让按行匹配的编辑工具（和 diff review）莫名其妙对不上。
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf

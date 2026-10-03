@@ -1,17 +1,8 @@
 # 构建产物：_worker.js 由 src/ 生成，不进版本库
 server/_worker.js
-client/netmaster.exe
-client/netmaster
-# go build -o 在 Windows 上覆盖一个正在运行的 exe 时会先把它改名成 exe~，
-# 失败/被占用就留下这个残骸。它和 serve.lock 是同一类问题：12 MB 的构建残骸
-# 挂在被跟踪目录里，`git status` 就不干净，发布清单第 1 项过不了。
-client/netmaster.exe~
+client/netmaster.*
 server/node_modules/
 .wrangler/
-
-# scripts/deploy.sh 生成的临时部署配置（wrangler.toml 的副本 + 真实 KV id）。
-# 不入库的理由：它是本机一次部署的产物，含真实 namespace id；wrangler.toml
-# 本身是入库文件，脚本刻意只写这份副本。
 server/wrangler.deploy.toml
 
 # 客户端配置可能含口令，不进版本库
@@ -32,13 +23,5 @@ serve.lock
 Thumbs.db
 .DS_Store
 
-
-# 协作面（.collab/）是有意入库的 —— 跨会话共享状态，清掉就没了
-
 # 本地调试产物
 refresh-relays.log
-
-# ZCode 本地工作区文件（顶部区块自动同步自 .gitignore，入库只会产生噪音）
-.zcodeignore
-serve.lock
-dom.json

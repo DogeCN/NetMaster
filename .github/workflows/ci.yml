@@ -50,15 +50,13 @@ jobs:
       - name: Unit tests
         run: |
           set -o pipefail   # node 的报错走 stderr，tail 会吞退出码 —— 不加这个测试挂了 CI 也是绿的
-          # crypto/protocol 是纯逻辑；其余套件经 socket.js 摸平台模块，要挂 shim
-          for t in crypto protocol; do
-            printf '%-12s ' "$t"
-            node "test/$t.mjs" | tail -1
-          done
-          for t in integration proxyip race router refresh-relays; do
-            printf '%-12s ' "$t"
-            NODE_OPTIONS="--import ./test/shims/register.mjs" node "test/$t.mjs" | tail -1
-          done
+          # 直接调 run-all.mjs，不在这里重抄一份套件清单。
+          #
+          # 之前这里是手写的两段 for 循环，于是新增套件必须记得回来加一行 ——
+          # 回归套件 regressions.mjs 就是这么被落下的：本地 `npm test` 跑 8 套，
+          # CI 只跑 7 套，测的还恰好是"作用域逃逸 / 字符集注入 / 打包器静默丢模块"
+          # 这三条最该有门的。清单只留一份，在 run-all.mjs 里。
+          npm test
 
   client:
     runs-on: ubuntu-latest
@@ -84,6 +82,27 @@ jobs:
       - name: Vet
         working-directory: client
         run: go vet ./...
+
+      # staticcheck 补的是 vet 抓不到的那一类：SA/SAF/S 系（恒假条件、丢弃的错误、
+      # 无效赋值、未用字段…）。
+      #
+      # 为什么必须另加一道：`go vet` 与 gofmt 都是**格式与用法**门禁，它们全绿的代码
+      # 完全可能是错的。实测过的真实缺陷：`defer` 写未命名返回值 —— `return res` 先
+      # 把 res 拷进返回槽位、再执行 defer，于是那次赋值被丢弃、ECHWorked 恒为 false。
+      # 那份代码 gofmt clean、vet exit 0、staticcheck 也 exit 0：三道全绿，逻辑全错。
+      # —— 也因此，别指望这道门兜住全部：它是网，不是墙。
+      #
+      # 版本钉死：latest 会在某天静默换掉检查集，然后某天开始红。2025.1.1 是本地验证
+      # 过能配 go.mod 里那个 go 1.26.3 的版本。
+      #
+      # 不开 -checks ST*（stylecheck）：那批是命名/注释级的吹毛求疵，一次能报几十条。
+      # 本文件顶上写着"一道永远绿的门等于教人忽略它"，反过来一道永远红的门同样等价 ——
+      # 要开就单开一个 job，别混进这道。
+      - name: Staticcheck
+        working-directory: client
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
+          "$(go env GOPATH)/bin/staticcheck" ./...
 
       - name: gofmt
         working-directory: client
