@@ -61,7 +61,15 @@ type Pool struct {
 	idleTrimDelay time.Duration
 	closed        bool // Close 之后为终态：不再拨号、不再补齐
 
-	warmRetries int // 连续几轮补齐失败（指数退避用；成功即清零）
+	// warmRetries: 连续几轮补齐失败（指数退避用；成功即清零）。
+	//
+	// 必须是原子的：它在 TopUp 起的最多 warmSlots 个 goroutine 里被读-改-写
+	// （下面那个 delay := warmRetryDelay << min(...) 后紧跟 ++ 是一次读改写），
+	// 还会被 time.AfterFunc 的重试链继续触发。裸 int 会丢更新，而丢更新的后果
+	// 恰好是这个退避唯一要防的东西：计数被压回 0 → 延迟塌回 2 秒地板 → 一个
+	// 已经关掉的 Worker 被我们每 2 秒拨满 warmSlots 次（正是本文件下面注释里
+	// 记着的那次实测：Close() 之后 500ms 内 69 次拨号尝试）。
+	warmRetries atomic.Int32
 	// idleHold: 刚因为空闲回收缩过一轮，先别急着补。
 	//
 	// 为什么需要它：光在 onMuxDead 里对自回收打个标记是不够的 —— 回收的那一刻
@@ -503,7 +511,7 @@ func (p *Pool) TopUp() {
 				return
 			}
 			if ok {
-				p.warmRetries = 0
+				p.warmRetries.Store(0)
 				p.TopUp()
 				return
 			}
@@ -515,11 +523,14 @@ func (p *Pool) TopUp() {
 			// 每 2 秒拨满 warmSlots 次，永远不停（对抗评审实测：Close() 之后 500ms
 			// 内又发起了 69 次拨号尝试）。指数退避把它压到一分钟一次，代价可以忽略，
 			// 而真恢复过来的那一次最多晚一分钟接上 —— 那种情况下用户早就重开了客户端。
-			delay := warmRetryDelay << min(p.warmRetries, 5)
+			//
+			// 计数与取延迟必须合成一次原子操作：先 Load 再 Store 是读-改-写，
+			// 几个 goroutine 同时失败时照样丢更新，退避就被压回地板。
+			prev := p.warmRetries.Add(1) - 1
+			delay := warmRetryDelay << min(prev, 5)
 			if delay > warmRetryMaxDelay {
 				delay = warmRetryMaxDelay
 			}
-			p.warmRetries++
 			time.AfterFunc(delay, p.TopUp)
 		}()
 	}
@@ -614,6 +625,28 @@ func (p *Pool) directTimeout() time.Duration {
 }
 
 func (p *Pool) Len() int { return len(p.nodes) }
+
+// Alive 返回**当前还没被判死**的节点数。
+//
+// 为什么不能拿 Len() 代替：Len() 数的是池子里有多少节点，不是有多少能用。
+// 实测过一个池里 49 个节点全死的情形，于是 `Len() != 0`，调用方据此认为
+// "还有出口可用"，既不去直连兜底也不报错 —— 用户看到的是客户端打印 ready、
+// 网页却一张都打不开，而失败原因不在任何用户能看到的地方。
+//
+// 语义与 pickNode 对齐：**全判死时返回 0**，不是返回 len(nodes)。
+// pickNode 在全死时会复活全部节点继续赌一把，但"曾经全部失败过"本身就是
+// 直连兜底比再等一轮退避重连更划算的信号。
+func (p *Pool) Alive() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for i := range p.nodes {
+		if !p.dead[i] {
+			n++
+		}
+	}
+	return n
+}
 
 // MuxTarget 返回这个池实际生效的隧道条数（诊断/启动日志用）。
 func (p *Pool) MuxTarget() int { return p.muxTarget }
@@ -774,6 +807,19 @@ func (p *Pool) NeedsFragDirect(host string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.fragDirectFreshLocked(host)
+}
+
+// ForgetFragDirect 忘掉"这个域名要分片直连"（实现 proxy.FragDirecter）。
+//
+// 为什么需要它：fragDirect 的优先级**高于** directBlocked（见字段注释），所以一条
+// 过期的分片记忆会连带压掉"这个域名该走代理"这条结论。如果链路一变（换了网络、
+// 换了中间设备），分片开始失效而记忆还有 6 小时，每条连接都会白付约 400ms 的
+// 分片延迟再落代理。分片实测失败时必须把它摘掉，否则这个代价会持续很久。
+func (p *Pool) ForgetFragDirect(host string) {
+	host = hostOf(host)
+	p.mu.Lock()
+	delete(p.fragDirect, host)
+	p.mu.Unlock()
 }
 
 func (p *Pool) bindDirect(host string, direct bool) {

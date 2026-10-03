@@ -81,11 +81,10 @@ func TestOptimizeRejectsUpgradeFailingIPs(t *testing.T) {
 	// 偶发连不上 —— 那是测试环境的产物，不该让回归测试去承担。
 	const good, bad = 2, 2
 	var nodes []entry.Node
-	var goodPorts, badPorts []int
+	var badPorts []int
 	for i := 0; i < good; i++ {
 		_, host, port := acceptingEdge(t)
 		nodes = append(nodes, nodeFor(host, port))
-		goodPorts = append(goodPorts, port)
 	}
 	for i := 0; i < bad; i++ {
 		host, port := rejectingEdge(t)

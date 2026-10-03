@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -295,6 +296,18 @@ func probeOne(ctx context.Context, node entry.Node, sni string, insecure bool, e
 //     而是握手刚完就被 RST（GFW 主动重置）。
 //
 // 拿不到 ECH 配置时退回明文 SNI：少一层保护也比完全不测强。
+// echWorked 记录**本进程最近一次 Optimize 探测**里，是否真的用 ECH 完成过一次握手。
+//
+// 为什么不能拿 tlsutil.ECHEnabled() 当这个信号：它的语义是"当前**是否值得尝试**ECH"
+// （now >= echDownUntil，见 tlsutil/ech.go），是一个许可/意图标志，不是结果。
+// 两者在"配置取到了但握手没成"时恰好分叉 —— bogus 配置会让握手失败，可失败未必
+// 被判成结构性故障、于是不会 MarkECHDown，ECHEnabled() 仍然是 true。
+// 那样 ECHWorked 会在 ECH 根本没生效时上报 true，恰好重演这个字段要消灭的那件事：
+// 用户以为 SNI 被藏起来了。
+//
+// 所以成功只在握手成功那一处记录（下面的 err == nil 分支）。
+var echWorked atomic.Bool
+
 func handshake(ctx context.Context, raw net.Conn, sni string, insecure bool, ech []byte) (net.Conn, error) {
 	// 每个候选都重新问一次 ECH 是否还可用，而不是只在 Optimize 开头问一次。
 	//
@@ -306,6 +319,8 @@ func handshake(ctx context.Context, raw net.Conn, sni string, insecure bool, ech
 	if len(ech) > 0 && tlsutil.ECHEnabled() {
 		conn, err := tlsutil.ECHOverConnDeadline(raw, sni, ech, insecure, probeTimeout)
 		if err == nil {
+			// 唯一能证明 ECH 真的生效了的地方：utls 走完了 ECH 握手。
+			echWorked.Store(true)
 			return conn, nil
 		}
 		if !tlsutil.ECHEnabled() {
@@ -352,12 +367,21 @@ func dialRaw(old net.Conn) (net.Conn, error) {
 //
 // 全灭时原样返回（全部候选都是死节点，但节点池为空会让代理完全不可用，
 // 留个机会比直接放弃好）。
-func Optimize(ctx context.Context, nodes []entry.Node, sni string, insecure bool) OptResult {
+// res 必须是**命名返回值**。
+//
+// 它不是风格问题：ECHWorked 是靠 `defer` 写进去的，而 `return res` 会先把 res 拷进
+// 返回槽位、再执行 defer —— 于是那次赋值被丢掉，ECHWorked 恒为 false。
+//
+// 这个恒假值有实际后果：客户端启动日志那行 "[ech] ...VISIBLE SNI" 正是靠它才碰巧
+// 说对了话（ECH 确实没生效）。用户照 README 在 CF zone 上打开 ECH 之后，这行日志
+// **仍然**会说没生效 —— 恰好摧毁掉唯一提示他去开 ECH 的信号。命名返回值让赋值
+// 落在返回槽位上，defer 才改得动最终结果。
+func Optimize(ctx context.Context, nodes []entry.Node, sni string, insecure bool) (res OptResult) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, probeBudgetAll)
 	defer cancel()
 
-	res := OptResult{ProbeTook: time.Since(start)}
+	res = OptResult{ProbeTook: time.Since(start)}
 
 	// ECH 配置**整个探测只取一次**，然后每个候选复用：它是按域名取的，与候选 IP
 	// 无关，逐个取会把启动时间乘以候选数。
@@ -365,8 +389,10 @@ func Optimize(ctx context.Context, nodes []entry.Node, sni string, insecure bool
 	// 取不到就退回明文 SNI（见 handshake 的说明）：那是"少一层保护"，不是"不测"。
 	ech := echConfigFor(ctx, sni)
 	res.ECHConfigured = len(ech) > 0
+	// 每轮从零开始：同一进程可能连着跑好几次探测，上一轮成功不能算这一轮的成果。
+	echWorked.Store(false)
 	if res.ECHConfigured {
-		defer func() { res.ECHWorked = tlsutil.ECHEnabled() }()
+		defer func() { res.ECHWorked = echWorked.Load() }()
 	}
 
 	// 第一段：便宜的 TCP 筛查，把候选缩到值得握手的规模。
