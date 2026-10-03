@@ -19,8 +19,13 @@ on:
   workflow_dispatch:
     inputs:
       worker:
-        description: "deployed worker hostname (no scheme)"
-        default: "netmaster.edge-tunnel.workers.dev"
+        # 默认留空 → 用 repo variable NETMASTER_WORKER。原先硬编
+        # netmaster.edge-tunnel.workers.dev，换账号后那个 worker 还在（且会被
+        # 测试打到限额），于是每次 push 触发的验收都在测一个已经不该测的部署，
+        # 红得毫无信息量 —— 真实事故：2026-10-04 换账号后 push 触发的 acceptance
+        # 连续失败，原因是旧账号 DO 额度耗尽后 WS 升级返回 1101。
+        description: "deployed worker hostname (no scheme); empty = repo variable NETMASTER_WORKER"
+        default: ""
       rounds:
         description: "repeated requests for the CF-hosted success-rate check"
         default: "20"
@@ -57,11 +62,25 @@ jobs:
             NODE_OPTIONS="--import ./test/shims/register.mjs" node "test/$t.mjs" | tail -1
           done
 
+      # 解析"验收哪个部署"。留空就硬失败：live_test 在没有 worker 时会 t.Skip，
+      # 而**跳过的 run 也是绿的** —— 那正是这个工作流最该防的假绿。
+      - name: Resolve target worker
+        id: target
+        env:
+          W: ${{ inputs.worker != '' && inputs.worker || vars.NETMASTER_WORKER }}
+        run: |
+          if [ -z "$W" ]; then
+            echo "::error::no worker hostname: pass the 'worker' input, or set repo variable NETMASTER_WORKER (Settings → Secrets and variables → Actions → Variables)"
+            exit 1
+          fi
+          echo "worker=$W" >> "$GITHUB_OUTPUT"
+          echo "acceptance target: $W"
+
       # 直连出口 + 多路复用：一次跑完，输出即验收依据。
       - name: Live tunnel checks (direct exit + mux)
         working-directory: client
         env:
-          NETMASTER_E2E_WORKER: ${{ inputs.worker != '' && inputs.worker || 'netmaster.edge-tunnel.workers.dev' }}
+          NETMASTER_E2E_WORKER: ${{ steps.target.outputs.worker }}
           NETMASTER_E2E_PASSWORD: ${{ secrets.PASSWORD }}
         run: go test ./internal/outbound/ -run TestLive -v -count=1 -timeout 300s
 
@@ -69,7 +88,7 @@ jobs:
       - name: CF-hosted target success rate
         working-directory: client
         env:
-          NETMASTER_E2E_WORKER: ${{ inputs.worker != '' && inputs.worker || 'netmaster.edge-tunnel.workers.dev' }}
+          NETMASTER_E2E_WORKER: ${{ steps.target.outputs.worker }}
           NETMASTER_E2E_PASSWORD: ${{ secrets.PASSWORD }}
           NETMASTER_E2E_ROUNDS: ${{ inputs.rounds }}
         run: go test ./internal/outbound/ -run TestLiveCFHosted -v -count=1 -timeout 600s

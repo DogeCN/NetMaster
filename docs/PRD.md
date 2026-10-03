@@ -806,3 +806,11 @@ M6 文档与部署脚本 一键部署脚本在全新账号跑通；README 快速
   `NODE_USE_ENV_PROXY=1` + `HTTPS_PROXY`（**curl 的 schannel 会在 POST 上偶发
   `SEC_E_INTERNAL_ERROR`，node 的 fetch 走 OpenSSL，稳定**）。`wrangler` 自己的代理
   支持在这条链路上不工作（`fetch failed`），所以本地不做 wrangler 部署，交给 CI。
+- **换账号暴露的第二个坑：验收工作流的默认目标是硬编的。** `acceptance.yml` 的
+  `worker` 输入默认写死 `netmaster.edge-tunnel.workers.dev`（旧账号），于是 push 触发的
+  验收一直在测一个已经不该测的部署；旧账号 DO 额度耗尽后 WS 升级返回 **1101
+  （Worker 抛异常）**，验收连续红——而这条红是环境性的，与当次提交无关。
+  已改为走 repo variable **`NETMASTER_WORKER`**（`= proxy.1nf.cc.cd`），并加一步
+  "解析不到就硬失败"：`live_test` 在 worker 为空时会 `t.Skip`，**跳过的 run 也是绿的**，
+  那正是这个工作流最该防的假绿。至此仓库需要两个 variable：
+  `NETMASTER_KV_ID`（验收的 KV 健康快照）与 `NETMASTER_WORKER`（验收目标）。
