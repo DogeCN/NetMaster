@@ -1,6 +1,9 @@
 package entry
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestIsCloudflareIP(t *testing.T) {
 	cases := []struct {
@@ -110,4 +113,30 @@ func mkNodes(prefix string, n int) []Node {
 		out[i] = Node{Addr: name, Port: 443, Name: prefix}
 	}
 	return out
+}
+
+// TestSourcesOf 钉住"启动日志里的 community: 那一行是真的"。
+//
+// 它曾经被硬编码成 "none"：源全挂了和源正常，在用户眼里长得一模一样，
+// 而这恰恰是排障第一个要看的信息。
+func TestSourcesOf(t *testing.T) {
+	if got := sourcesOf(nil); got != "none" {
+		t.Errorf("no lists at all = %q, want %q", got, "none")
+	}
+	if got := sourcesOf(make([][]Node, len(Sources))); got != "none" {
+		t.Errorf("all sources empty = %q, want %q", got, "none")
+	}
+	lists := make([][]Node, len(Sources))
+	lists[0] = mkNodes("a", 3)
+	lists[2] = mkNodes("c", 1)
+	got := sourcesOf(lists)
+	if !strings.Contains(got, sourceLabel(Sources[0])) || !strings.Contains(got, sourceLabel(Sources[2])) {
+		t.Fatalf("contributing sources missing from %q", got)
+	}
+	if strings.Contains(got, sourceLabel(Sources[1])) {
+		t.Errorf("%q lists a source that contributed nothing", got)
+	}
+	if got == "none" {
+		t.Error("two sources contributed but the log line still says none")
+	}
 }

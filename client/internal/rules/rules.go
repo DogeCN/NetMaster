@@ -157,6 +157,40 @@ func (r *Router) add(rule Rule) {
 	}
 }
 
+// BuiltinOnly 只用内置规则集构造 Router，**不拉任何网络、不读磁盘缓存**。
+//
+// 为什么砍掉订阅：分流表的唯一作用是省掉"第一次走错"。而现在客户端已经有完整的观测闭环
+// （明文探测 → 判阻断 → 分片 → 记忆，见 internal/proxy/tlsfrag.go），走错一次的代价是
+// 多等一个探测窗口，不是走不通。订阅反而是整个启动路径上**唯一必须外网可达的配置来源**
+// —— 实测 `raw.githubusercontent.com` 在大陆直接 ECONNRESET，也就是说这份表在需要的
+// 地方恰恰拿不到，还得为"拉不到"再写一条降级路径。少一个外部依赖是净收益。
+//
+// 砍掉它**不会伤到两条边界**，它们都独立于规则集：
+//   - 私网/loopback 强制直连：`Match` 里 `privateCIDRs` 是硬编码的（见 Match）；
+//   - CN 先验：GeoIP 是独立阶段（`geoAction`，默认 Direct），不经过规则列表。
+//
+// 所以最终形态 = 私网硬规则 + geoip CN 先验 + 进程内记忆（frag 6h / blocked 冷却）。
+//
+// userRules 非空时（`--rules` 指定的本地文件）叠加在内置集之上：用户显式指定了规则，
+// 就该只有他的规则 + 内置兜底，不再叠订阅。
+func BuiltinOnly(userRules []Rule, geo GeoResolver) (*Router, error) {
+	var parsed []Rule
+	skipped := 0
+	var stats []ParseStats
+	for _, s := range BuiltinRulesets() {
+		rules, st := ParseClashRuleset(s.Name, s.Body, s.Action)
+		parsed = append(parsed, rules...)
+		skipped += st.Skipped
+		stats = append(stats, st)
+	}
+	parsed = append(parsed, userRules...)
+	r := New(parsed, Proxy, geo)
+	r.source = "builtin"
+	r.skipped = skipped
+	r.stats = stats
+	return r, nil
+}
+
 // Source 返回规则来源："fetched" / "cache" / "builtin"（供启动日志）。
 func (r *Router) Source() string { return r.source }
 
