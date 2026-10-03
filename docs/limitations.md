@@ -95,8 +95,13 @@ Cloudflare 免费版的 50 次/轮子请求，换成了 GitHub 的 runner 分钟
   泄漏，是否配加密 DNS 由用户决定。
 - **公共中继的出口 IP 被 CF 系站点拉黑是常态**，动态列表 + 竞速 + 亲和记忆是自愈机制不是
   根治。要根治只能自建中继（见 [relay.md](relay.md)）。
-- **ECH 在部分网络下间歇失败**（服务端返回 outer 名证书而 utls 用 outer 名校验 hostname）。
-  客户端有 2 秒预算与 60 秒短路兜底，但该网络下明文 SNI 会暴露。
+- **ECH 当前完全不生效**（2026-10-03 实测，非"部分网络"）：`utls` 在 ECH 模式下拿外层
+  `cloudflare-ech.com` 的证书去匹配真实域名，必然失败；把 `ServerName` 改成 public_name
+  则边缘直接回 `server rejected ECH`。失败被 `isStructuralECHFailure` 判成结构性故障 →
+  熔断 60 秒 → 之后每次拨号都退回明文 SNI。
+  客户端已改为**在启动日志里明说**（`[ech] ...VISIBLE SNI`），探测也不再被 ECH 拖垮
+  （失败一次后本轮其余候选直接走明文，不再拿同一份配置一个个去撞）。
+  修复方向：在 Cloudflare zone 上开启 Encrypted Client Hello；未开启前明文 SNI 是常态。
 - **geoip 表只有 IPv4**，纯 IPv6 站点一律按"非 CN"处理（走代理）。
 - **无版本协商**：协议升级是破坏性变更，客户端与服务端必须同时更新；错误版本的帧呈现为
   `0x01`，与密码错误不可区分。

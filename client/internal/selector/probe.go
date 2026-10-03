@@ -99,6 +99,14 @@ type OptResult struct {
 	Nodes     []entry.Node
 	ProbeTook time.Duration
 	Upgraded  int // WS 升级通过的候选数
+	// ECH 取到了配置没 / 握手成功没。
+	//
+	// 为什么单列出来：ECH 失败时客户端会静默退回明文 SNI，而这个事实对用户
+	// 是完全不可见的 —— 他以为自己被隐着，实际域名一直明文在外面。
+	// 上一整个版本就是这样过去的（实测确认：ECH 从来没成功过，每次拨号都
+	// 退回明文）。启动日志必须说这件事。
+	ECHConfigured bool // DoH 取到了 ECHConfigList
+	ECHWorked     bool // 真的用 ECH 完成过一次握手
 	// TLSTook / UpgradeTook 是两个阶段各自的耗时。启动慢的时候，用户需要知道的
 	// 不是"探测花了 10 秒"，而是"哪一段花的" —— 没有这个拆分就只能猜。
 	// TLSErrors 是 TLS 阶段失败的样本（最多几条）。整个候选集全军覆没时，
@@ -356,6 +364,10 @@ func Optimize(ctx context.Context, nodes []entry.Node, sni string, insecure bool
 	//
 	// 取不到就退回明文 SNI（见 handshake 的说明）：那是"少一层保护"，不是"不测"。
 	ech := echConfigFor(ctx, sni)
+	res.ECHConfigured = len(ech) > 0
+	if res.ECHConfigured {
+		defer func() { res.ECHWorked = tlsutil.ECHEnabled() }()
+	}
 
 	// 第一段：便宜的 TCP 筛查，把候选缩到值得握手的规模。
 	scrStart := time.Now()

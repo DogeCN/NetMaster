@@ -435,6 +435,21 @@ func cmdServe(args []string) {
 	pr := <-probed
 	// 两段耗时分别印出来：启动慢的时候，"哪一段慢"和"慢多少"才是能据此动手的信息，
 	// 一句"探测用了 10 秒"只会让人干瞪眼。
+	// ECH 的成败必须说在启动日志里。
+	//
+	// 它的失败是**静默**的：握手失败会被判成结构性故障、把 ECH 熔断 60 秒，然后
+	// 每次拨号都退回明文 SNI —— 用户照样能上网，但完全不知道自己以为被隐着的
+	// 服务端域名一直明文在外面。实测确认过：ECH 从来没成功过，而这个事实藏了
+	// 整整一个版本。所以这里明说。
+	switch {
+	case !pr.ECHConfigured:
+		logger.Printf("[ech] no ECH config published for this domain - connections will use a visible SNI")
+	case !pr.ECHWorked:
+		logger.Printf("[ech] ECH handshake failed on every attempt - connections fall back to a VISIBLE SNI " +
+			"(see docs: ECH must be enabled on the Cloudflare zone; until then the server domain is in the clear)")
+	default:
+		logger.Printf("[ech] SNI hidden by ECH")
+	}
 	logger.Printf("[probe] %d entries -> %d nodes in %s (tcp %s, tls %s, ws upgrade %s, %d entry IPs refused)",
 		len(all), len(pr.Nodes), pr.ProbeTook.Round(time.Millisecond),
 		pr.ScreenTook.Round(time.Millisecond), pr.TLSTook.Round(time.Millisecond),

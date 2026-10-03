@@ -21,7 +21,7 @@ HMAC 认证。没有用户标识符要生成、没有数据库 ID 要复制、�
         │  分流：Clash 规则集 → geoip → 兜底；入口并发优选
         ├──────────────── 直连 ────────────────────────────▶ 目标站        2 跳
         │
-        │  wss://  TLS(ECH) + WebSocket + 协议 v2 mux 帧
+        │  wss://  TLS(+ECH, 见限制一节) + WebSocket + 协议 v2 mux 帧
         ▼
   Cloudflare 边缘 Worker ──▶ Session DO（每连接一个，Hibernation）
                                   │  出口选路
@@ -194,8 +194,14 @@ Worker 这段链路的 SNI 隐藏）、`--tunnels <1-8>`（同时保持几条隧
   出口只剩 ProxyIP 中继一类。
 - **公共中继的出口 IP 被 Cloudflare 系站点拉黑是常态**，动态列表 + 竞速 + 亲和记忆
   是自愈机制，不是根治。
-- ECH 在部分网络下间歇失败（服务端返回 outer 名证书），客户端有 2s 尝试预算与
-  60s 短路兜底。
+- **ECH 目前不生效，服务端域名是明文的。** 2026-10-03 实测确认：客户端每次拨号的
+  ECH 握手都被边缘拒绝（拿到的是 `cloudflare-ech.com` 的 outer 名证书，或直接
+  `server rejected ECH`），于是熔断 60 秒、退回明文 SNI。也就是说**每次连接都是明文
+  SNI**，而这一版之前文档和 `no-ech` 开关都写着它在隐 —— 失败一路静默，没人发现。
+  客户端现在会在启动日志里直说（`[ech] ...fall back to a VISIBLE SNI`）。
+  要真正隐起来，需要在 Cloudflare 控制台给该 zone 打开
+  Encrypted Client Hello（SSL/TLS → Edge Certificates）；打开后启动日志会变成
+  `[ech] SNI hidden by ECH`。在此之前不要依赖 ECH 的任何保护。
 - geoip 的 CN 网段表只有 IPv4，纯 IPv6 站点一律按"非 CN"处理。
 - 系统代理不转发 UDP：QUIC 不会被代理，建议在浏览器里禁用 QUIC
   （`chrome://flags/#enable-quic`），强制回落 TCP。

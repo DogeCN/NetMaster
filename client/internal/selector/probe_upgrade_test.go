@@ -207,10 +207,14 @@ func TestProbeUsesECHWhenConfigAvailable(t *testing.T) {
 	host, port := srvAddr(t, srv)
 	node := nodeFor(host, port)
 
-	if r := probeOne(context.Background(), node, "example.com", true, nil); r.Err != nil {
+	if r, c := probeOne(context.Background(), node, "example.com", true, nil); r.Err != nil {
 		t.Fatalf("plain-SNI probe should succeed against the local server: %v", r.Err)
+	} else if c == nil {
+		t.Fatal("a successful probe must hand its established connection back for reuse")
+	} else {
+		_ = c.Close()
 	}
-	if r := probeOne(context.Background(), node, "example.com", true, []byte("not-an-ech-configlist")); r.Err == nil {
+	if r, _ := probeOne(context.Background(), node, "example.com", true, []byte("not-an-ech-configlist")); r.Err == nil {
 		t.Fatal("a bogus ECH config still completed a plain handshake — " +
 			"the ECH path is not being taken when a config is available")
 	}
@@ -277,5 +281,33 @@ func TestOptimizeFallbackIsStillCapped(t *testing.T) {
 	}
 	if len(got.Nodes) == 0 {
 		t.Error("the fallback must not be empty — that leaves the client unusable")
+	}
+}
+
+// TestOptimizeReportsThatECHFailed 钉住"ECH 失败要说出来"。
+//
+// 这是本项目最贵的一次教训：ECH 从来没成功过，每个连接都静默退回明文 SNI，
+// 而 README、config 的 no-ech 开关、界面文案都写着它在隐 —— 用户以为被保护着。
+// 失败一路静默了整整一个版本。
+//
+// 判据不是"日志里有没有那句话"，而是**结果里有没有这个字段**：
+// 静默退回发生在 dialTLS 里，那一层没有 logger，事后翻代码只会看到一句
+// "普通 TLS 兜底" 注释。能把这件事带出来的唯一位置就是探测结果。
+func TestOptimizeReportsThatECHFailed(t *testing.T) {
+	passThroughScreen(t)
+	_, host, port := acceptingEdge(t)
+
+	old := echConfigFetch
+	echConfigFetch = func(string) ([]byte, error) { return []byte("bogus-ech-config"), nil }
+	defer func() { echConfigFetch = old }()
+
+	got := Optimize(context.Background(), []entry.Node{nodeFor(host, port)}, "example.com", true)
+
+	if !got.ECHConfigured {
+		t.Error("a config was available, so the probe must report that it tried ECH")
+	}
+	if got.ECHWorked {
+		t.Error("a bogus ECH config cannot complete a handshake; reporting it as working " +
+			"is exactly the silence this test exists to prevent")
 	}
 }
