@@ -126,17 +126,28 @@ func parseECHFromDoH(body []byte) ([]byte, error) {
 	return nil, fmt.Errorf("no ECH config found in HTTPS RR")
 }
 
+// dialPhaseTimeout 限制"TCP 已连上、但握手阶段"的等待上限。
+//
+// 没有它时，一次拨号的耗时上限只由 TCP 的 10s 决定，而握手阶段既没有 deadline
+// 也没有超时——被 RST 注入的 IP 恰好走"TCP 通、握手挂住"这条路（实测大陆网络上
+// 部分 CF IP 如此），浏览器就会看到整页加载吃满 20s+。对冲拨号把第二个节点
+// 拉进来之后，这个上限就是用户能感知的首字节时间。
+const dialPhaseTimeout = 6 * time.Second
+
 // DialTLS 普通 TLS 握手（带 SNI）。
 func DialTLS(addr string, port uint16, sni string, insecure bool) (net.Conn, error) {
-	raw, err := net.DialTimeout("tcp", net.JoinHostPort(addr, strconv.Itoa(int(port))), 10*time.Second)
+	raw, err := net.DialTimeout("tcp", net.JoinHostPort(addr, strconv.Itoa(int(port))), dialPhaseTimeout)
 	if err != nil {
 		return nil, err
 	}
 	conn := tls.Client(raw, &tls.Config{ServerName: sni, InsecureSkipVerify: insecure, NextProtos: []string{"http/1.1"}})
+	// 握手有上限：握手完成后清掉，不影响这条连接后续的长期转发
+	_ = conn.SetDeadline(time.Now().Add(dialPhaseTimeout))
 	if err := conn.Handshake(); err != nil {
 		raw.Close()
 		return nil, err
 	}
+	_ = conn.SetDeadline(time.Time{})
 	return conn, nil
 }
 
@@ -156,6 +167,7 @@ func ECHOverConnCfg(raw net.Conn, realSNI string, ech []byte, insecure bool) (ne
 		MinVersion:                     utls.VersionTLS13,
 		NextProtos:                     []string{"http/1.1"},
 	}, utls.HelloGolang)
+	_ = raw.SetDeadline(time.Now().Add(dialPhaseTimeout))
 	if err := uconn.Handshake(); err != nil {
 		raw.Close()
 		if isStructuralECHFailure(err) {
@@ -163,6 +175,7 @@ func ECHOverConnCfg(raw net.Conn, realSNI string, ech []byte, insecure bool) (ne
 		}
 		return nil, err
 	}
+	_ = raw.SetDeadline(time.Time{}) // 握手有上限；之后这条连接长期转发，不设限
 	return uconn, nil
 }
 
@@ -188,6 +201,7 @@ func DialECHNoVerify(addr string, port uint16, realSNI string, ech []byte) (net.
 		// 覆盖：让 utls 不再用 outer name 做 hostname 校验。
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error { return nil },
 	}, utls.HelloGolang)
+	_ = raw.SetDeadline(time.Now().Add(dialPhaseTimeout))
 	if err := uconn.Handshake(); err != nil {
 		raw.Close()
 		if isStructuralECHFailure(err) {
@@ -195,6 +209,7 @@ func DialECHNoVerify(addr string, port uint16, realSNI string, ech []byte) (net.
 		}
 		return nil, err
 	}
+	_ = raw.SetDeadline(time.Time{}) // 握手有上限；之后这条连接长期转发，不设限
 	return uconn, nil
 }
 
@@ -259,5 +274,6 @@ func DialECH(addr string, port uint16, realSNI string, ech []byte, insecure bool
 		}
 		return nil, err
 	}
+	_ = raw.SetDeadline(time.Time{}) // 握手有上限；之后这条连接长期转发，不设限
 	return uconn, nil
 }

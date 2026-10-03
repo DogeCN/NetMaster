@@ -325,17 +325,29 @@ func cmdServe(args []string) {
 	fs.Parse(args)
 	host, pw := requireConn(*server, passwordValue(password, cfg))
 
-	// 单实例（PRD §6.5 step 1）：两个 serve 会互相抢系统代理。锁文件系统失败
-	// 只降级告警，不拦着用户上网。
-	unlock, holder, lerr := instlock.Acquire(config.LockPath(cfgPath))
-	if errors.Is(lerr, instlock.ErrLocked) {
-		fatal(fmt.Sprintf("netmaster is already running (pid %d).\nstop that instance first; if the system proxy is stuck, run: netmaster restore", holder))
+	// 单实例（PRD §6.5 step 1）：两个 serve 会互相抢系统代理。锁只拦"接管系统
+	// 代理"的实例——--manual 不碰系统代理，允许多开（诊断/并行观察是正当需求）。
+	// 锁文件系统失败只降级告警，不拦着用户上网。
+	var unlock func()
+	var lockWarn error
+	if !*manual {
+		var holder int
+		var lerr error
+		unlock, holder, lerr = instlock.Acquire(config.LockPath(cfgPath))
+		switch {
+		case errors.Is(lerr, instlock.ErrLocked):
+			// 命名互斥体模式下拿不到持有者的真实 pid；锁文件里的 pid 可能是过期
+			// 记录，只作参考。
+			fatal(fmt.Sprintf("another netmaster serve is already running (last recorded pid %d).\nstop that instance first; if the system proxy is stuck, run: netmaster restore", holder))
+		case lerr != nil:
+			lockWarn = lerr
+		}
 	}
 
 	logger := log.New(os.Stdout, "", log.Ltime)
-	if lerr != nil {
-		logger.Printf("WARN single-instance lock: %v (continuing without it)", lerr)
-	} else {
+	if lockWarn != nil {
+		logger.Printf("WARN single-instance lock: %v (continuing without it)", lockWarn)
+	} else if unlock != nil {
 		defer unlock()
 	}
 	if cfgPath != "" {
@@ -346,9 +358,9 @@ func cmdServe(args []string) {
 	all, src := resolveEntries(context.Background(), host)
 	logger.Printf("entries: %d (community: %s)", len(all), src)
 
-	// 2. IP 优选（PRD §6.6）：并发测延迟，取最快 16 个进池。全流程 ≤ 10s，
-	//    超预算就用已到手的结果 —— 优选是优化，不是能不能用的前提。
-	nodes, took := selector.Optimize(context.Background(), all)
+	// 2. IP 优选（PRD §6.6）：并发做真实 TLS 握手（同拨号路径），取最快 16 个进池。
+	//    全流程 ≤ 10s，超预算就用已到手的结果 —— 优选是优化，不是能不能用的前提。
+	nodes, took := selector.Optimize(context.Background(), all, host, cfg.InsecureEnabled())
 	logger.Printf("[probe] %d entries -> %d nodes in %s", len(all), len(nodes), took.Round(time.Millisecond))
 
 	pool := selector.New(selector.Config{

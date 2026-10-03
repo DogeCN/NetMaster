@@ -8,6 +8,12 @@ import (
 	"testing"
 )
 
+func TestMain(m *testing.M) {
+	// 独立互斥体名：本机可能同时有一个真实的 serve 持有全局锁
+	os.Setenv("NETMASTER_LOCK_NAME", "netmaster-serve-test")
+	os.Exit(m.Run())
+}
+
 func TestAcquireExclusive(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "serve.lock")
 

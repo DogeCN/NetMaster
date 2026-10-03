@@ -17,6 +17,14 @@ const (
 	// 超时**不算**被阻断 —— 目标只是慢而已，据此改道会误伤正常站点。
 	// 只有"一个字节都没回就被断开"才判定为阻断（GFW 的 SNI 阻断就是这种形态）。
 	relayProbeWait = 3 * time.Second
+	// relayProxyProbeWait 是**代理隧道**专用的首字节窗口。
+	//
+	// 比直连侧宽得多，因为这条路要多付一跳中继：KV 里实测的健康中继延迟就有
+	// 1~2.6s，再加目标自身的首字节，3 秒窗口会把"慢但活"的隧道判成死的 ——
+	// 代价是丢掉已经建立的隧道、再付一次拨号（实测表现为资源密集页面整页超时）。
+	// 真死的隧道几乎都是立刻 EOF（RST/close），不等窗口到期，所以放宽窗口
+	// 并不牺牲故障切换的速度。
+	relayProxyProbeWait = 8 * time.Second
 	// relaySpoolMax 是首个飞行段的缓存上限，超出就不再收（正常 ClientHello 约 200~2000 字节）。
 	relaySpoolMax = 16 * 1024
 )
@@ -180,7 +188,7 @@ func (s *Server) relayWithProxyReplay(client, up net.Conn, host string) {
 	}
 
 	probe := make([]byte, 32*1024)
-	_ = up.SetReadDeadline(time.Now().Add(relayProbeWait))
+	_ = up.SetReadDeadline(time.Now().Add(relayProxyProbeWait))
 	pn, perr := up.Read(probe)
 	_ = up.SetReadDeadline(time.Time{})
 

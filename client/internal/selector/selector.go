@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"netmaster/internal/entry"
@@ -44,6 +45,7 @@ type Pool struct {
 
 	mu            sync.Mutex
 	muxes         map[int]*outbound.MuxConn // 节点索引 -> 活跃 mux
+	warming       atomic.Bool               // 已有预热拨号在进行中（防惊群）
 	directBlocked map[string]time.Time
 	direct        map[string]bool // host -> 已学习的直连/代理粘性
 	fails         map[int]int     // 节点索引 -> 连续失败次数
@@ -91,12 +93,108 @@ func (p *Pool) liveMux() (int, *outbound.MuxConn) {
 	return -1, nil
 }
 
+// redialHedgeDelay 是对冲拨号的启动延迟：首选节点这么久还没建好传输，就同时
+// 拨第二个节点。实测大陆网络上部分 CF IP 会挂着 TCP 但拖死 TLS/WS（15s 才超时），
+// 单节点串行拨号会让浏览器整页加载吃满超时——对冲把最坏情况从"一次坏运气 15s"
+// 压到"3s + 第二个节点的建连时间"。
+const redialHedgeDelay = 3 * time.Second
+
 // redial 重建一条传输；成功返回 true（失败时 mux 不入表）。
+// 首选节点慢半拍时自动对冲第二个节点，先建好的赢。
 func (p *Pool) redial() bool {
-	idx := p.pickNode()
-	if idx < 0 {
+	first := p.pickNode()
+	if first < 0 {
 		return false
 	}
+	type result struct {
+		idx int
+		m   *outbound.MuxConn
+		ok  bool
+	}
+	ch := make(chan result, 2)
+	dial := func(idx int) {
+		m, err := p.dialMux(idx)
+		if err != nil {
+			p.noteFailure(idx)
+			ch <- result{idx: idx}
+			return
+		}
+		ch <- result{idx: idx, m: m, ok: true}
+	}
+	go dial(first)
+
+	pending := 1
+	hedged := false
+	hedgeTimer := time.NewTimer(redialHedgeDelay)
+	defer hedgeTimer.Stop()
+	for {
+		select {
+		case r := <-ch:
+			pending--
+			if r.ok {
+				p.attach(r.idx, r.m)
+				// 败者（若还在拨）晚些完成时会留下一条空闲传输：回收掉
+				if left := pending; left > 0 {
+					go func() {
+						for ; left > 0; left-- {
+							if r := <-ch; r.ok {
+								r.m.Close()
+							}
+						}
+					}()
+				}
+				return true
+			}
+			if pending == 0 {
+				return false
+			}
+		case <-hedgeTimer.C:
+			if hedged {
+				continue // 已对冲：无限等结论（dial 自带超时，goroutine 必然收尾）
+			}
+			hedged = true
+			if second := p.pickNodeExcluding(first); second >= 0 {
+				pending++
+				go dial(second)
+			}
+		}
+	}
+}
+
+// attach 把建好的传输登记进池并挂上死亡回调。
+func (p *Pool) attach(idx int, m *outbound.MuxConn) {
+	m.OnDead(func(planned bool) { p.onMuxDead(idx, planned) })
+	p.mu.Lock()
+	p.muxes[idx] = m
+	p.mu.Unlock()
+}
+
+// onMuxDead 传输终止时的处理。
+//
+// planned（服务端预算回收）不算节点故障——那是设计好的续命点（m0-findings E8：
+// 每条连接一生约 30 次出站建连），把它记成失败会把好节点误判死。
+//
+// 两种情况都要在后台把下一条连接备好：资源密集型页面（Netflix 之类一次开
+// 几十条流）会在回收瞬间堆出一大批请求，让它们全挤在"下一次拨号"的关键
+// 路径上，实测就是整页加载超时。
+func (p *Pool) onMuxDead(idx int, planned bool) {
+	if !planned {
+		p.noteFailure(idx)
+	}
+	if _, live := p.liveMux(); live != nil {
+		return // 还有别的传输在用，不必预热
+	}
+	if !p.warming.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer p.warming.Store(false)
+		p.redial()
+	}()
+}
+
+// dialMux 建立节点 idx 的传输（不登记进池）。
+func (p *Pool) dialMux(idx int) (*outbound.MuxConn, error) {
 	client := &outbound.Client{
 		Node:     p.nodes[idx],
 		SNI:      p.sni,
@@ -104,14 +202,7 @@ func (p *Pool) redial() bool {
 		UseECH:   p.useECH,
 		Insecure: p.insecure,
 	}
-	m, err := outbound.DialMux(client)
-	if err != nil {
-		return false
-	}
-	p.mu.Lock()
-	p.muxes[idx] = m
-	p.mu.Unlock()
-	return true
+	return outbound.DialMux(client)
 }
 
 // pickNode 随机选一个未判死的节点；全判死时全部复活（池耗尽后仍要能继续用）。
@@ -127,6 +218,22 @@ func (p *Pool) pickNode() int {
 		for i := range p.nodes {
 			p.dead[i] = false
 			p.fails[i] = 0
+			live = append(live, i)
+		}
+	}
+	p.mu.Unlock()
+	if len(live) == 0 {
+		return -1
+	}
+	return live[rand.Intn(len(live))]
+}
+
+// pickNodeExcluding 同 pickNode，但避开 exclude（对冲拨号的第二个节点用）。
+func (p *Pool) pickNodeExcluding(exclude int) int {
+	p.mu.Lock()
+	live := make([]int, 0, len(p.nodes))
+	for i := range p.nodes {
+		if i != exclude && !p.dead[i] {
 			live = append(live, i)
 		}
 	}
@@ -238,20 +345,11 @@ func (p *Pool) dialNode(idx int, target string) (net.Conn, error) {
 			return conn, nil
 		}
 	}
-	client := &outbound.Client{
-		Node:     p.nodes[idx],
-		SNI:      p.sni,
-		Password: p.password,
-		UseECH:   p.useECH,
-		Insecure: p.insecure,
-	}
-	m, err := outbound.DialMux(client)
+	m, err := p.dialMux(idx)
 	if err != nil {
 		return nil, err
 	}
-	p.mu.Lock()
-	p.muxes[idx] = m
-	p.mu.Unlock()
+	p.attach(idx, m)
 	conn, err := m.Open(target)
 	if err != nil {
 		return nil, err
@@ -371,11 +469,21 @@ func (p *Pool) Verify() (string, error) {
 	// 端口、example.com 已迁 CF 网段，两者任占一条这个验证都会被出口层拒绝。
 	// 443 + 非 CF 目标是直连路径上唯一稳定的组合；建流成功即同时验证了
 	// 传输层（TLS+WS+认证）与出站路径。
-	_, err := p.dialNode(0, "www.google.com:443")
-	if err != nil {
-		return "", err
+	//
+	// 依次试前 3 个节点（按探测延迟排序）：单节点抽样会把"恰好分到一个坏 IP"
+	// 报成 tunnel failed，而浏览实际是好的——误报比不报更吓人。
+	var lastErr error
+	for i := 0; i < 3 && i < len(p.nodes); i++ {
+		if _, err := p.dialNode(i, "www.google.com:443"); err != nil {
+			lastErr = err
+			continue
+		}
+		return p.nodes[i].Addr, nil
 	}
-	return p.nodes[0].Addr, nil
+	if lastErr == nil {
+		lastErr = fmt.Errorf("selector: no nodes tried")
+	}
+	return "", lastErr
 }
 
 // Nodes 返回节点列表（诊断用）。

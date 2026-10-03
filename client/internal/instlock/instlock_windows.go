@@ -17,13 +17,21 @@ import (
 // Windows 用命名互斥体：内核在持有进程死亡时自动释放，没有"陈旧锁"，
 // 也没有 PID 复用带来的误判（PID 探测会把复用了死进程 PID 的新进程当成
 // 持有者，实测踩过）。锁文件只用来给用户展示持有者 PID，不参与互斥。
-const mutexName = `Local\netmaster-serve`
+//
+// 互斥体名默认全局（一台机器一个 serve）。测试用 NETMASTER_LOCK_NAME
+// 换独立名字，否则测试会被本机正在运行的 serve 卡死。
+func mutexName() string {
+	if v := os.Getenv("NETMASTER_LOCK_NAME"); v != "" {
+		return `Local\` + v
+	}
+	return `Local\netmaster-serve`
+}
 
 func Acquire(path string) (func(), int, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, 0, err
 	}
-	name, err := syscall.UTF16PtrFromString(mutexName)
+	name, err := syscall.UTF16PtrFromString(mutexName())
 	if err != nil {
 		return nil, 0, err
 	}

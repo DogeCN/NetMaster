@@ -28,6 +28,12 @@ type savedState struct {
 	HadProxyEnable bool   `json:"had_proxy_enable"`
 	HadServer      bool   `json:"had_server"`
 	HadOverride    bool   `json:"had_override"`
+	// ProxyAddr / OwnerPID 是本次 Enable 写下的代理地址与持有者进程。
+	// 还原前据此判断"注册表现在还是不是我们设置的那个"：多个 netmaster 实例
+	// （或用户手动改代理）共用同一份注册表，盲还原会把活跃实例的接管整个
+	// 覆盖掉——实测发生过。
+	ProxyAddr string `json:"proxy_addr,omitempty"`
+	OwnerPID  int    `json:"owner_pid,omitempty"`
 }
 
 func openKey() (registry.Key, error) {
@@ -108,6 +114,7 @@ func Enable(proxyAddr string) (func(), error) {
 		st.ProxyOverride, st.HadOverride = v, true
 	}
 	// 落盘，供异常退出后的自愈
+	st.ProxyAddr, st.OwnerPID = proxyAddr, os.Getpid()
 	if b, err := json.Marshal(st); err == nil {
 		_ = os.WriteFile(stateFile, b, 0600)
 	}
@@ -136,8 +143,24 @@ func Disable() error {
 	return Restore()
 }
 
+// ownsRegistry 判断注册表当前是否仍是 st 记录的那次 Enable 设置的。
+// ProxyAddr 为空（旧版状态文件）时无从判断，按"不是我们的"处理——宁可少还原。
+func ownsRegistry(k registry.Key, st savedState) bool {
+	if st.ProxyAddr == "" {
+		return false
+	}
+	enable, _, err := k.GetIntegerValue("ProxyEnable")
+	if err != nil || enable != 1 {
+		return false
+	}
+	server, _, err := k.GetStringValue("ProxyServer")
+	return err == nil && server == st.ProxyAddr
+}
+
 // Restore 把系统代理恢复到上次 Enable 之前的状态，并删除状态文件。
 // 若状态文件不存在（从未由 netmaster 设置），退化为关闭代理。
+// 若注册表当前已不是我们设置的地址（另一个实例或用户接手），**只清状态文件、
+// 不动注册表**——还原别人正在用的代理是破坏性行为。
 func Restore() error {
 	st, hadState := loadState()
 
@@ -153,6 +176,12 @@ func Restore() error {
 			return err
 		}
 		notifyChange()
+		return nil
+	}
+
+	if !ownsRegistry(k, st) {
+		// 接管者已换人（新实例 / 用户手动设置）：我们的状态文件过时了，清掉即可
+		_ = os.Remove(stateFile)
 		return nil
 	}
 
@@ -176,11 +205,16 @@ func Restore() error {
 	return nil
 }
 
-// CleanupStale 在启动时调用：若存在状态文件（说明上次异常退出，代理仍指向 netmaster），
-// 先恢复干净，避免系统代理指向已不存在的端口。
+// CleanupStale 在启动时调用：若存在状态文件且持有进程已死（上次异常退出，
+// 代理仍指向 netmaster），先恢复干净。持有进程还活着 = 另一个实例正在
+// 接管中，**绝不能动**。
 func CleanupStale() (bool, error) {
-	if _, err := os.Stat(stateFile); err != nil {
+	st, ok := loadState()
+	if !ok {
 		return false, nil // 无状态文件，正常
+	}
+	if st.OwnerPID > 0 && processAlive(st.OwnerPID) {
+		return false, nil // 活跃实例的接管状态，不是残留
 	}
 	if err := Restore(); err != nil {
 		return true, err

@@ -2,6 +2,7 @@ package selector
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"sort"
@@ -11,12 +12,21 @@ import (
 	"netmaster/internal/entry"
 )
 
-// IP 优选（PRD §6.6）：并行测候选入口的 TCP 建连延迟，取最快的 TopN 作为节点池
-// 并按延迟排序；再随机选一个作为当前节点。
+// IP 优选（PRD §6.6）：并行测候选入口的 TLS 握手延迟，取最快的 TopN 作为节点池
+// 并按延迟排序。
+//
+// 为什么必须真握手而不是裸 TCP：实测（2026-10-03，大陆家宽）同一 CF 边缘 IP 上
+// 部分 IP 对真实 SNI 的 ClientHello 会注入 RST——TCP 三次握手全通，TLS 必挂。
+// 裸 TCP 探测选出的"快节点"一大半是这种，浏览器的页面加载超时撑不过
+// "坏节点 15s 拨号超时 → failover"的链路，表现就是"时好时坏"。TLS 握手探测与
+// 实际拨号同路径，把这类 IP 在进池前剔掉。
 //
 // 只测延迟不测吞吐：吞吐测试（多次小请求测带宽）在启动预算内做不完 16 个候选，
-// 而延迟才是决定"握手卡不卡"的那一项。代价是延迟相近的节点之间无法区分真实
-// 吞吐 —— 这在浏览器访问场景下影响有限。
+// 而延迟才是决定"握手卡不卡"的那一项。
+//
+// 探测不做证书校验（InsecureSkipVerify 恒真）：这里筛的是"IP+TLS 路径通不通"，
+// 证书校验是拨号层（真实客户端配置）的职责——两处保持一致的开关由调用方传入，
+// 探测层只关心握手能不能完成。
 
 const (
 	probeTopN      = 16
@@ -33,8 +43,9 @@ type ProbeResult struct {
 }
 
 // Probe 测全部候选，返回按延迟升序的可用结果（失败项排除）。
+// sni 是 TLS 握手用的域名（即 server 域名）；insecure 透传拨号层的证书校验开关。
 // ctx 超时即返回已到手的部分：启动不能被几个连不上的候选拖死。
-func Probe(ctx context.Context, nodes []entry.Node) []ProbeResult {
+func Probe(ctx context.Context, nodes []entry.Node, sni string, insecure bool) []ProbeResult {
 	if len(nodes) == 0 {
 		return nil
 	}
@@ -54,7 +65,19 @@ func Probe(ctx context.Context, nodes []entry.Node) []ProbeResult {
 				results[i] = ProbeResult{Node: nodes[i], Err: err}
 				return
 			}
-			c.Close()
+			defer c.Close()                                 //nolint:errcheck
+			_ = c.SetDeadline(time.Now().Add(probeTimeout)) //nolint:errcheck
+			tlsConn := tls.Client(c, &tls.Config{
+				ServerName:         sni,
+				InsecureSkipVerify: insecure, //nolint:gosec // 探测层只筛路径，校验在拨号层
+				NextProtos:         []string{"h2", "http/1.1"},
+			})
+			hsCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+			defer cancel()
+			if err := tlsConn.HandshakeContext(hsCtx); err != nil {
+				results[i] = ProbeResult{Node: nodes[i], Err: err}
+				return
+			}
 			results[i] = ProbeResult{Node: nodes[i], Latency: time.Since(start)}
 		}(i)
 	}
@@ -80,12 +103,12 @@ func Probe(ctx context.Context, nodes []entry.Node) []ProbeResult {
 // Optimize 按 PRD §6.6 把候选收敛成节点池：取最快的 TopN 排序返回。
 // 全灭时原样返回（全部候选都是死节点，但节点池为空会让代理完全不可用，
 // 留个机会比直接放弃好）。
-func Optimize(ctx context.Context, nodes []entry.Node) ([]entry.Node, time.Duration) {
+func Optimize(ctx context.Context, nodes []entry.Node, sni string, insecure bool) ([]entry.Node, time.Duration) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, probeBudgetAll)
 	defer cancel()
 
-	ranked := Probe(ctx, nodes)
+	ranked := Probe(ctx, nodes, sni, insecure)
 	if len(ranked) == 0 {
 		return nodes, time.Since(start)
 	}

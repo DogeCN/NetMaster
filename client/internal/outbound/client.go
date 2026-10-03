@@ -132,8 +132,11 @@ func (c *Client) DialWS() (*WSConn, error) {
 		NetDialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return tlsConn, nil
 		},
-		ReadBufferSize:  4096,
-		WriteBufferSize: 4096,
+		// 握手必须有上限：gorilla 的零值是不限时，一个 accept 之后不说话的
+		// 边缘节点能把这次拨号无限挂住（浏览器表现为整页加载不返回）。
+		HandshakeTimeout: 8 * time.Second,
+		ReadBufferSize:   4096,
+		WriteBufferSize:  4096,
 	}
 	ws, _, err := d.Dial(u.String(), header)
 	if err != nil {

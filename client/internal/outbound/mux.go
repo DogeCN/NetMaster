@@ -36,6 +36,13 @@ type MuxConn struct {
 	firstSent bool
 
 	alive atomic.Bool
+	// recycled 标记"服务端主动回收"（close(1000,"budget")：子请求预算见底，
+	// 每条连接一生约 30 次出站建连）。这不是故障——不计入节点失败，并值得
+	// 立刻在后台把下一条连接备好，避免下一波请求（浏览器一次开几十条流）
+	// 全挤在重连的关键路径上。
+	recycled atomic.Bool
+	// onDead 在传输终止时回调（planned=true 表示服务端主动回收）。
+	onDead func(planned bool)
 	// ping/pong 判死（PRD §4.6）：30s 一发，连续 2 个周期没 Pong 判死。
 	lastPong atomic.Int64
 	pingOnce sync.Once
@@ -99,6 +106,10 @@ func NewMuxConn(ws *websocket.Conn, password string) *MuxConn {
 }
 
 func (m *MuxConn) Alive() bool { return m.alive.Load() }
+
+// OnDead 注册传输终止回调（planned=true = 服务端主动预算回收，非故障）。
+// 回调在独立 goroutine 里触发，不要在里面做阻塞操作。
+func (m *MuxConn) OnDead(fn func(planned bool)) { m.onDead = fn }
 
 // LiveCount 返回当前活跃流数（诊断用）。
 func (m *MuxConn) LiveCount() int {
@@ -215,6 +226,12 @@ func (m *MuxConn) readLoop() {
 	for {
 		_, data, err := m.ws.ReadMessage()
 		if err != nil {
+			// 服务端预算回收是计划内的 close(1000,"budget")：与节点故障区分开，
+			// 好让上层不记失败、并提前把下一条连接备好。
+			var ce *websocket.CloseError
+			if errors.As(err, &ce) && ce.Text == "budget" {
+				m.recycled.Store(true)
+			}
 			m.logf("readLoop error: %v", err)
 			m.kill(err)
 			return
@@ -290,6 +307,9 @@ func (m *MuxConn) kill(cause error) {
 		s.markDead(cause)
 	}
 	_ = m.ws.Close()
+	if m.onDead != nil {
+		go m.onDead(m.recycled.Load())
+	}
 }
 
 // Close 关闭整条 WS。
@@ -314,6 +334,14 @@ type MuxStream struct {
 	rcond   *sync.Cond
 	errOnce sync.Once
 	err     error
+
+	// tmu 守 timer：SetDeadline(零值)必须真的撤销上一个计时器。少了这一步，
+	// 每次"设 3 秒 deadline 探首字节、探完清除"都会在 3 秒后把这条流杀掉
+	// ——浏览器复用隧道拉图片/脚本时必现（实测复杂页面时好时坏、curl 短请求
+	// 正常，根因就在这里）。
+	tmu   sync.Mutex
+	timer *time.Timer
+	fired bool // 计时器已触发过：此后的清零/重设都不再复活这条流
 
 	wmu sync.Mutex
 }
@@ -411,18 +439,42 @@ func (s *MuxStream) SetWriteDeadline(t time.Time) error {
 }
 
 func (s *MuxStream) armTimer(t time.Time) error {
+	s.tmu.Lock()
+	if s.timer != nil {
+		s.timer.Stop() // 撤销上一个计时器：清零必须真的取消，否则它在原定时间照样开枪
+		s.timer = nil
+	}
+	fired := s.fired
+	s.tmu.Unlock()
+
 	if t.IsZero() {
-		return nil
+		return nil // deadline 已清除
+	}
+	if fired || s.dead.Load() {
+		return nil // 流已因超时结束：不再复活
 	}
 	d := time.Until(t)
 	if d <= 0 {
 		s.markDead(errors.New("mux: deadline exceeded"))
 		return nil
 	}
-	time.AfterFunc(d, func() {
+	s.tmu.Lock()
+	if s.fired || s.timer != nil {
+		s.tmu.Unlock()
+		return nil
+	}
+	s.timer = time.AfterFunc(d, func() {
+		s.tmu.Lock()
+		if s.fired {
+			s.tmu.Unlock()
+			return
+		}
+		s.fired = true
+		s.tmu.Unlock()
 		if !s.dead.Load() {
 			s.markDead(errors.New("mux: i/o timeout"))
 		}
 	})
+	s.tmu.Unlock()
 	return nil
 }
