@@ -30,6 +30,27 @@ type Config struct {
 	Password string `json:"password,omitempty"`
 	Manual   bool   `json:"manual,omitempty"`
 	Rules    string `json:"rules,omitempty"`
+	// Insecure 关闭出口连接的证书校验。缺省（不写）= 校验开启 —— 标准部署下
+	// 客户端总是用 server 域名做 SNI，边缘返回的就是该域名的正规证书，校验
+	// 应当通过；只有自建网关用自签证书等场景才需要显式设为 true。
+	Insecure *bool `json:"insecure,omitempty"`
+}
+
+// InsecureEnabled 返回证书校验开关的生效值。nil 视为 false（校验开启）。
+func (c Config) InsecureEnabled() bool {
+	return c.Insecure != nil && *c.Insecure
+}
+
+// LockPath 返回 serve 单实例锁文件的路径：与实际加载的 config.json 同目录；
+// 没有配置文件时退到 UserConfigDir/netmaster，再退到当前目录。
+func LockPath(cfgPath string) string {
+	if cfgPath != "" {
+		return filepath.Join(filepath.Dir(cfgPath), "serve.lock")
+	}
+	if base, err := os.UserConfigDir(); err == nil && base != "" {
+		return filepath.Join(base, "netmaster", "serve.lock")
+	}
+	return "serve.lock"
 }
 
 // searchPaths 返回按优先级排列的候选路径。

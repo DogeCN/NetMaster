@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,12 +16,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"netmaster/internal/config"
 	"netmaster/internal/entry"
 	"netmaster/internal/geoip"
+	"netmaster/internal/instlock"
 	"netmaster/internal/procwait"
 	"netmaster/internal/proxy"
 	"netmaster/internal/rules"
@@ -150,8 +153,20 @@ const maxEntries = 64
 func resolveEntries(ctx context.Context, server string) ([]entry.Node, string) {
 	commCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	comm, src := entry.Community(commCtx)
-	nodes := entry.Merge(entry.FromServer(ctx, server), comm)
+	// 两类源并行（PRD §6.5 step 2）：服务端域名解析与社区优选互不依赖，
+	// 串行的话慢的那类直接拖慢启动。
+	var (
+		wg      sync.WaitGroup
+		comm    []entry.Node
+		src     string
+		fromSrv []entry.Node
+	)
+	wg.Add(2)
+	go func() { defer wg.Done(); comm, src = entry.Community(commCtx) }()
+	go func() { defer wg.Done(); fromSrv = entry.FromServer(commCtx, server) }()
+	wg.Wait()
+
+	nodes := entry.Merge(fromSrv, comm)
 	if len(nodes) > maxEntries {
 		nodes = nodes[:maxEntries]
 	}
@@ -227,7 +242,7 @@ func cmdNodes(args []string) {
 	logger := log.New(os.Stdout, "", log.Ltime)
 	nodes, src := resolveEntries(context.Background(), host)
 	logger.Printf("entries: %d (community: %s)", len(nodes), src)
-	pool := selector.New(selector.Config{Nodes: nodes, SNI: host, Password: pw, UseECH: true, Insecure: true})
+	pool := selector.New(selector.Config{Nodes: nodes, SNI: host, Password: pw, UseECH: true, Insecure: cfg.InsecureEnabled()})
 
 	router, rerr := rules.LoadRules(context.Background(), rules.Overrides{}, "", nil)
 	if rerr != nil {
@@ -310,7 +325,19 @@ func cmdServe(args []string) {
 	fs.Parse(args)
 	host, pw := requireConn(*server, passwordValue(password, cfg))
 
+	// 单实例（PRD §6.5 step 1）：两个 serve 会互相抢系统代理。锁文件系统失败
+	// 只降级告警，不拦着用户上网。
+	unlock, holder, lerr := instlock.Acquire(config.LockPath(cfgPath))
+	if errors.Is(lerr, instlock.ErrLocked) {
+		fatal(fmt.Sprintf("netmaster is already running (pid %d).\nstop that instance first; if the system proxy is stuck, run: netmaster restore", holder))
+	}
+
 	logger := log.New(os.Stdout, "", log.Ltime)
+	if lerr != nil {
+		logger.Printf("WARN single-instance lock: %v (continuing without it)", lerr)
+	} else {
+		defer unlock()
+	}
 	if cfgPath != "" {
 		logger.Printf("config: %s", cfgPath)
 	}
@@ -329,7 +356,10 @@ func cmdServe(args []string) {
 		SNI:      host,
 		Password: pw,
 		UseECH:   true,
-		Insecure: true,
+		// 缺省校验证书（config.json 可设 "insecure": true 关闭）。标准部署下
+		// SNI 就是 server 域名，边缘返回该域名的正规证书，校验应当通过；
+		// 校验失败属于真实攻击面，宁可连不上让用户看见，也不静默放行。
+		Insecure: cfg.InsecureEnabled(),
 	})
 	pool.SetDialTimeout(15 * time.Second)
 
