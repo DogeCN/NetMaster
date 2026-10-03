@@ -63,13 +63,21 @@ func TestBeginRecordsDuration(t *testing.T) {
 //
 // `tr.Begin(...)()` 看起来完全正常，实际 span 在同一行开始又结束、耗时恒为 0。
 // 这条用例把这个形态本身固定下来，免得将来"简化"测试时顺手写成裸调用。
+// 判据是"小到不构成一个阶段"，不是"严格等于 0"。
+//
+// 原判据写成 `Dur != 0`：在 Windows 上成立（单调钟分辨率约毫秒级，同一行开始又
+// 结束的 span 记到的就是 0），而 CI 的 Linux runner 纳秒级分辨率下同一个裸调用
+// 能记到几十纳秒，用例直接红。真正要钉的是"它小到不能当一个阶段用时"，
+// 0 只是那个事实在粗分辨率钟上的表现。取 1ms：真实阶段至少是毫秒量级，
+// 而裸调用哪怕在最慢的 CI 上也是微秒级。
 func TestBeginIsNotUsableAsABareCall(t *testing.T) {
 	tr := New(true)
 	tr.Begin("bare", time.Second)() // 就是那个陷阱的形态
 
 	for _, s := range tr.Spans() {
-		if s.Dur != 0 {
-			t.Fatalf("bare call recorded %v; it must record ~0 — that is why call sites use defer", s.Dur)
+		if s.Dur > time.Millisecond {
+			t.Fatalf("bare call recorded %v; that is a real span, not the ~0 a bare call produces — "+
+				"call sites must hold the returned func and call it at the end (usually via defer)", s.Dur)
 		}
 	}
 }
