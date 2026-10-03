@@ -15,11 +15,16 @@
 // ## 用法
 //
 //   node tools/profile.mjs compare a.json b.json            # 客户端两次运行
-//   node tools/profile.mjs merge  client.json server.json    # 双端一条时间线
-//   node tools/profile.mjs server --namespace <id>          # 从 KV 拉服务端记录
+//   node tools/profile.mjs merge    client.json server.json # 双端一条时间线
+//   node tools/profile.mjs fingerprint doc.json             # 只算指纹
 //
-// server.json 可以是从 `wrangler kv key get` 取下来的单条记录，或多条记录组成的
-// 数组（同一轮的多个目标）。
+// 服务端记录从 KV 取（`profile:<target>:<minute>`，TTL 1 小时，键里的 target 是
+// profile.js 的 targetOf 截到 64 字符的目标串、minute 是分钟数）：
+//
+//   npx wrangler kv key list --namespace-id <id> --remote | grep '"profile:'
+//   npx wrangler kv key get 'profile:<target>:<minute>' --namespace-id <id> --remote > server.json
+//
+// server.json 可以是取下来的单条记录，或多条记录组成的数组（同一轮的多个目标）。
 
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';

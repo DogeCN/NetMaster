@@ -36,6 +36,12 @@ Cloudflare 承载的站点时，Workers 的 `connect()` 不能拨 CF 自己的 I
 中继，四跳。**NAT64 出口已砍**——M0 实测 Workers `connect()` 不支持 IPv6 出站
 （见 [docs/m0-findings.md](docs/m0-findings.md)）。
 
+直连这一侧还有一条**三级阶梯**（分流判 proxy 却没有可用出口时的兜底）：先退回尝试性
+直连，3 秒内**零字节即断**就改分片直连——把 ClientHello 切成 8B 片、8ms 间隔，阻断
+设备靠重组读 SNI，重组窗口先到期它就只看到碎片——再不行才落代理隧道。分片成功就**留在
+直连**：不多绕一跳，也不在服务端多烧一次 `connect()`。成败各自记 6 小时 / 30 分钟，
+日志打 `[frag]` / `[route]`，详见 [docs/routing.md](docs/routing.md)。
+
 KV 里的中继健康排名（`proxyip:top`）由 GitHub Actions 的 `refresh-relays` 定时任务刷新，
 **默认不开也不影响使用**——不开时竞速只用内置兜底列表。启用方式与排障见
 [docs/operations.md](docs/operations.md)。
@@ -219,7 +225,7 @@ Worker 这段链路的 SNI 隐藏）、`--tunnels <1-8>`（同时保持几条隧
 | [docs/PRD.md](docs/PRD.md) | 产品需求文档（v1.1 冻结基线，文末附 v2 实施修订记录） |
 | [docs/architecture.md](docs/architecture.md) | v2 架构、组件职责、协议帧格式、出口选路 |
 | [docs/relay.md](docs/relay.md) | ProxyIP 中继：为什么需要、候选来源、竞速、自建指引 |
-| [docs/routing.md](docs/routing.md) | 客户端分流规则与优先级 |
+| [docs/routing.md](docs/routing.md) | 客户端分流规则与优先级；直连的三级阶梯（明文 → 分片 → 代理）与两级记忆 |
 | [docs/limitations.md](docs/limitations.md) | 免费版限额表与实测数据 |
 | [docs/operations.md](docs/operations.md) | 部署、运维、日志与 DEBUG |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | 排障：连不上、ECH 回退、节点全挂、系统代理残留 |
@@ -245,6 +251,14 @@ cd client && go test ./internal/outbound -run TestProtoE2E -v
 # 端到端验收脚本（本地自检；给真实部署加 NETMASTER_E2E_WORKER / NETMASTER_E2E_PASSWORD 即跑全量）
 # 经 socket.js 摸平台模块，要挂 Node shim —— 与 test-all.sh 同因
 cd server && node --import ./test/shims/register.mjs test/e2e.mjs
+
+# 分段耗时（启动/选路慢在哪；两侧都默认关闭，关闭时零开销）
+NETMASTER_PROFILE=start.json netmaster serve   # 客户端：报告进 stdout，JSON 落文件
+PROFILE=1 scripts/deploy.sh                    # 服务端：在临时配置上开 PROFILE=1，分段耗时写进 KV
+node tools/profile.mjs compare a.json b.json   # 指纹不符 → exit 2，拒绝比"谁更快"
+node tools/profile.mjs merge client.json server.json
 ```
+
+采集器的打点、预算与 KV 键见 [docs/operations.md](docs/operations.md) 的"分段耗时采集"。
 
 发版：打 `v*` tag 即构建全部 Release 产物（`.github/workflows/release.yml`）。

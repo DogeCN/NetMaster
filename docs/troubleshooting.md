@@ -84,6 +84,9 @@ runner 上，不在 Worker 里。要看它的输出去 Actions 的 run 页面：
 | `server rejected stream: target forbidden (0x02)` | 目标是私网 / CF 网段 / 端口 25 | 设计如此；私网应走客户端直连规则 |
 | `server rejected stream: all exits failed (0x03)` | 直连失败且中继全挂 | 看服务端 tail 里的 race slot 失败原因 |
 | `[route] <host> direct unusable (…) — switched to proxy and replayed` | 直连被判定不可用，已改走代理 | 正常自愈；该域名 30 分钟内不再试直连 |
+| `[frag] <host> direct was blocked (…) — TLS fragmentation got through, staying direct` | 明文直连被拦，**分片直连穿过去了** | 最好的结果：留在直连，不多付一跳；该域名 6 小时内直连带分片起步 |
+| `[frag] <host> fragmented direct also blocked (…) — falling back to proxy` | 分片也穿不过去，已落代理 | 正常自愈；分片记忆同时清掉，下次直接走代理 |
+| `[frag] <host> remembered fragmentation no longer works (…) — forgetting it` | 旧的分片记忆已失效 | 正常；不清它会让此后 6 小时每条连接白付约 400ms 再落代理 |
 | `[route] <host> proxy tunnel dead (…) — switched exit and replayed` | 隧道建立但零字节即断，已换出口 | 正常自愈；Worker 侧也会把坏中继忘掉 |
 
 ## ECH 回退

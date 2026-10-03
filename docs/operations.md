@@ -78,9 +78,14 @@ npx wrangler deploy
 
 ## 部署产物
 
-`_worker.js` 由 `server/build.mjs` 把 `src/` 下 9 个模块拼接成一个文件
-（crypto → protocol → exits → proxyip → race → router → session → index）。
+`_worker.js` 由 `server/build.mjs` 把 `src/` 下 10 个模块拼接成一个文件
+（`crypto / protocol / exits / socket / proxyip / race / router / profile / session / index`）。
 它是**生成物**，改 `src/` 之后重新 `node build.mjs`。
+
+模块顺序**从 import 图 DFS 推导**，不是手写的数组：顺序写死过一次，代价是"新增的
+`src/*.js` 忘了登记就被静默丢掉，而 CI 的 `node --check` 只查语法、照样全绿"——本轮的
+`profile.js` 就正站在这个雷上（`session.js` import 了它、build 也"成功"，而
+`makeProfiler` 一次都没被调用）。现在缺失模块与别名 import 一律硬失败。
 
 `build.mjs` 同时是 CI 的语法门：`src/` 里任何一个走错字符都会在这里失败，而不是在生产里。
 
@@ -95,10 +100,14 @@ npx wrangler deploy
 | `RACE_GLOBAL_TIMEOUT_MS` | var | 3000 | 竞速全局超时 |
 | `RACE_STAGGER_MS` | var | 120 | 槽位交错启动间隔 |
 | `RACE_KV_TOP` | var | 4 | 从 KV 取前 N 个中继 |
+| `PROFILE` | var | 关 | `'1'` 时会话结束把**分段耗时**写进 KV（见下"分段耗时采集"）。花 KV 写配额，每会话最多 3 次 |
 
 竞速参数非法或 ≤0 一律回落到默认（`posEnv`）：写错一个字符不该变成 0ms。
 
-`DEBUG` 是变量不是 Secret——改完要重新部署。
+`DEBUG` 与 `PROFILE` 都是变量不是 Secret——改完要重新部署。`scripts/deploy.sh` 支持
+`PROFILE=1` 前缀，把它加在**部署时生成的临时配置**上；不要在控制台手改：`keep_vars = false`
+会在下次 `wrangler deploy` 时把控制台里有、文件里没有的变量悄悄删掉，于是"部署时明明好的"
+下次就没了。
 
 ## 存储与迁移
 
@@ -202,6 +211,46 @@ cd client && go test ./internal/outbound -run TestProtoE2E -v
 
 `scripts/test-all.sh` 与各 workflow 都用 `set -o pipefail`——node 的报错走 stderr，
 `tail` 会吞掉退出码，不加这个测试挂了 CI 也是绿的。
+
+## 分段耗时采集（profile）
+
+"这次改动到底快在哪、慢在哪"要有**可比较的证据**。两侧各一套采集器，都默认关闭，
+关闭时零开销（调用点是 nil 接收者上的空操作，热路径上连一个 `if` 都不留）。
+
+**客户端**：`NETMASTER_PROFILE=1`（或 `=stdout`）把报告打到 stdout；
+`NETMASTER_PROFILE=<路径>` 额外把 JSON 落到该文件。报告直接走 stdout 而不是 logger
+——logger 每行带时间戳，而报告自己就有偏移列。
+
+```bash
+NETMASTER_PROFILE=start.json netmaster serve
+```
+
+打点覆盖启动的每一段，**超出自己预算的段在报告里标 `!`**（真正贵的那一段往往不是你以为的
+那一段，所以预算是"这段超过它就不对"而不是"参考值"）：`entries`（入口候选拉取，带来源与
+条数）、`rules.load`（预算 500ms）、`probe.total`（12s）、`tunnel.verify`（10s）、
+`ready`（从进程启动算起）、`ech`。请求路径上还有 `connect.<rung>`、`replay.*`、`frag.*`。
+
+**服务端**：`PROFILE=1` 时会话结束把分段耗时写进 KV，键 `profile:<target>:<minute>`、
+TTL 1 小时，**每会话最多 3 次写，且预算全会话共享**（按目标各算的话一次首屏就能写几十次
+KV，而"客户端疯狂开页面"恰恰是最不该烧配额的场景）。写 KV 而不打日志的原因见
+[m0-findings](m0-findings.md) E9：DO 内的 console 在 `wrangler tail` 上**完全不可见**。
+
+**指纹**：facts 覆盖节点池身份、`tunnels`、`ech`、`insecure`、`rules-file`、frag 参数
+（`Chunk/Delay/MaxSpan`）与 build。分片参数一改、节点池一换，两次运行就不可比。
+
+```bash
+node tools/profile.mjs compare a.json b.json           # 两次客户端运行；不可比 → exit 2
+node tools/profile.mjs merge    client.json server.json  # 双端合并成一条时间线
+node tools/profile.mjs fingerprint doc.json
+```
+
+工具的第一职责不是画图而是**防止"比错了"**：指纹不同就逐项点名差异、拒绝给出"谁更快"
+（exit 2）。本项目吃过一次亏——入口池改动前用了 `nodes[:64]` 随机截断，两次跑的节点池根本
+不是一回事，"7.2s → 5.1s"作废。服务端记录还带出口阶梯分布
+（`0=直连 1=会话缓存 2=Router 3=竞速`）：期望走 0 却总落在 3，说明"直连被判死"的判断偏保守。
+
+两端 span 单位不同：客户端是 Go `time.Duration`（**纳秒**整数），服务端是 `ms`。工具会折算，
+手工对齐时别忘了——不折算的话客户端每个阶段都显示成 0。
 
 ## 发版
 
