@@ -111,7 +111,22 @@ func (c *Client) dialECH() (net.Conn, error) {
 	} else {
 		errs = append(errs, "preferred-ip: "+err.Error())
 	}
-	// 回退：域名直连（系统 DNS 可能给到承载 zone 的 IP）。
+	// 回退：**用 DoH 解析出的 IP** 直连。
+	//
+	// 为什么插在"域名直连"之前：系统解析器会被投毒（实测同一台机器上
+	// `en.wikipedia.org` → 31.13.94.41，Facebook 网段），而这条回退只在优选 IP
+	// 失败之后才走 —— 那时解析质量就是最后一根稻草。DoH 端点除一个域名外全是
+	// 字面量 IP，没有 bootstrap 问题；查不到就继续往下走，行为只增不减。
+	if ips, derr := tlsutil.ResolveIPs(context.Background(), c.SNI, ""); derr == nil {
+		for _, ip := range ips {
+			if conn, err := tlsutil.DialECH(ip.String(), c.Node.Port, c.SNI, ech, c.Insecure); err == nil {
+				return conn, nil
+			} else {
+				errs = append(errs, "doh-ip "+ip.String()+": "+err.Error())
+			}
+		}
+	}
+	// 再退：域名直连（系统 DNS 可能给到承载 zone 的 IP）。
 	// 重新读一次缓存：第一步若触发了 RetryConfig 自愈，缓存里已是服务端下发的新配置。
 	if refreshed, ferr := tlsutil.FetchECHConfigList(c.SNI, ""); ferr == nil {
 		ech = refreshed

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"netmaster/internal/tlsfrag"
+	"netmaster/internal/tlsutil"
 )
 
 // Node 一个入口候选。SNI/鉴权不属于单个节点：SNI 是服务端域名（全局唯一），
@@ -39,13 +40,73 @@ type Node struct {
 // DefaultPort 入口的默认端口。
 const DefaultPort = 443
 
+// dohGrace 是"系统答案已到手、还愿意再等 DoH 多久"。
+//
+// 为什么值得等：被投毒的答案会把假 IP 直接塞进池子 —— 入口候选现在一回来就建池、
+// 就绪（见 cmd/netmaster 的两批候选），而 DoH 通常几十毫秒就回。500ms 是上限不是常态。
+const dohGrace = 500 * time.Millisecond
+
+// dohResolveBudget 是这次 DoH 查询自己的总预算。
+const dohResolveBudget = 1500 * time.Millisecond
+
+// resolveViaDoH / fetchECHConfigFor 是测试注入点。
+//
+// 两个都是"要连真网络"的东西：前者查 DoH，后者查 HTTPS RR。测试要断言的偏偏是
+// **谁优先、失败后走哪条退路**，而不是 DoH 本身能不能用 —— 所以把函数做成变量。
+var (
+	resolveViaDoH     = tlsutil.ResolveIPs
+	fetchECHConfigFor = tlsutil.FetchECHConfigList
+)
+
 // FromServer 解析服务端域名，把结果作为入口候选。
 // 这是唯一不依赖任何第三方的源 —— 只要服务端域名能解析，客户端就有候选可用。
+//
+// 解析走两条路，**DoH 优先**：系统解析器会被投毒（实测同一台机器上
+// `en.wikipedia.org` → 31.13.94.41，Facebook 网段），而入口是整条链路里唯一
+// "没有第三方兜底"的一环。两条并发而不是串行：串行等于给启动加一个 DoH 往返，
+// 而入口现在站在关键路径上；并发时 DoH 几乎总是先回，最坏也只是多等 dohGrace。
 func FromServer(ctx context.Context, server string) []Node {
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", server)
-	if err != nil {
-		return nil
+	type res struct {
+		ips []net.IP
+		err error
 	}
+	dohCh := make(chan res, 1)
+	go func() {
+		c, cancel := context.WithTimeout(ctx, dohResolveBudget)
+		defer cancel()
+		ips, err := resolveViaDoH(c, server, "")
+		dohCh <- res{ips, err}
+	}()
+	sysCh := make(chan res, 1)
+	go func() {
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", server)
+		sysCh <- res{ips, err}
+	}()
+
+	var sys res
+	select {
+	case d := <-dohCh:
+		if len(d.ips) > 0 {
+			return nodesFromIPs(d.ips, server)
+		}
+		// DoH 明确失败（端点全挂或无记录）：系统答案就是全部，不再空等。
+		sys = <-sysCh
+		return nodesFromIPs(sys.ips, server)
+	case sys = <-sysCh:
+	}
+	// 系统答案先到。DoH 抗投毒，值得再等它一小会儿 —— 但只一小会儿。
+	select {
+	case d := <-dohCh:
+		if len(d.ips) > 0 {
+			return nodesFromIPs(d.ips, server)
+		}
+	case <-time.After(dohGrace):
+	}
+	return nodesFromIPs(sys.ips, server)
+}
+
+// nodesFromIPs 把解析结果转成候选（去重、统一端口）。
+func nodesFromIPs(ips []net.IP, name string) []Node {
 	out := make([]Node, 0, len(ips))
 	seen := make(map[string]struct{}, len(ips))
 	for _, ip := range ips {
@@ -54,7 +115,7 @@ func FromServer(ctx context.Context, server string) []Node {
 			continue
 		}
 		seen[key] = struct{}{}
-		out = append(out, Node{Addr: key, Port: DefaultPort, Name: server})
+		out = append(out, Node{Addr: key, Port: DefaultPort, Name: name})
 	}
 	return out
 }
@@ -198,29 +259,135 @@ var fragClient = &http.Client{
 	},
 }
 
+// sourceECHClient 造一个用 **ECH** 握手的 HTTP 客户端（拿不到配置时不该用它）。
+//
+// 为什么值得单独造一个：这三个源都是被墙域名，而它们**全部发布并接受 ECH**
+// （2026-10-04 实测：三个源 `[2a] DialECH(verify)` 全 OK、内层证书校验通过）。
+// 与现在的分片相比，ECH 强两点：SNI 是**真加密**（不是"指望对方重组失败"），
+// 而且省掉分片那约 400ms 的代价。
+//
+// 与 fragClient 同理，TLS 必须自己挂在 DialTLSContext 上：ECH 要求把
+// ECHConfigList 塞进 tls.Config，那是 Transport 内部握手做不到的事。
+func sourceECHClient(host string, ech []byte) *http.Client {
+	return &http.Client{
+		Timeout: fetchTimeout,
+		Transport: &http.Transport{
+			Proxy:               nil,
+			ForceAttemptHTTP2:   false,
+			MaxIdleConnsPerHost: 1,
+			IdleConnTimeout:     30 * time.Second,
+			TLSHandshakeTimeout: fetchTimeout,
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				d := &net.Dialer{Timeout: fetchTimeout}
+				raw, err := d.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				c, err := tlsutil.ECHOverConnCfg(raw, host, ech, false)
+				if err != nil {
+					_ = raw.Close()
+					return nil, err
+				}
+				return c, nil
+			},
+		},
+	}
+}
+
+// fetchSource 取回一个源并解析成候选。
 func fetchSource(ctx context.Context, rawURL string) ([]Node, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	body, err := fetchSourceBody(ctx, rawURL)
 	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "netmaster")
-	resp, err := fragClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
-	if err != nil && len(body) == 0 {
 		return nil, err
 	}
 	// 剔掉不在 CF 官方网段内的条目：入口必须是承载我们域名的 CF 边缘地址，
 	// 而订阅源是第三方维护的"优选 IP"列表，实测会混进非 CF 地址
 	//（`090227.pages.dev` 150 条里 28 条）。留着的话它们先占 maxEntries 名额、
 	// 再各花一次真实 TLS 探测预算，最后还是连不上。判据与实测见 cfnet.go。
-	return FilterCloudflare(parseList(string(body))), nil
+	return FilterCloudflare(parseList(body)), nil
+}
+
+// echLookupBudget 是"为了用 ECH 而查一次配置"的上限。
+//
+// 必须有上限：tlsutil 那条 DoH 查询自己的客户端超时是 10 秒，而入口取数站在启动
+// 关键路径上。ECH 是锦上添花，等不到就退回分片（分片本来就能过）。
+const echLookupBudget = 800 * time.Millisecond
+
+// fetchSourceBody 按"① ECH 优先 → ② 分片兜底"取回正文。
+//
+// 顺序的理由：ECH 是**真加密**且没有分片那 400ms；而分片是"指望阻断设备拼不出
+// 完整记录"，属于降级手段。但 ECH 依赖三件事同时成立（域名发布配置、边缘接受、
+// DoH 拿得到配置），任何一条不成立就退回分片 —— 行为只增不减。
+func fetchSourceBody(ctx context.Context, rawURL string) (string, error) {
+	host := hostOfURL(rawURL)
+	// IP 字面量没有 HTTPS RR 可查（测试里的 127.0.0.1 就是这种），直接走分片。
+	if host != "" && net.ParseIP(host) == nil && tlsutil.ECHEnabled() {
+		if ech := echConfigWithin(host, echLookupBudget); len(ech) > 0 {
+			if body, derr := httpGetBody(ctx, sourceECHClient(host, ech), rawURL); derr == nil {
+				return body, nil
+			}
+			// ECH 这条路失败（被拒/被墙/超时）：落到②。不在这里 MarkECHDown ——
+			// 熔断的语义是"这次网络里 ECH 整体不可用"，单个源失败不足以判断。
+		}
+	}
+	return httpGetBody(ctx, fragClient, rawURL)
+}
+
+// echConfigWithin 在预算内查一次 ECH 配置；超时或失败返回 nil（调用方走分片）。
+//
+// 为什么另起 goroutine 而不是直接用 ctx：tlsutil.FetchECHConfigList 不接受 context
+// （它内部是 http.Client 自带超时）。这条查询最长 10 秒，而入口取数在启动关键路径上，
+// 不能为它等。channel 带缓冲，所以超时之后那个 goroutine 不会漏。
+func echConfigWithin(host string, budget time.Duration) []byte {
+	type res struct {
+		ech []byte
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		e, err := fetchECHConfigFor(host, "")
+		ch <- res{e, err}
+	}()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return nil
+		}
+		return r.ech
+	case <-time.After(budget):
+		return nil
+	}
+}
+
+// httpGetBody 用给定客户端取回正文（两个客户端共用的那一段）。
+func httpGetBody(ctx context.Context, c *http.Client, rawURL string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "netmaster")
+	resp, err := c.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("http %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	if err != nil && len(body) == 0 {
+		return "", err
+	}
+	return string(body), nil
+}
+
+// hostOfURL 取 URL 的主机名；解析不出来返回空串（调用方退回分片）。
+func hostOfURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
 
 // entryRe 宽容匹配一行里的候选：IPv4 或主机名，可选 :端口，可带 #名字 后缀。
