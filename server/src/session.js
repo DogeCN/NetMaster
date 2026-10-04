@@ -493,6 +493,18 @@ class SessionDO {
       relayId: ex.relay ? `${ex.relay.host}:${ex.relay.port}` : null,
       prof: p, // 首字节到达时打点用（见 pumpOutbound）
       openedAt: Date.now(),
+      // 数据路径的度量（2026-10-04 加）。
+      //
+      // 为什么必须补这三个：坏窗口里用户等的"几十秒"发生在**建连之后** ——
+      // exit.* 那批 span 全都好看（几十毫秒），而真正慢的是"目标多久才回第一个
+      // 字节"与"这一路到底有多少吞吐"。此前只有一个 mark（mark 在 summarize 里
+      // 只剩名字，看不到耗时分布），所以"中继慢在哪"无从回答。
+      //
+      // TTFB 的 attrs 带上出口标识：这样慢的那几条能直接对到具体中继，而不是只能
+      // 说"中继整体慢"。
+      bytes: 0,
+      endTTFB: p.begin("exit.ttfb", ex.relay ? `${ex.relay.host}:${ex.relay.port}` : "direct"),
+      endStream: p.begin("exit.stream"),
     };
     if (rec.hash) {
       // 出口学到的映射先乐观记下，3 秒内没有首字节就承认学错了。
@@ -528,6 +540,12 @@ class SessionDO {
           // exit.* 的 span 全都好看，只有这个 span 会大。
           rec.prof?.count("firstByte", 1);
           rec.prof?.mark("firstByte", `${Date.now() - rec.openedAt}ms after open`);
+          // 首字节到达 ⇒ TTFB 这一段结束。它比 mark 有用得多：mark 在 summarize 里
+          // 只剩名字，而 span 有 ms/n/max，能直接看分布。
+          if (rec.endTTFB) {
+            rec.endTTFB();
+            rec.endTTFB = null;
+          }
           if (rec.learnPending) {
             // SNI 中继此刻被端到端证实（数据真的穿过了隧道），写入 Router DO
             // 供跨会话复用——这是竞速 6 槽预算之外唯一的复用来源。
@@ -535,6 +553,9 @@ class SessionDO {
             this.learn(rec.hash, RELAY_TYPE_SNI, rec.relayId);
           }
         }
+        // 这一路实际送回来的字节数：与 exit.stream 的时长一起给出吞吐
+        //（bytes / ms），那是"中继能不能扛住"的直接答案。
+        rec.bytes += value.length;
         let buf = value;
         while (buf.length > MAX_PAYLOAD) {
           if (!sendTo(encodeDataFrame(id, buf.slice(0, MAX_PAYLOAD)))) return;
@@ -584,6 +605,21 @@ class SessionDO {
     this.rememberClosed(id);
     if (rec) {
       if (rec.firstByteTimer) clearTimeout(rec.firstByteTimer);
+      // 数据路径的收尾。
+      //
+      // 首字节**始终没来**的流要单独记一笔：那正是"隧道建立后被零字节断开"的形态
+      //（坏窗口里成片出现，客户端日志里表现为 proxy tunnel dead），而它此前在服务端
+      // 完全不可见 —— 那些流的 exit.* span 全是好看的建连耗时。
+      if (rec.endTTFB) {
+        rec.endTTFB();
+        rec.endTTFB = null;
+        rec.prof?.count("exit.ttfb.none", 1);
+      }
+      if (rec.endStream) {
+        rec.endStream();
+        rec.endStream = null;
+      }
+      if (rec.bytes > 0) rec.prof?.count("exit.bytes", rec.bytes);
       try { rec.socket.close(); } catch {}
     }
     if (notify && rec?.ws) {
