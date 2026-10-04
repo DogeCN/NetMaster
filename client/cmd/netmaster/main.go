@@ -452,9 +452,11 @@ func cmdServe(args []string) {
 	manual := fs.Bool("manual", cfg.Manual, "don't take over the system proxy, just print listen addrs (config.json: manual)")
 	rulesFile := fs.String("rules", cfg.Rules, "custom rules file (config.json: rules)")
 	noECH := fs.Bool("no-ech", cfg.ECHDisabled(), "disable ECH SNI hiding on the client->worker hop (config.json: no-ech)")
+	fragOOB := fs.Bool("frag-oob", cfg.FragOOBValue(), "send the first ClientHello fragment as TCP urgent data (MSG_OOB); only for sites where plain fragmentation is blocked (config.json: frag-oob)")
 	tunnels := fs.Int("tunnels", tunnelDefault(cfg), "simultaneous proxy tunnels, 1-8; more helps busy pages but burns the free DO time quota (config.json: tunnels)")
 	fs.Parse(args)
 	host, pw := requireConn(*server, passwordValue(password, cfg))
+	tlsfrag.OOB = *fragOOB
 	if *tunnels < 1 || *tunnels > selector.MaxMuxTarget {
 		fatal(fmt.Sprintf("tunnels must be between 1 and %d, got %d", selector.MaxMuxTarget, *tunnels))
 	}
@@ -466,7 +468,7 @@ func cmdServe(args []string) {
 		tr.Fact("ech", boolWord(*noECH, "disabled", "enabled"))
 		tr.Fact("insecure", boolWord(cfg.InsecureEnabled(), "on", "off"))
 		tr.Fact("rules-file", rulesFileLabel(*rulesFile))
-		tr.Fact("frag", fmt.Sprintf("%dB/%dms/%dB", tlsfrag.Chunk, tlsfrag.Delay.Milliseconds(), tlsfrag.MaxSpan))
+		tr.Fact("frag", fmt.Sprintf("%dB/%dms/%dB%s", tlsfrag.Chunk, tlsfrag.Delay.Milliseconds(), tlsfrag.MaxSpan, boolWord(*fragOOB, "+oob", "")))
 	}
 
 	// 单实例（PRD §6.5 step 1）：两个 serve 会互相抢系统代理。锁只拦"接管系统
@@ -633,7 +635,7 @@ func cmdServe(args []string) {
 		Pool:           pool,
 		DirectFallback: true,
 		Logger:         logger,
-		DialTimeout:    15 * time.Second,
+		DialTimeout:    5 * time.Second,
 		Trace:          tr,
 	})
 	if err := srv.Start(); err != nil {

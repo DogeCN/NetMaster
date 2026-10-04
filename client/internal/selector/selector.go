@@ -92,6 +92,13 @@ type Pool struct {
 	rr            atomic.Uint32             // 流分摊用的轮转游标
 	directBlocked map[string]time.Time
 	direct        map[string]bool // host -> 已学习的直连/代理粘性
+	// directDown 记住"这个域名的直连在 TCP 层就失败"（连接被拒/超时）。
+	//
+	// 与 directBlocked 的分工：directBlocked 是 TLS 层被拦的冷却（代理送出过字节
+	// 才写，30min）；directDown 是 TCP 层失败的短记忆（5min）——TCP 都连不上，
+	// 大概率是目标本身不可达或本机网络对该目标异常，不值得每个请求都重付一次
+	// 完整的拨号超时。TTL 短，因为"目标临时不可达"比"被墙"更常恢复。
+	directDown map[string]time.Time
 	// fragDirect 记住"这个域名只有把 TLS 首段分片才能直连"（TLS-RF，见 proxy/tlsfrag.go）。
 	// 存在这里的含义是"分片直连已验证可行"，因此它的优先级高于 directBlocked：
 	// 后者只是"明文 SNI 挨过一次拦"的冷却，不该把学到的能力作废。
@@ -110,6 +117,7 @@ func New(cfg Config) *Pool {
 		insecure:      cfg.Insecure,
 		muxes:         make(map[int]*outbound.MuxConn),
 		directBlocked: make(map[string]time.Time),
+		directDown:    make(map[string]time.Time),
 		direct:        make(map[string]bool),
 		fragDirect:    make(map[string]time.Time),
 		fails:         make(map[int]int),
@@ -823,6 +831,34 @@ func (p *Pool) shouldDirect(host string) bool {
 	return false
 }
 
+// ShouldTryFragDirect 回答"这个域名现在值不值得先试一次分片直连"（实现 proxy.FragTryer）。
+//
+// 默认是"值得"，这是刻意的：分流判 proxy 只说明这个站通常需要代理，不代表直连一定
+// 不通 —— 而**用户装这个软件本身就说明普通直连不通**，所以这里不问"明文行不行"，
+// 直接按分片试（调用方会带着分片起步，见 proxy.relayWithReplay 的 frag）。分片穿过去
+// 就是 2 跳，绕过去是 3 跳，差的是整个 Worker 出站那一段。
+//
+// 记忆决定要不要再试：
+//   - fragDirect 新鲜（6h）→ 值得，且下次直接带分片起步；
+//   - directBlocked 新鲜（30min，隧道真的送出过字节时写）→ 不值得，直接走隧道；
+//   - 没有记忆 → 值得试一次（试错的成本有上界，见 proxy.relayFragProbeWait）。
+func (p *Pool) ShouldTryFragDirect(host string) bool {
+	host = hostOf(host)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.fragDirectFreshLocked(host) {
+		return true
+	}
+	if at, has := p.directBlocked[host]; has {
+		if time.Since(at) > directBlockedTTL {
+			delete(p.directBlocked, host)
+		} else {
+			return false
+		}
+	}
+	return true
+}
+
 // fragDirectTTL 是"这个域名需要分片直连"这条记忆的保留时长。
 //
 // 比 directBlockedTTL 长得多：directBlocked 是一次失败就能下的结论（冷却短一点，
@@ -930,6 +966,37 @@ func (p *Pool) RetryProxy(target string) (net.Conn, error) {
 	delete(p.direct, host)
 	p.mu.Unlock()
 	return p.Dial(target)
+}
+
+// directDownTTL 是"直连 TCP 层失败"这条短记忆的保留时长。比 directBlockedTTL
+// 短得多：目标临时不可达（站点重启、本机网络抖动）远比被墙恢复得快，记长了会把
+// 已经恢复的域名按在代理上多绕 5 分钟。
+const directDownTTL = 5 * time.Minute
+
+// NoteDirectDown 记下"该域名的直连在 TCP 层失败"。由 proxy 层在规则直连拨号
+// 失败时调用；调用方通常紧接着会试代理兜底，这条记忆只是让 5 分钟内的后续请求
+// 别再重复付一次完整的拨号超时。
+func (p *Pool) NoteDirectDown(host string) {
+	host = hostOf(host) // 入参可能带端口，键必须归一（同 NoteFragDirect）
+	p.mu.Lock()
+	p.directDown[host] = time.Now()
+	p.mu.Unlock()
+}
+
+// DirectDownRecently 报告该域名近期是否发生过直连 TCP 层失败（5min 内）。
+func (p *Pool) DirectDownRecently(host string) bool {
+	host = hostOf(host)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	at, has := p.directDown[host]
+	if !has {
+		return false
+	}
+	if time.Since(at) > directDownTTL {
+		delete(p.directDown, host)
+		return false
+	}
+	return true
 }
 
 // NoteProxyConfirmed 在代理隧道真的送出第一个字节之后调用（实现 proxy.ProxyConfirmer）。

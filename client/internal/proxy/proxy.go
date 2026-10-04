@@ -34,6 +34,23 @@ type Exiter interface {
 	NoteProxyFailure(host string)
 }
 
+// FragTryer 由出口选择器实现：回答"这个域名现在值不值得先试一次分片直连"。
+//
+// 单独一个可选接口（而不是塞进 Exiter）：替身不实现它时行为不变，不会因为多一个
+// 方法而编译不过；同时也让"这条策略"在代码里是一个可以整体关掉的东西。
+type FragTryer interface {
+	ShouldTryFragDirect(host string) bool
+}
+
+// DirectDownTracker 记录与查询"直连 TCP 层失败"的短记忆（5min，selector.Pool 实现）。
+//
+// 与 ProxyConfirmer（TLS 层被拦、代理确认后写 30min 冷却）分工见 selector.NoteDirectDown。
+// 可选接口：替身不实现时退回"每次都重试直连"的老行为，不崩。
+type DirectDownTracker interface {
+	NoteDirectDown(host string)
+	DirectDownRecently(host string) bool
+}
+
 // Config 代理服务配置。
 type Config struct {
 	// HTTPAddr 监听的 HTTP 代理地址，如 127.0.0.1:8080
@@ -49,9 +66,6 @@ type Config struct {
 	// RetryViaProxy 在"尝试性直连"被判定阻断后改用代理重连（见 relayWithReplay）。
 	// 默认走 Pool.RetryProxy；测试可注入替身。
 	RetryViaProxy func(host string) (net.Conn, error)
-	// DirectDial 分片直连重试时的拨号（见 tryFragmentedDirect）。
-	// 留空则用 net.DialTimeout；测试可注入替身。
-	DirectDial func(host string) (net.Conn, error)
 	// IsHTTPS 判定一个 CONNECT 目标是否走"首段探测 + 重放"。留空 = 只认 443。
 	//
 	// 为什么留这个口子：测试无法在 127.0.0.1 上占用 443，而这一整条链路（分片、
@@ -83,7 +97,10 @@ type Server struct {
 // New 创建代理服务。
 func New(cfg Config) *Server {
 	if cfg.DialTimeout == 0 {
-		cfg.DialTimeout = 15 * time.Second
+		// 5s 而不是老默认的 15s：这个超时压在用户首屏上（拨号失败 → 502 或改道）。
+		// 健康站点的 TCP 建连在 1s 内完成；15s 只服务"对死目标保持耐心"，而那正是
+		// 负记忆（directDown）该管的事 —— 失败一次记 5min，比每请求等 15s 划算。
+		cfg.DialTimeout = 5 * time.Second
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
@@ -156,13 +173,35 @@ type aliveCounter interface {
 	Alive() int
 }
 
+// directMode 描述 dial() 建出的连接是什么形态 —— 调用方据此选择 relay 策略。
+type directMode int
+
+const (
+	// exitProxy 连接经代理隧道，不是直连。
+	exitProxy directMode = iota
+	// directPlain 直连，首段**明文**起步。规则直连域名默认走这个：CN 站点明文
+	// 大多能通，先付 400ms 分片延迟是浪费；被拦了 relayWithReplay 会补一次分片。
+	directPlain
+	// directFrag 直连，首段**带分片**起步。分流判 proxy 的域名走这个 —— 用户装
+	// 这个软件本身就说明明文 SNI 大概率被拦，先试明文只是白等一个探测窗口。
+	directFrag
+)
+
+// direct 报告这个形态是否属于直连。
+func (m directMode) direct() bool { return m != exitProxy }
+
 // dial 按路由决策建连。
 //
-// 返回的 tentativeDirect 表示"这是一次尝试性的直连"：TCP 连上了，但不代表这个站
-// 真能直连（GFW 常在看到 TLS SNI 后才发 RST）。调用方应据此决定要不要走
-// relayWithReplay。规则明确要求直连的（比如局域网、.cn 名单）不算尝试性 ——
-// 那是用户自己写的规则，失败就该失败，不由我们替他改道。
-func (s *Server) dial(host string) (conn net.Conn, tentativeDirect bool, err error) {
+// 返回的 directMode 里，直连形态（directPlain/directFrag）都表示"这是一次尝试性的
+// 直连"：TCP 连上了，但不代表这个站真能直连（GFW 常在看到 TLS SNI 后才发 RST）。
+// 调用方应据此对 HTTPS 走 relayWithReplay —— 包括规则明确要求直连的域名。
+//
+// 这里与旧语义的分歧值得说清楚：以前规则直连（geoip CN / 用户规则）是裸 relay，
+// 理由是"那是用户自己写的规则，失败就该失败"。但那条理由只对**拨号失败**成立
+// （站点真挂了，改道也救不了，现在仍然直接报错）；对"SNI 被拦"不成立 —— 用户
+// 写 direct 的意思是"这个站通常该直连"，不是"被拦了也给我报错"。relayWithReplay
+// 对健康站点只多付首字节缓冲的几十毫秒，对被拦域名则是一次无感改道。
+func (s *Server) dial(host string) (conn net.Conn, mode directMode, err error) {
 	_, portStr, splitErr := net.SplitHostPort(host)
 	port := uint16(0)
 	if splitErr == nil {
@@ -174,26 +213,97 @@ func (s *Server) dial(host string) (conn net.Conn, tentativeDirect bool, err err
 	if s.cfg.Router != nil {
 		action = s.cfg.Router.Match(host, port)
 	}
-	switch action {
-	case rules.Direct:
-		c, derr := net.DialTimeout("tcp", host, s.cfg.DialTimeout)
-		return c, false, derr
-	default: // proxy
-		if !s.hasUsableExit() {
-			if s.cfg.DirectFallback {
-				// 这条分支**就是**"尝试性直连"的定义：我们没有把握它通，
-				// 只是没有可用的出口了才退回来试。所以 tentativeDirect 必须为 true
-				// —— 否则调用方不会走 relayWithReplay，整条"被阻断→分片→改道"的
-				// 链路就一次都不会执行（这正是它此前一直惰性的原因）。
-				c, derr := net.DialTimeout("tcp", host, s.cfg.DialTimeout)
-				return c, derr == nil, derr
+	if action == rules.Direct {
+		// 近期这个域名直连在 TCP 层就失败过：别再付一次完整拨号超时，直接试代理。
+		// 代理也不行就照常报错 —— 记忆只是省重复成本，不改变失败的结局。
+		if s.cfg.DirectFallback && s.directDownRecently(host) && s.hasUsableExit() {
+			if c, derr := s.cfg.Pool.Dial(host); derr == nil {
+				return c, exitProxy, nil
 			}
-			return nil, false, errors.New("proxy action but no usable exit")
 		}
-		c, derr := s.cfg.Pool.Dial(host)
-		return c, false, derr
+		c, derr := net.DialTimeout("tcp", host, s.cfg.DialTimeout)
+		if derr != nil {
+			// TCP 层失败（被拒/超时）：写下短负记忆。代理兜底在这里**不**主动做 ——
+			// CONNECT 还没回 200，改道的收益只是"502 变成代理侧的 502"，而多数
+			// TCP 失败（站点真挂）改道也救不了。记忆留给下一次请求省时间。
+			s.noteDirectDown(host)
+			return nil, exitProxy, derr
+		}
+		// 明文起步还是分片起步交给记忆：只有"验证过分片才行"的域名才直接带分片。
+		if s.httpsish(host) && s.needsFragDirect(host) {
+			return c, directFrag, nil
+		}
+		return c, directPlain, nil
+	}
+	// 先赌一把**分片直连**（TLS-RF），哪怕池子里还有可用出口。
+	//
+	// 为什么值得赌：分流判 proxy 只说明这个站"通常需要代理"，不代表直连一定
+	// 不通 —— 而分片直连能穿过去的话就是 2 跳，绕过去是 3 跳，差的是整个
+	// Worker 出站那一段（实测 CF 托管页面的抓取 3–12s，直连只要 1–2s）。
+	// 用户装这个软件本身就说明普通直连不通，所以这里不问"明文行不行"，
+	// 直接带分片起步（见 relayWithReplay 的 frag）。
+	//
+	// 记忆决定值不值得再试一次：成功记 6h（fragDirect），失败则在隧道真的送出
+	// 字节之后记 30min（directBlocked，见 NoteProxyConfirmed）—— 那 30 分钟里
+	// 这个域名直接走隧道，不再付探测成本。
+	if s.cfg.DirectFallback && s.httpsish(host) && s.shouldTryFragDirect(host) {
+		if c, derr := net.DialTimeout("tcp", host, directProbeDialTimeout); derr == nil {
+			return c, directFrag, nil
+		}
+		// TCP 都建不起来（黑洞/无路由）：没什么可赌的，直接落隧道。
+	}
+	if !s.hasUsableExit() {
+		if s.cfg.DirectFallback {
+			// 这条分支**就是**"尝试性直连"的定义：我们没有把握它通，
+			// 只是没有可用的出口了才退回来试。所以形态必须是 directFrag
+			// —— 否则调用方不会走 relayWithReplay，整条"被阻断→分片→改道"
+			// 的链路就一次都不会执行（这正是它此前一直惰性的原因）。
+			c, derr := net.DialTimeout("tcp", host, s.cfg.DialTimeout)
+			if derr != nil {
+				return nil, exitProxy, derr
+			}
+			return c, directFrag, nil
+		}
+		return nil, exitProxy, errors.New("proxy action but no usable exit")
+	}
+	c, derr := s.cfg.Pool.Dial(host)
+	return c, exitProxy, derr
+}
+
+// shouldTryFragDirect 问出口选择器"这个域名值不值得先试分片直连"。
+// 替身没实现 FragTryer 时返回 false —— 策略整体不生效，而不是崩。
+func (s *Server) shouldTryFragDirect(host string) bool {
+	ft, ok := s.cfg.Pool.(FragTryer)
+	return ok && ft.ShouldTryFragDirect(host)
+}
+
+// needsFragDirect 查"这个域名是否已验证过分片直连可行"（含分片起步决策）。
+// 替身没实现 FragDirecter 时返回 false：明文起步，被拦了再补分片。
+func (s *Server) needsFragDirect(host string) bool {
+	fd, ok := s.cfg.Pool.(FragDirecter)
+	return ok && fd.NeedsFragDirect(host)
+}
+
+// noteDirectDown / directDownRecently 是直连 TCP 层失败短记忆的读写。
+// 替身没实现 DirectDownTracker 时：不记、不查 —— 行为退回"每次都重试直连"。
+func (s *Server) noteDirectDown(host string) {
+	if dt, ok := s.cfg.Pool.(DirectDownTracker); ok {
+		dt.NoteDirectDown(host)
 	}
 }
+
+func (s *Server) directDownRecently(host string) bool {
+	dt, ok := s.cfg.Pool.(DirectDownTracker)
+	return ok && dt.DirectDownRecently(host)
+}
+
+// directProbeDialTimeout 是"先赌一把分片直连"那次 TCP 建连的上限。
+//
+// 明显短于常规 DialTimeout(15s)：这一步对**每个新域名**都要走一次，而它的性质是赌 ——
+// 被黑洞的 IP（TCP SYN 石沉大海）会一直不回应，15 秒的等待直接压在用户首屏上
+// （实测首请求 20.9s 就是它：15s 拨号 + 落隧道重放）。赌输了落隧道，代价可控；
+// 赌赢了省掉整整一跳。
+const directProbeDialTimeout = 5 * time.Second
 
 // hasUsableExit 判断代理侧还有没有可用的出口。
 //
@@ -343,13 +453,14 @@ func (s *Server) handleHTTPConn(c net.Conn) {
 
 // tunnel 处理 CONNECT：连上后回 200 再双向转发。
 //
-// 若这次连的是"尝试性直连"的 HTTPS，走 relayWithReplay —— 它会把选择推迟到
-// 首个数据包回来之后再定，以便在被 GFW 阻断时无缝改走代理。
+// 直连（无论来自规则还是代理动作下的分片赌注）且是 HTTPS 时走 relayWithReplay ——
+// 它把选择推迟到首个数据包回来之后再定，被拦时无缝改走代理；分片记忆决定首段
+// 是明文还是分片起步。
 // 代理路径的 HTTPS 走 relayWithProxyReplay —— 与直连侧对称：隧道已建立但不等于
 // 这跳真能用（worker 内联选中继，首次可能踩到"TCP 能通但不干活"的中继），
 // 上游零字节即断时换出口重放一次，浏览器无感。
 func (s *Server) tunnel(client net.Conn, host string) {
-	up, tentativeDirect, err := s.dial(host)
+	up, mode, err := s.dial(host)
 	if err != nil {
 		fmt.Fprintf(client, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
 		return
@@ -357,11 +468,11 @@ func (s *Server) tunnel(client net.Conn, host string) {
 	defer up.Close()
 	fmt.Fprintf(client, "HTTP/1.1 200 Connection Established\r\n\r\n")
 
-	if tentativeDirect && s.httpsish(host) {
-		s.relayWithReplay(client, up, host)
+	if mode.direct() && s.httpsish(host) {
+		s.relayWithReplay(client, up, host, mode == directFrag)
 		return
 	}
-	if !tentativeDirect && s.cfg.Pool != nil && s.httpsish(host) {
+	if mode == exitProxy && s.httpsish(host) {
 		s.relayWithProxyReplay(client, up, host)
 		return
 	}
@@ -393,7 +504,7 @@ func (s *Server) handleSocksConn(c net.Conn) {
 		return
 	}
 	c.SetReadDeadline(time.Time{})
-	up, tentativeDirect, err := s.dial(host)
+	up, mode, err := s.dial(host)
 	if err != nil {
 		// reply: 失败
 		c.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) //nolint:errcheck
@@ -402,11 +513,11 @@ func (s *Server) handleSocksConn(c net.Conn) {
 	defer up.Close()
 	// reply 成功（bound addr 填 0.0.0.0:0）
 	c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) //nolint:errcheck
-	if tentativeDirect && s.httpsish(host) {
-		s.relayWithReplay(c, up, host)
+	if mode.direct() && s.httpsish(host) {
+		s.relayWithReplay(c, up, host, mode == directFrag)
 		return
 	}
-	if !tentativeDirect && s.cfg.Pool != nil && s.httpsish(host) {
+	if mode == exitProxy && s.httpsish(host) {
 		s.relayWithProxyReplay(c, up, host)
 		return
 	}

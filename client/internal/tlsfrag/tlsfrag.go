@@ -22,11 +22,31 @@ import (
 )
 
 var (
-	// Chunk 每片字节数。取小值（个位数）以保证重组窗口内凑不出一条完整记录。
-	Chunk = 8
+	// Chunk 每片字节数。
+	//
+	// ⚠️ 2026-10-04 实测（client/cmd/fragprobe，同一目标 IP 换 SNI 对照确认是纯 SNI 阻断）：
+	// 片 ≤2 字节才穿得过去，≥4 字节一律被 RST。原先取 8 —— 那一档在这台网络上
+	// **3/3 全灭**，也就是说"分片"这个功能此前在真实链路上等于没生效。
+	//
+	//	1B/0/100B  2/2 通过 461ms      4B/0/400B  0/2
+	//	1B/0/200B  2/2 通过 490ms      6B/0/400B  0/2
+	//	2B/0/400B  2/2 通过 480ms      8B/8ms/400B 0/2（原默认）
+	//	3B/0/400B  1/2（临界）         16B/16ms/400B 0/2
+	//
+	// 机制未定论（可能是阻断设备对"连续小段"有个放弃阈值，而不是拼不出 SNI ——
+	// span=50 不过、span=100 过，而 SNI 在 ~120 字节处，说明它不是在 SNI 字节上被切断的）。
+	// 结论按实测取：片小 + 覆盖足够长的前缀。
+	Chunk = 1
 
-	// Delay 片间隔。要大于阻断设备的重组等待，但不必大到拖垮首包。
-	Delay = 8 * time.Millisecond
+	// Delay 片间隔。
+	//
+	// 原为 8ms，理由是"要大于阻断设备的重组等待"。实测推翻了这个理由：0 延迟反而
+	// 更快且同样可靠（1B/0/100B 461ms vs 1B/1ms/400B 1050ms）。8ms 的代价是
+	// 每片白等，400 字节要 3.2 秒。
+	//
+	// 注意 Go 的 net.TCPConn 默认开着 TCP_NODELAY，所以"0 延迟"仍然是每片一个
+	// TCP 段，不会在本地被合并成一个大段。
+	Delay = time.Duration(0)
 
 	// MaxSpan 只分片前 N 字节，之后一次性写出。
 	//
@@ -34,6 +54,8 @@ var (
 	// （记录头5 + 握手头4 + 版本2 + random32 + session_id + cipher_suites +
 	// compression + extensions 头 ≈ 100~160 字节，SNI 是惯例上的第一个扩展）。
 	// 超出这个窗口的字节与"能不能读到 SNI"无关，不值得为它付延迟。
+	//
+	// 实测下限：span=50 过不去，span≥100 能过 —— 分片前缀必须够长（理由见 Chunk）。
 	MaxSpan = 400
 )
 
@@ -70,6 +92,22 @@ func WriteWith(w io.Writer, chunk int, delay time.Duration, span int, b []byte) 
 		end := off + chunk
 		if end > span {
 			end = span
+		}
+		// 第一片可走 MSG_OOB 变体（见 oob.go）。仅在 OOB 开启且底层是真连接时接管；
+		// 失败即中止 —— OOB 写发生错误后字节的落点不可知，退回普通写可能造成重复。
+		if off == 0 && OOB {
+			handled, oerr := trySendOOB(w, b[off:end], &total)
+			if handled {
+				off = end
+				if oerr != nil {
+					return total, oerr
+				}
+				// 与普通分片一致：后面还有字节才需要拉开间隔。
+				if off < len(b) {
+					time.Sleep(delay)
+				}
+				continue
+			}
 		}
 		// 游标必须按**实际写出的字节数**推进，而不是按 chunk。
 		//

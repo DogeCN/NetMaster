@@ -112,6 +112,10 @@ func (c *Client) dialECH() (net.Conn, error) {
 		errs = append(errs, "preferred-ip: "+err.Error())
 	}
 	// 回退：域名直连（系统 DNS 可能给到承载 zone 的 IP）。
+	// 重新读一次缓存：第一步若触发了 RetryConfig 自愈，缓存里已是服务端下发的新配置。
+	if refreshed, ferr := tlsutil.FetchECHConfigList(c.SNI, ""); ferr == nil {
+		ech = refreshed
+	}
 	if conn, err := tlsutil.DialECH(c.SNI, c.Node.Port, c.SNI, ech, c.Insecure); err == nil {
 		return conn, nil
 	} else {

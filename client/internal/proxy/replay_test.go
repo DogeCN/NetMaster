@@ -79,7 +79,7 @@ func TestRelayWithReplayFailsOver(t *testing.T) {
 		},
 	}}
 
-	go srv.relayWithReplay(client, up, "blocked.example:443")
+	go srv.relayWithReplay(client, up, "blocked.example:443", true)
 
 	// 模拟客户端发出首个飞行段。
 	payload := []byte("PING-CLIENTHELLO")
@@ -119,7 +119,7 @@ func TestRelayWithReplayStaysDirect(t *testing.T) {
 		},
 	}}
 
-	go srv.relayWithReplay(client, up, "ok.example:443")
+	go srv.relayWithReplay(client, up, "ok.example:443", true)
 
 	payload := []byte("HELLO")
 	go func() { _, _ = peer.Write(payload) }()

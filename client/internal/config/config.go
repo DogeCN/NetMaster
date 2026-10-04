@@ -53,6 +53,15 @@ type Config struct {
 	// 只接受 1..8：不写就用默认；写了超范围由调用方报错退出，而不是静默夹到
 	// 边界 —— 静默夹取会让人以为自己真的跑在 8 条上。
 	Tunnels *int `json:"tunnels,omitempty"`
+	// FragOOB 让分片直连的第一片用 TCP 紧急数据（MSG_OOB）发出（tlsfrag.OOB）。
+	// 缺省（不写）= 关闭：紧急字节是否进入对端字节流取决于 SO_OOBINLINE，开了的
+	// 接收方会拿到坏记录，所以只在确认目标站点"普通分片被拦、OOB 能过"时手动打开。
+	FragOOB *bool `json:"frag-oob,omitempty"`
+}
+
+// FragOOBValue 返回分片 OOB 开关的生效值。nil 视为 false（关闭）。
+func (c Config) FragOOBValue() bool {
+	return c.FragOOB != nil && *c.FragOOB
 }
 
 // TunnelsValue 返回配置里写的隧道条数；没写（nil）返回 0，由调用方按"用默认"处理。

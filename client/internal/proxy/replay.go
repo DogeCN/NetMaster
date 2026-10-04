@@ -28,12 +28,6 @@ const (
 	// 真死的隧道几乎都是立刻 EOF（RST/close），不等窗口到期，所以放宽窗口
 	// 并不牺牲故障切换的速度。
 	relayProxyProbeWait = 8 * time.Second
-	// relayFragProbeWait 是**分片直连**的首字节窗口。
-	//
-	// 比明文侧略宽，因为分片本身已经付掉了 MaxSpan/Chunk × Delay 的延迟
-	// （默认约 400ms）才开始等回应；而目标在看到分片 ClientHello 后才决定
-	// 收不收，给它一点余量免得把"碎片拼得慢"误判成被墙。
-	relayFragProbeWait = 4 * time.Second
 	// relaySpoolMax 是首个飞行段的缓存上限，超出就不再收（正常 ClientHello 约 200~2000 字节）。
 	relaySpoolMax = 16 * 1024
 )
@@ -161,18 +155,22 @@ func (s *Server) noteProxyConfirmed(host string) {
 //
 // 做法是把判定推迟到第一个数据包回来之后，并且**按代价从低到高**依次尝试：
 //
-//	① 明文直连   t=0     等 relayProbeWait(3s)
-//	② 分片直连   仅在①被判阻断时   重新拨一次 + 约 400ms 分片
-//	③ 代理隧道   仅在②也失败时     沿用已有 mux
+//	① 直连首段    t=0   明文或分片起步（见 fragStart），等 relayProbeWait(3s)
+//	② 分片重试    仅在①明文起步且被拦时   重新拨一次 + 约 400ms 分片
+//	③ 代理隧道    仅在②也失败时          沿用已有 mux
 //
-// ②排在③之前是这里的核心：分片成功就**留在直连**，不多绕一跳、也不在服务端多烧
-// 一次 connect() 子请求（50 子请求/invocation 是免费版硬顶）。这正是 TLS-RF 的意义
+// 起步形态由调用方按域名性质决定：分流判 proxy 的域名**带分片起步**（用户装这个
+// 软件本身就说明明文 SNI 早被 RST，先试明文只是白等一个探测窗口）；规则直连的
+// 域名**明文起步**（CN 站点明文大多能通，先付分片延迟是浪费），被拦了自然落到②。
+//
+// ②/③排在后面是这里的核心：留在直连就**不多绕一跳**、不在服务端多烧一次
+// connect() 子请求（50 子请求/invocation 是免费版硬顶）。这正是 TLS-RF 的意义
 // —— 穿过去，而不是绕过去。
 //
-// ②成功之后记住这个域名（selector.Pool，6h），下次直接跳过注定失败的①。
+// 分片成功之后记住这个域名（selector.Pool，6h），下次直接带分片起步。
 //
 // 浏览器全程无感，只看到握手慢了一点。
-func (s *Server) relayWithReplay(client, up net.Conn, host string) {
+func (s *Server) relayWithReplay(client, up net.Conn, host string, fragStart bool) {
 	endTunnel := s.cfg.Trace.Begin("connect."+routeTag(host), 0)
 	defer endTunnel()
 
@@ -184,54 +182,96 @@ func (s *Server) relayWithReplay(client, up net.Conn, host string) {
 	}
 
 	fd := s.fragDirecter()
-	frag := fd != nil && fd.NeedsFragDirect(host)
-	endWrite := s.cfg.Trace.Begin("replay.write-first", 0, fmt.Sprintf("fragmented=%v", frag))
-	if err := writeFlight(up, first, frag); err != nil {
-		endWrite()
-		return
-	}
+	// 分片记忆可以把明文起步升级成分片起步：规则直连域名若上一轮验证过"必须
+	// 分片"，就没必要每次都先吃一次拦截再补。remembered 只用于日志与打点。
+	remembered := fd != nil && fd.NeedsFragDirect(host)
+	frag := fragStart || remembered
+	endWrite := s.cfg.Trace.Begin("replay.write-first", 0,
+		fmt.Sprintf("fragmented=%v remembered=%v", frag, remembered))
+	writeErr := writeFlight(up, first, frag)
 	endWrite()
 
-	data, perr := probeUp(up, relayProbeWait)
-	if data != nil {
-		// 直连成立。先把探到的数据送给客户端，再转入普通转发。
-		if _, err := client.Write(data); err != nil {
+	// 首段写不出去（对端已经关了）时**不能提前 return**：浏览器那侧已经收到
+	// "200 Connection Established"，提前返回等于把它挂在一个死隧道上。正确做法是
+	// 当成"这条路不通"，继续往下走代理兜底 —— 这与"零字节即断"是同一类结论。
+	//
+	// 这条以前没暴露，是因为明文首段是一次性写出去的：写到已关闭的 socket 上
+	// 本地缓冲多半会成功，于是照样走到探测那一步；而分片是多次写，中途就失败了。
+	reason := ""
+	if writeErr == nil {
+		data, perr := probeUp(up, relayProbeWait)
+		if data != nil {
+			// 直连成立。先记住"这个域名分片直连可行"（6h），再把探到的数据送给
+			// 客户端，然后转入普通转发。
+			//
+			// 记忆必须在这里写：以前只有"明文被拦 → 分片重试成功"那条路会写它，
+			// 而分片优先之后第一次尝试就带分片，那条路不再经过 —— 漏了这里，
+			// 每条新连接都会把分片当"第一次赌"，日志里也永远学不到结论。
+			if fd != nil {
+				fd.NoteFragDirect(host)
+			}
+			if _, err := client.Write(data); err != nil {
+				return
+			}
+			s.cfg.Trace.Mark("replay.direct-ok", fmt.Sprintf("probe=%s", relayProbeWait))
+			s.relay(client, up, host)
 			return
 		}
-		s.cfg.Trace.Mark("replay.direct-ok", fmt.Sprintf("probe=%s", relayProbeWait))
-		s.relay(client, up, host)
-		return
-	}
-	if isTimeoutErr(perr) {
-		// 目标只是慢：认账，不据此改道。
-		s.cfg.Trace.Mark("replay.slow-kept-direct", "")
-		s.relay(client, up, host)
-		return
+		if isTimeoutErr(perr) {
+			// 超时**按阻断处理**，不再当"目标只是慢"。
+			//
+			// 这是 2026-10-04 的有意反转。旧契约是"超时不是被阻断的证据"，理由是
+			// 别把慢但活的站点推去代理。但这条路径现在对**每个新域名**都要走一次
+			// （分片直连优先），而实测的阻断形态里"TCP 连上、ClientHello 被静默丢弃"
+			// 比 RST 更常见（BBC/Wikipedia 明文直连都是 20s 无响应而非 RST）。
+			// 把它当"慢"的后果是：请求留在一条永远不会回应的直连上，用户干等自己的
+			// 超时（实测 25s 以上）。
+			//
+			// 代价：首字节真的超过 relayProbeWait 的目标会被推去代理，并记 30 分钟。
+			// 取舍依据：被墙网络里"静默丢弃"远多于"慢站点"，而多绕一跳远好过整页挂死。
+			reason = fmt.Sprintf("no response within %s (silent drop, treated as blocked)", relayProbeWait)
+			s.cfg.Trace.Mark("replay.silent-drop", "")
+		} else {
+			// 注意措辞：能确定的只是"直连没能把这段数据送出去"，原因可能是 RST、连接被
+			// 关闭，也可能是**上游 worker 侧的出站连接失败**（比如目标是 Cloudflare 承载的，
+			// 而 Worker 不能连 CF 自己的 IP），不能一律归为 "blocked by RST" —— 会把后者
+			// 也误报成防火墙阻断，排查时被带偏。
+			reason = "peer closed before responding"
+			if perr != nil {
+				reason = perr.Error()
+			}
+		}
+	} else {
+		reason = writeErr.Error()
 	}
 
-	// 注意措辞：能确定的只是"直连没能把这段数据送出去"，原因可能是 RST、连接被
-	// 关闭，也可能是**上游 worker 侧的出站连接失败**（比如目标是 Cloudflare 承载的，
-	// 而 Worker 不能连 CF 自己的 IP），不能一律归为 "blocked by RST" —— 会把后者
-	// 也误报成防火墙阻断，排查时被带偏。
-	reason := "peer closed before responding"
-	if perr != nil {
-		reason = perr.Error()
-	}
-
-	// ② 分片直连。明文都被拦了才轮到它，所以这里不该再付一次"明文试错"的时间。
+	// ② 明文起步被拦：还差一步分片没试。重新拨一次直连，带分片把首段重写。
+	// 成功就留在直连（2 跳），并把"这个域名要分片"记下来；失败才落③。
 	if !frag {
-		if s.tryFragmentedDirect(client, up, first, host, reason) {
+		if up2, data2, ok := s.retryWithFrag(host, first); ok {
+			_ = up.Close()
+			if _, err := client.Write(data2); err != nil {
+				return
+			}
+			s.relay(client, up2, host)
 			return
 		}
-	} else if fd != nil {
-		// 我们**是因为**这条记忆才分片的，而分片这次没奏效 ⇒ 摘掉它。
-		//
-		// 这个分支以前是空的，于是记忆永远清不掉：fragDirect 的优先级高于
-		// directBlocked（见 selector.Pool 的字段注释），而下面紧接着写下的
-		// "这个域名该走代理"会被它压掉。后果是此后 6 小时内每条连接都先白付约
-		// 400ms 的分片、再落代理 —— 一次失败的探测，代价按 TTL 持续计费。
+		// 重拨失败时 up 还是那条已建立的直连 —— 它TCP 是通的，别白白扔掉：
+		// 浏览器那侧 200 已经回出去了，宁可让它干等到自己的超时。
+		s.cfg.Trace.Mark("replay.frag-retry-unavailable", "")
+	}
+
+	// 分片也没穿过去 ⇒ 摘掉"分片可行"这条记忆（如果有）。
+	//
+	// 这个分支以前只在"因为记忆才分片"时走，于是记忆清不掉：fragDirect 的优先级
+	// 高于 directBlocked（见 selector.Pool 的字段注释），而下面紧接着写下的
+	// "这个域名该走代理"会被它压掉。后果是此后 6 小时内每条连接都先白付约 400ms
+	// 的分片、再落代理 —— 一次失败的探测，代价按 TTL 持续计费。
+	if fd != nil {
 		fd.ForgetFragDirect(host)
-		s.cfg.Logger.Printf("[frag] %s remembered fragmentation no longer works (%s) — forgetting it", host, reason)
+		if remembered {
+			s.cfg.Logger.Printf("[frag] %s remembered fragmentation no longer works (%s) — forgetting it", host, reason)
+		}
 	}
 
 	// ③ 代理隧道。分片也穿不过去，说明这条路对我们不成立，只能绕。
@@ -250,79 +290,39 @@ func (s *Server) relayWithReplay(client, up net.Conn, host string) {
 	s.relay(client, pc, host)
 }
 
-// tryFragmentedDirect 用分片后的 ClientHello 重新走一次直连。
+// retryWithFrag 是 relayWithReplay 的阶梯②：对明文起步被拦的域名，重新拨一条
+// 直连、带分片重写首段并探测。返回 (conn, data, true) 表示分片直连成立 —— data 是
+// 探测窗口里收到的目标首字节，调用方必须先把它回给客户端再转普通 relay；
+// (nil, nil, false) 表示这条路不通（调用方维持原状或落代理）。
 //
-// 返回 true 表示本函数已经接管（成功转发，或明确失败并把 up 关掉），调用方不要
-// 再往下走代理；返回 false 表示这条路不可用，调用方应当继续走代理兜底。
-//
-// 为什么必须**重新拨**一条连接：触发它的那次直连已经被对端 RST 掉了，
-// 同一�� socket 上重发只会得到同样的 RST。
-func (s *Server) tryFragmentedDirect(client, dead net.Conn, first []byte, host, reason string) bool {
-	endT := s.cfg.Trace.Begin("frag.retry", 0)
-	defer endT()
-
-	fd := s.fragDirecter()
-	if fd == nil {
-		// 没有记忆层就永远学不会分片可行 —— 但**仍然试一次**是值得的：
-		// 这次试的成本是一次拨号加约 400ms，而成功的话这次调用就把它记住了。
-		fd = &statelessFragDirecter{}
-	}
-	_ = dead.Close()
-
-	endDial := s.cfg.Trace.Begin("frag.redial", 0)
-	up2, err := s.dialDirect(host)
-	endDial()
+// 判定语义与①一致：拿到数据 = 通过；超时/断开 = 不通。
+func (s *Server) retryWithFrag(host string, first []byte) (net.Conn, []byte, bool) {
+	up2, err := net.DialTimeout("tcp", host, s.cfg.DialTimeout)
 	if err != nil {
-		s.cfg.Logger.Printf("[frag] %s fragmented direct could not redial: %v", host, err)
-		return false
+		s.cfg.Trace.Mark("replay.frag-retry-dial-fail", err.Error())
+		return nil, nil, false
 	}
-	endFrag := s.cfg.Trace.Begin("frag.write", 0, fmt.Sprintf("%d bytes", len(first)))
-	_, err = tlsfrag.Write(up2, first)
-	endFrag()
-	if err != nil {
-		_ = up2.Close()
-		return false
+	if werr := writeFlight(up2, first, true); werr != nil {
+		up2.Close()
+		s.cfg.Trace.Mark("replay.frag-retry-write-fail", werr.Error())
+		return nil, nil, false
 	}
-	data, _ := probeUp(up2, relayFragProbeWait)
+	data, perr := probeUp(up2, relayProbeWait)
 	if data == nil {
-		_ = up2.Close()
-		fd.ForgetFragDirect(host)
-		s.cfg.Logger.Printf("[frag] %s fragmented direct also blocked (%s) — falling back to proxy", host, reason)
-		return false
+		reason := "no response (silent drop, treated as blocked)"
+		if perr != nil && !isTimeoutErr(perr) {
+			reason = perr.Error()
+		}
+		up2.Close()
+		s.cfg.Trace.Mark("replay.frag-retry-blocked", reason)
+		return nil, nil, false
 	}
-
-	fd.NoteFragDirect(host)
-	// 探到的首包（TLS 场景即 ServerHello）必须先交给客户端，否则它会一直等
-	// 一个已经被我们读走的回应，表现为握手挂死。
-	if _, err := client.Write(data); err != nil {
-		_ = up2.Close()
-		return true
+	if fd := s.fragDirecter(); fd != nil {
+		fd.NoteFragDirect(host)
 	}
-	s.cfg.Logger.Printf("[frag] %s direct was blocked (%s) — TLS fragmentation got through, staying direct", host, reason)
-	s.relay(client, up2, host)
-	return true
-}
-
-// statelessFragDirecter 是"没有记忆层"时的空实现：让 tryFragmentedDirect 仍然
-// 能跑一次并给出正确的成败，只是不留下跨连接的结论。
-type statelessFragDirecter struct{}
-
-func (statelessFragDirecter) NeedsFragDirect(string) bool { return false }
-func (statelessFragDirecter) NoteFragDirect(string)       {}
-func (statelessFragDirecter) ForgetFragDirect(string)     {}
-
-// dialDirect 拨一条直连。
-//
-// 绕过 Router 与 Pool 是**刻意的**：能走到这里说明分流已经判给代理、而出口全灭，
-// 我们是在"没有选择"的处境里赌一把直连。此时再问一次规则没有意义（结果只会是
-// 同样的代理出口），而 Pool.Dial 只会把我们送回那个已经证明不通的路径。
-//
-// 测试可注入：Config.DirectDial。
-func (s *Server) dialDirect(host string) (net.Conn, error) {
-	if s.cfg.DirectDial != nil {
-		return s.cfg.DirectDial(host)
-	}
-	return net.DialTimeout("tcp", host, s.cfg.DialTimeout)
+	s.cfg.Logger.Printf("[frag] %s plain direct was blocked — TLS fragmentation got through, staying direct", host)
+	s.cfg.Trace.Mark("replay.frag-retry-ok", "")
+	return up2, data, true
 }
 
 // retryViaProxy 在被判定阻断后改用代理重连。

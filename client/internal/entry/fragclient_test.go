@@ -22,7 +22,10 @@ type clientHelloRecorder struct {
 	reads   int
 	firstAt time.Time
 	lastAt  time.Time
-	done    chan struct{}
+	// firstRead 是**第一次读到的字节数**。它比"总读次数"更难糊弄：分层错了
+	// （先握手再打散）时第一次读就是整条 ClientHello；分片生效时第一次读只有一片。
+	firstRead int
+	done      chan struct{}
 }
 
 func newClientHelloRecorder(t *testing.T) *clientHelloRecorder {
@@ -49,6 +52,7 @@ func newClientHelloRecorder(t *testing.T) *clientHelloRecorder {
 				now := time.Now()
 				if r.reads == 0 {
 					r.firstAt = now
+					r.firstRead = n
 				}
 				r.lastAt = now
 				r.reads++
@@ -67,13 +71,13 @@ func (r *clientHelloRecorder) url() string {
 	return fmt.Sprintf("https://%s/netmaster.txt", r.ln.Addr().String())
 }
 
-func (r *clientHelloRecorder) stats() (reads int, elapsed time.Duration) {
+func (r *clientHelloRecorder) stats() (reads int, elapsed time.Duration, firstRead int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.firstAt.IsZero() {
-		return r.reads, 0
+		return r.reads, 0, 0
 	}
-	return r.reads, r.lastAt.Sub(r.firstAt)
+	return r.reads, r.lastAt.Sub(r.firstAt), r.firstRead
 }
 
 func (r *clientHelloRecorder) close() {
@@ -98,20 +102,26 @@ func TestFragClientFragmentsTheClientHelloOnTheWire(t *testing.T) {
 	// 握手必然失败（服务端不做 TLS），这里只关心它失败前把什么写上了线。
 	_, _ = fetchSource(ctx, r.url())
 
-	reads, elapsed := r.stats()
+	reads, _, firstRead := r.stats()
 	r.close()
 
 	if reads == 0 {
 		t.Fatal("nothing reached the server; the test cannot tell a layering bug from a dial failure")
 	}
-	// 不分片时整个 ClientHello 是一次 Write 落地，服务端看到的是 1 次读、耗时 ~0。
-	// 分片后是几十次读、耗时数百毫秒。阈值取宽松的中间值，两边都不贴边。
+	// 不分片时整个 ClientHello 是一次 Write 落地，服务端看到的是 1 次读。
 	if reads < 3 {
-		t.Fatalf("ClientHello arrived in %d read(s) over %s — it was not fragmented "+
-			"(a DialTLSContext here fragments only the bytes written after the handshake)", reads, elapsed)
+		t.Fatalf("ClientHello arrived in %d read(s) — it was not fragmented "+
+			"(a DialTLSContext here fragments only the bytes written after the handshake)", reads)
 	}
-	if elapsed < 20*time.Millisecond {
-		t.Fatalf("ClientHello arrived over %s in %d reads — the pieces were not spaced out", elapsed, reads)
+	// 首片必须很小。
+	//
+	// 这里原先断言的是"各片之间有 ≥20ms 间隔"，理由是"必须拉开间隔才骗得过重组"。
+	// 2026-10-04 的实测推翻了它：零延迟的 1B 分片（1B/0/400B）在同一网络、同一目标上
+	// 3/3 通过、461ms，而带延迟的 1B/1ms/400B 是 1050ms —— 起作用的不是"间隔"，
+	// 是"片足够小、前缀足够长"（见 tlsfrag.Chunk 的实测表）。于是默认 Delay 改为 0，
+	// 这条断言也跟着换成"首片很小"，它同样是分层错误（先握手再打散）会立刻违反的性质。
+	if firstRead >= 64 {
+		t.Fatalf("the first read carried %d bytes — the ClientHello was not written piece by piece", firstRead)
 	}
 }
 
@@ -123,7 +133,7 @@ func TestFragClientDoesNotWriteTheFirstByteAsOnePiece(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	_, _ = fetchSource(ctx, r.url())
-	reads, _ := r.stats()
+	reads, _, _ := r.stats()
 	r.close()
 
 	if reads == 0 {

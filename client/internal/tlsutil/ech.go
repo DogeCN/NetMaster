@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -126,6 +127,30 @@ func parseECHFromDoH(body []byte) ([]byte, error) {
 	return nil, fmt.Errorf("no ECH config found in HTTPS RR")
 }
 
+// storeECHRetryConfig 把服务端下发的 RetryConfigList 写进缓存，顶掉已失效的旧配置。
+//
+// key 必须与 FetchECHConfigList 的默认 key（domain+"|"）一致，这样自愈后的配置
+// 会被后续所有不带 dohBase 的取用方直接捡走，而不必等 TTL 过期后重新 DoH。
+func storeECHRetryConfig(domain string, retry []byte) {
+	if domain == "" || len(retry) == 0 {
+		return
+	}
+	echCacheMu.Lock()
+	echCache[domain+"|"] = echEntry{data: retry, expires: time.Now().Add(echTTL)}
+	echCacheMu.Unlock()
+}
+
+// retryConfigFrom 判断 err 是否为"服务端拒绝了我们的 ECH 配置"；若是且服务端给了
+// 新配置（RetryConfigList），返回它。这正是 ECH 协议设计的自愈通道：边缘认为你
+// 手里的 ECHConfigList 过期/不认识时，会在拒绝的同时下发当前有效的配置。
+func retryConfigFrom(err error) ([]byte, bool) {
+	var re *utls.ECHRejectionError
+	if errors.As(err, &re) && len(re.RetryConfigList) > 0 {
+		return re.RetryConfigList, true
+	}
+	return nil, false
+}
+
 // dialPhaseTimeout 限制"TCP 已连上、但握手阶段"的等待上限。
 //
 // 没有它时，一次拨号的耗时上限只由 TCP 的 10s 决定，而握手阶段既没有 deadline
@@ -174,7 +199,12 @@ func ECHOverConnDeadline(raw net.Conn, realSNI string, ech []byte, insecure bool
 	_ = raw.SetDeadline(time.Now().Add(timeout))
 	if err := uconn.Handshake(); err != nil {
 		raw.Close()
-		if isStructuralECHFailure(err) {
+		// 被拒绝说明配置过期而非 ECH 不可用：把服务端给的新配置存进缓存，
+		// 让同一轮里后续的拨号直接用上。这里不重试 —— raw 是调用方的，
+		// 探测循环自己会换下一个候选再试。
+		if retry, ok := retryConfigFrom(err); ok {
+			storeECHRetryConfig(realSNI, retry)
+		} else if isStructuralECHFailure(err) {
 			markECHDown()
 		}
 		return nil, err
@@ -195,7 +225,9 @@ func ECHOverConnCfg(raw net.Conn, realSNI string, ech []byte, insecure bool) (ne
 	_ = raw.SetDeadline(time.Now().Add(dialPhaseTimeout))
 	if err := uconn.Handshake(); err != nil {
 		raw.Close()
-		if isStructuralECHFailure(err) {
+		if retry, ok := retryConfigFrom(err); ok {
+			storeECHRetryConfig(realSNI, retry)
+		} else if isStructuralECHFailure(err) {
 			markECHDown()
 		}
 		return nil, err
@@ -229,7 +261,9 @@ func DialECHNoVerify(addr string, port uint16, realSNI string, ech []byte) (net.
 	_ = raw.SetDeadline(time.Now().Add(dialPhaseTimeout))
 	if err := uconn.Handshake(); err != nil {
 		raw.Close()
-		if isStructuralECHFailure(err) {
+		if retry, ok := retryConfigFrom(err); ok {
+			storeECHRetryConfig(realSNI, retry)
+		} else if isStructuralECHFailure(err) {
 			markECHDown()
 		}
 		return nil, err
@@ -280,7 +314,21 @@ func isStructuralECHFailure(err error) bool {
 }
 
 // DialECH 用 utls 建立带 ECH 的 TLS 握手。外层 SNI 自动设为 ECHConfig 的 public_name，真实 SNI 加密。
+//
+// 自愈：若服务端拒绝（ECHRejectionError）且附带了 RetryConfigList，说明本地缓存的
+// ECHConfigList 已过期 —— 把新配置写进缓存，并用它重试一次（fresh TCP，旧连接已被
+// 服务端终止）。重试仍失败才把错误交出去。这样"配置过期"从"熔断 60 秒 + 退明文"
+// 变成一次额外的握手，用户无感。
 func DialECH(addr string, port uint16, realSNI string, ech []byte, insecure bool) (net.Conn, error) {
+	conn, err := dialECHOnce(addr, port, realSNI, ech, insecure)
+	if retry, ok := retryConfigFrom(err); ok {
+		storeECHRetryConfig(realSNI, retry)
+		conn, err = dialECHOnce(addr, port, realSNI, retry, insecure)
+	}
+	return conn, err
+}
+
+func dialECHOnce(addr string, port uint16, realSNI string, ech []byte, insecure bool) (net.Conn, error) {
 	raw, err := net.DialTimeout("tcp", net.JoinHostPort(addr, strconv.Itoa(int(port))), 10*time.Second)
 	if err != nil {
 		return nil, err

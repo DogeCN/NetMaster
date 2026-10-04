@@ -25,12 +25,15 @@ type stubPool struct {
 	frag    map[string]bool
 	proxied map[string]bool
 
+	directDown map[string]bool
+	dialFn     func(string) (net.Conn, error) // 非空时 Dial 走它（模拟"代理能用"）
+
 	mu       sync.Mutex
 	proxyTry int
 }
 
 func newStubPool(alive int) *stubPool {
-	return &stubPool{alive: alive, frag: map[string]bool{}, proxied: map[string]bool{}}
+	return &stubPool{alive: alive, frag: map[string]bool{}, proxied: map[string]bool{}, directDown: map[string]bool{}}
 }
 
 func (p *stubPool) Len() int   { return 49 }
@@ -38,7 +41,12 @@ func (p *stubPool) Alive() int { return p.alive }
 func (p *stubPool) DialAuto(string) (net.Conn, bool, error) {
 	return nil, false, errNoExit
 }
-func (p *stubPool) Dial(string) (net.Conn, error) { return nil, errNoExit }
+func (p *stubPool) Dial(host string) (net.Conn, error) {
+	if p.dialFn != nil {
+		return p.dialFn(host)
+	}
+	return nil, errNoExit
+}
 func (p *stubPool) RetryProxy(host string) (net.Conn, error) {
 	p.mu.Lock()
 	p.proxyTry++
@@ -84,6 +92,26 @@ func (p *stubPool) NoteProxyConfirmed(host string) {
 	p.proxied[p.key(host)] = true
 	p.mu.Unlock()
 }
+
+// NoteDirectDown / DirectDownRecently 实现 proxy.DirectDownTracker（键归一化同上）。
+func (p *stubPool) NoteDirectDown(host string) {
+	p.mu.Lock()
+	p.directDown[p.key(host)] = true
+	p.mu.Unlock()
+}
+func (p *stubPool) DirectDownRecently(host string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.directDown[p.key(host)]
+}
+
+// ShouldTryFragDirect 实现 proxy.FragTryer：默认"值得先赌一次分片直连"，
+// 已经在隧道上确认过的域名不再试（与 selector.Pool 的语义一致）。
+func (p *stubPool) ShouldTryFragDirect(host string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.proxied[p.key(host)]
+}
 func (p *stubPool) proxyTries() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -109,6 +137,11 @@ func (w testWriter) Write(p []byte) (int, error) {
 type alwaysProxyRouter struct{}
 
 func (alwaysProxyRouter) Match(string, uint16) rules.Action { return rules.Proxy }
+
+// alwaysDirectRouter 让分流判给直连，模拟 geoip CN / 用户 direct 规则命中的域名。
+type alwaysDirectRouter struct{}
+
+func (alwaysDirectRouter) Match(string, uint16) rules.Action { return rules.Direct }
 
 // ---------------- 模拟 GFW 的服务端 ----------------
 
@@ -390,14 +423,14 @@ func liveAddr(t *testing.T) string {
 // 而当时 4 条测试全绿，因为它们都绕过了 s.dial。
 func TestDialMarksFallbackAsTentative(t *testing.T) {
 	s := newServer(t, newStubPool(0))
-	c, tentative, err := s.dial(liveAddr(t))
+	c, mode, err := s.dial(liveAddr(t))
 	if err != nil {
 		t.Fatalf("dial to a live local address failed: %v", err)
 	}
 	defer c.Close()
-	if !tentative {
+	if !mode.direct() {
 		t.Fatal("a direct dial taken because no exit is usable is by definition tentative; " +
-			"returning false makes relayWithReplay unreachable")
+			"returning exitProxy makes relayWithReplay unreachable")
 	}
 }
 
@@ -411,39 +444,64 @@ func TestDeadPoolStillTriggersDirectFallback(t *testing.T) {
 		t.Fatal("the stub is supposed to look full (Len=49) while being entirely dead (Alive=0)")
 	}
 	s := newServer(t, pool)
-	c, tentative, err := s.dial(liveAddr(t))
+	c, mode, err := s.dial(liveAddr(t))
 	if err != nil {
 		t.Fatalf("dial to a live local address failed: %v", err)
 	}
 	defer c.Close()
-	if !tentative {
+	if !mode.direct() {
 		t.Fatalf("pool reports Len()=%d but Alive()=0; the direct fallback must still fire", pool.Len())
 	}
 }
 
-// TestLivePoolDoesNotTriggerDirectFallback 是上一条的对照组：还有可用节点时
-// 不该去直连 —— 否则分片直连会抢在正常代理出口前面。
-func TestLivePoolDoesNotTriggerDirectFallback(t *testing.T) {
+// TestLivePoolStillTriesDirectFirst 钉住新契约（2026-10-04 改）：**池子健康时也要先赌
+// 一次分片直连**。
+//
+// 依据：分流判 proxy 只说明这个站通常需要代理，不代表直连一定不通；而分片直连穿过去
+// 就是 2 跳，绕隧道是 3 跳，差的是整个 Worker 出站那一段（实测 CF 托管页面 3–12s，
+// 直连 1–2s）。用户装这个软件本身就说明普通直连不通，所以这里不问"明文行不行"，
+// 直接带分片试。
+func TestLivePoolStillTriesDirectFirst(t *testing.T) {
+	pool := newStubPool(3) // 池子有可用出口
+	s := newServer(t, pool)
+	c, mode, err := s.dial(liveAddr(t))
+	if err != nil {
+		t.Fatalf("dial to a live local address failed: %v", err)
+	}
+	defer c.Close()
+	if mode != directFrag {
+		t.Fatal("有可用出口时也必须先赌一次分片直连 —— 否则分片那条路永远不会被尝试")
+	}
+}
+
+// TestDirectAttemptFallsBackToPoolWhenTCPFails 是上一条的另一半：直连的 TCP 都建不起来
+// （域名解析不了、黑洞、无路由）时，必须老老实实回池子，不能把错误抛给用户。
+func TestDirectAttemptFallsBackToPoolWhenTCPFails(t *testing.T) {
 	pool := newStubPool(3)
 	s := newServer(t, pool)
-	_, tentative, err := s.dial("live-pool.example:443")
+	_, mode, err := s.dial("no-such-host.invalid:443")
 	if err == nil {
 		t.Fatal("the stub pool has no working exit; Dial should have failed")
 	}
-	if tentative {
-		t.Fatal("with usable exits present the request must go through the pool, not direct")
+	if mode.direct() {
+		t.Fatal("直连的 TCP 都建不起来时不能标记成直连 —— 那条路没什么可重放的")
 	}
 }
 
 // ---------------- TLS-RF：分片直连真的穿得过去 ----------------
 
-// TestFragmentedDirectRescuesABlockedHost 端到端：明文被 RST，分片被放行。
+// TestFragmentedDirectRescuesABlockedHost 端到端：分片首段穿过去了。
 //
-// 这条用例是整套 TLS-RF 存在的理由。回退掉 tryFragmentedDirect 的接线时它变红。
+// 这条用例是整套 TLS-RF 存在的理由。**新契约下它一次就成**：不需要任何先验记忆，
+// 第一次尝试就是分片的（旧实现要先付一次明文被 RST 的探测窗口）。
 func TestFragmentedDirectRescuesABlockedHost(t *testing.T) {
 	dpi := newDPIListener(t, dpiFragOnly)
 	pool := newStubPool(0)
 	s := newServer(t, pool)
+	host := hostOfTest(dpi.addr())
+	if pool.NeedsFragDirect(host) {
+		t.Fatal("precondition: no memory yet — the first attempt must stand on its own")
+	}
 
 	got := driveTunnel(t, s, dpi.addr(), clientHello(), 8*time.Second)
 
@@ -453,29 +511,30 @@ func TestFragmentedDirectRescuesABlockedHost(t *testing.T) {
 	if pool.proxyTries() != 0 {
 		t.Fatalf("fell back to the proxy %d time(s); fragmentation should have been tried first", pool.proxyTries())
 	}
-	if !pool.NeedsFragDirect(hostOfTest(dpi.addr())) {
+	if !pool.NeedsFragDirect(host) {
 		t.Error("fragmentation worked but was not remembered; the next connection will pay the failed plain attempt again")
 	}
 }
 
-// TestPlainDirectIsNotFragmentedByDefault 守住"绝大多数站点不受影响"。
+// TestPlainOnlyDpiFallsBackToProxy 记下新契约的**代价**，免得将来有人以为它是漏的。
 //
-// 没有证据说需要分片时绝不分片：无脑分片会让每个直连 HTTPS 连接白付约 400ms。
-func TestPlainDirectIsNotFragmentedByDefault(t *testing.T) {
+// dpiPlainOnly 模拟"只放行明文"的中间盒：分片被拒。旧实现先试明文、于是这种站点能直连；
+// 新实现一律带分片起步，于是它落回代理。这是用户明确选的方向 —— "要是用户能普通直连
+// 不会起这个软件"，代价（这类站点多绕一跳）比"每个新域名都先白等一个明文探测窗口"小。
+//
+// 真正兜住它的是记忆：落代理之后 directBlocked 记 30 分钟，那段时间不再付探测成本。
+func TestPlainOnlyDpiFallsBackToProxy(t *testing.T) {
 	dpi := newDPIListener(t, dpiPlainOnly)
 	pool := newStubPool(0)
 	s := newServer(t, pool)
 
-	got := driveTunnel(t, s, dpi.addr(), clientHello(), 8*time.Second)
+	driveTunnel(t, s, dpi.addr(), clientHello(), 8*time.Second)
 
-	if !strings.Contains(string(got), "SERVERHELLO") {
-		t.Fatalf("got %q; a site that was never blocked must keep working without fragmentation", got)
+	if pool.proxyTries() == 0 {
+		t.Fatal("分片被拒时必须落回代理（失败走隧道），而不是继续挂在直连上")
 	}
 	if pool.NeedsFragDirect(hostOfTest(dpi.addr())) {
-		t.Error("fragmentation was remembered for a host that never needed it")
-	}
-	if pool.proxyTries() != 0 {
-		t.Errorf("fell back to the proxy %d time(s) for a perfectly reachable host", pool.proxyTries())
+		t.Error("分片失败了却记住了'分片可行'，后续每条连接都会白付分片延迟")
 	}
 }
 
@@ -549,9 +608,23 @@ func TestFragMemoryMakesTheNextConnectionSkipThePlainAttempt(t *testing.T) {
 
 // TestSlowTargetIsNotRerouted 钉住"不误伤"。
 //
-// 超时**不是**被阻断的证据，只判"目标只是慢"。据此改道会把一批慢但活的站点
-// 全部推去分片、再推去代理 —— 而分片要白付 400ms。
-func TestSlowTargetIsNotRerouted(t *testing.T) {
+// ⚠️ 这是 2026-10-04 的一次**有意反转**，旧契约与此相反（那时断言 proxyTries()==0）。
+//
+// 旧契约：probeUp 超时只判"目标只是慢"，不据此改道 —— 理由是"超时不是被阻断的证据"。
+// 新契约：超时按阻断处理，落隧道。
+//
+// 为什么反转：这条路径现在对**每个新域名**都要走一次（分片直连优先），而实测的阻断
+// 形态里"TCP 连上、ClientHello 被静默丢弃"比 RST 更常见（BBC / Wikipedia 的明文直连
+// 都是 20s 无响应，不是 RST）。把它当"慢"的后果是：请求被留在一条永远不会回应的直连
+// 上，用户干等自己的超时 —— 实测 25s 以上，整页挂死。
+//
+// 代价如实记下：首字节真的超过 relayProbeWait 的目标会被推去代理，并记 30 分钟。
+// 取舍依据：被墙网络里"静默丢弃"远多于"慢站点"，而多绕一跳远好过整页挂死。
+//
+// 顺带修掉旧用例的一个空断言：它手工构造 Config 而**没设 IsHTTPS**，于是
+// 127.0.0.1:<随机端口> 根本不进重放路径（isHTTPSPort 只认 443），它断言的
+// "没有改道"是必然成立的 —— 测了个寂寞。这里改用带 IsHTTPS 的 newServer。
+func TestSilentDropFallsBackToProxy(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -563,30 +636,22 @@ func TestSlowTargetIsNotRerouted(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go func(c net.Conn) { // 收下首段，然后一直不说话
+			go func(c net.Conn) { // 收下首段，然后一直不说话（静默丢弃的形态）
 				defer c.Close()
 				buf := make([]byte, 4096)
 				_, _ = c.Read(buf)
-				// 比 relayProbeWait(3s) 长、比测试等待窗口短：于是"超时"这个结论一定成立,
-				// 而连接不会一直被攥住让转发无法收尾。
 				time.Sleep(6 * time.Second)
 			}(c)
 		}
 	}()
 
 	pool := newStubPool(0)
-	s := New(Config{
-		Router:         alwaysProxyRouter{},
-		Pool:           pool,
-		DirectFallback: true,
-		DialTimeout:    5 * time.Second,
-		Logger:         log.New(testWriter{t}, "", 0),
-	})
+	s := newServer(t, pool)
 
-	driveTunnel(t, s, ln.Addr().String(), clientHello(), 10*time.Second)
+	driveTunnel(t, s, ln.Addr().String(), clientHello(), 12*time.Second)
 
-	if pool.proxyTries() != 0 {
-		t.Error("a slow-but-alive target was treated as blocked and rerouted")
+	if pool.proxyTries() == 0 {
+		t.Error("对端一个字都不回时必须落隧道：留在直连上等于让用户干等自己的超时")
 	}
 }
 
