@@ -38,9 +38,6 @@ func newStubPool(alive int) *stubPool {
 
 func (p *stubPool) Len() int   { return 49 }
 func (p *stubPool) Alive() int { return p.alive }
-func (p *stubPool) DialAuto(string) (net.Conn, bool, error) {
-	return nil, false, errNoExit
-}
 func (p *stubPool) Dial(host string) (net.Conn, error) {
 	if p.dialFn != nil {
 		return p.dialFn(host)

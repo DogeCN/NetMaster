@@ -108,6 +108,55 @@ func TestRulesDirectDialFailureStillErrors(t *testing.T) {
 	}
 }
 
+// TestProbeOwnerShipBlocksHerd 钉住惊群挡板：探测进行中时，同一域名的其他请求
+// 的 dial() 必须直接落代理（exitProxy），而不是各自再赌一次分片直连；探测权
+// 释放后恢复原状。
+func TestProbeOwnerShipBlocksHerd(t *testing.T) {
+	pool := newStubPool(3)
+	s := newDirectServer(t, pool)
+	// 需要"分流判 proxy"的路径（分片赌注只在那边发生），换掉路由。
+	s.cfg.Router = alwaysProxyRouter{}
+	addr := liveAddr(t)
+	// 挡板生效时请求落代理，池子必须真给得出连接。
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln2.Close() })
+	go func() {
+		for {
+			c, err := ln2.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	pool.dialFn = func(string) (net.Conn, error) { return net.Dial("tcp", ln2.Addr().String()) }
+
+	if !s.tryBeginProbe(addr) {
+		t.Fatal("precondition: first claim must succeed")
+	}
+	c, mode, err := s.dial(addr)
+	if err != nil {
+		t.Fatalf("dial while another request is probing: %v", err)
+	}
+	c.Close()
+	if mode != exitProxy {
+		t.Fatalf("mode=%d; while a probe is in flight the herd must skip the bet and use the proxy", mode)
+	}
+
+	s.endProbe(addr)
+	c, mode, err = s.dial(addr)
+	if err != nil {
+		t.Fatalf("dial after probe release: %v", err)
+	}
+	c.Close()
+	if mode != directFrag {
+		t.Fatalf("mode=%d; with the probe released the frag bet must fire again", mode)
+	}
+}
+
 // 编译期守卫：stubPool 必须继续实现完整的能力面（router 假件别删）。
 var (
 	_ Router            = alwaysDirectRouter{}

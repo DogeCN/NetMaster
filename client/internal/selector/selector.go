@@ -4,6 +4,7 @@
 package selector
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"net"
@@ -16,12 +17,6 @@ import (
 	"netmaster/internal/entry"
 	"netmaster/internal/outbound"
 )
-
-// GeoResolver 判断一个域名解析后是否位于中国大陆。
-// 由 geoip.Provider 实现；known=false 表示无法判断（无表或解析失败）。
-type GeoResolver interface {
-	IsCNHost(host string) (isCN bool, known bool)
-}
 
 type Config struct {
 	Nodes    []entry.Node
@@ -51,9 +46,6 @@ type Pool struct {
 	password string
 	useECH   bool
 	insecure bool
-
-	dialTimeout time.Duration // 直连拨号超时；0 = 默认 15s
-	geo         GeoResolver
 
 	// muxTarget / idleTrimDelay 是并发余量的两个旋钮，取值见 Config 的同名字段。
 	// 存进 Pool 而不是继续读包级变量：包级变量没法按实例配置，改一个池会连带
@@ -91,7 +83,6 @@ type Pool struct {
 	warming       atomic.Int32              // 正在进行的预热拨号数（并行，非互斥）
 	rr            atomic.Uint32             // 流分摊用的轮转游标
 	directBlocked map[string]time.Time
-	direct        map[string]bool // host -> 已学习的直连/代理粘性
 	// directDown 记住"这个域名的直连在 TCP 层就失败"（连接被拒/超时）。
 	//
 	// 与 directBlocked 的分工：directBlocked 是 TLS 层被拦的冷却（代理送出过字节
@@ -118,7 +109,6 @@ func New(cfg Config) *Pool {
 		muxes:         make(map[int]*outbound.MuxConn),
 		directBlocked: make(map[string]time.Time),
 		directDown:    make(map[string]time.Time),
-		direct:        make(map[string]bool),
 		fragDirect:    make(map[string]time.Time),
 		fails:         make(map[int]int),
 		dead:          make(map[int]bool),
@@ -695,17 +685,59 @@ func (p *Pool) noteSuccess(idx int) {
 	p.mu.Unlock()
 }
 
-func (p *Pool) SetGeo(g GeoResolver) { p.geo = g }
-func (p *Pool) SetDialTimeout(d time.Duration) {
-	if d > 0 {
-		p.dialTimeout = d
+// recheckParallel 是周期探活的并发上限：只探前几个节点，一波就该跑完。
+const recheckParallel = 5
+
+// RecheckTop 对当前节点序的前 n 个做一次 TCP+TLS 握手探活（不带 WS 升级 ——
+// 升级会真的建 DO，空闲期凭空烧额度）。
+//
+// 为什么需要它：运行期原本没有周期探活，节点健康完全靠"真实流量撞上失败"来
+// 发现。空闲一小时后第一批请求可能撞上整批死节点，体验是"明明刚才还好好的"。
+// 成功清零失败计数、失败记一次（连续 nodeFailLimit 次判死，与流量侧同一套账，
+// 所以探活自己不会把节点冤死）。
+//
+// 返回探活的节点里握上手几个（日志用）。调用方给 ctx 设预算：探活是后台的，
+// 不许跟真实流量抢时间。
+func (p *Pool) RecheckTop(ctx context.Context, n int) int {
+	p.mu.Lock()
+	if n > len(p.nodes) {
+		n = len(p.nodes)
 	}
-}
-func (p *Pool) directTimeout() time.Duration {
-	if p.dialTimeout <= 0 {
-		return 15 * time.Second
+	if n <= 0 {
+		p.mu.Unlock()
+		return 0
 	}
-	return p.dialTimeout
+	top := make([]entry.Node, n)
+	copy(top, p.nodes[:n])
+	sni, insecure, useECH := p.sni, p.insecure, p.useECH
+	p.mu.Unlock()
+
+	ech := []byte(nil)
+	if useECH {
+		ech = echConfigFor(ctx, sni)
+	}
+
+	var alive atomic.Int32
+	sem := make(chan struct{}, recheckParallel)
+	var wg sync.WaitGroup
+	for i := range top {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			_, conn := probeOne(ctx, top[i], sni, insecure, ech)
+			if conn != nil {
+				_ = conn.Close() //nolint:errcheck
+				p.noteSuccess(i)
+				alive.Add(1)
+				return
+			}
+			p.noteFailure(i)
+		}(i)
+	}
+	wg.Wait()
+	return int(alive.Load())
 }
 
 func (p *Pool) Len() int {
@@ -796,41 +828,6 @@ func (p *Pool) Dial(target string) (net.Conn, error) {
 	return nil, errNoUsableExit
 }
 
-// shouldDirect 给出该域名的直连先验：已学习的粘性 > geoip 判断（PRD：出口 IP
-// 稳定——同域一会儿直连一会儿代理会让按 IP 判定的登录态失效）。
-func (p *Pool) shouldDirect(host string) bool {
-	p.mu.Lock()
-	// 分片记忆优先于"别直连"的冷却。这个域名我们已经验证过"分片直连走得通"，
-	// 而冷却期的由来只是"明文 SNI 挨过一次拦"——按冷却把它丢给代理，等于把
-	// 已经付过代价学到的能力作废，逼着每次连接重走一遍失败的明文探测。
-	if p.fragDirectFreshLocked(host) {
-		p.mu.Unlock()
-		return true
-	}
-	sticky, ok := p.direct[host]
-	blocked := false
-	if at, has := p.directBlocked[host]; has {
-		if time.Since(at) > directBlockedTTL {
-			delete(p.directBlocked, host)
-		} else {
-			blocked = true
-		}
-	}
-	p.mu.Unlock()
-	if blocked {
-		return false
-	}
-	if ok {
-		return sticky
-	}
-	if p.geo != nil {
-		if isCN, known := p.geo.IsCNHost(host); known && isCN {
-			return true
-		}
-	}
-	return false
-}
-
 // ShouldTryFragDirect 回答"这个域名现在值不值得先试一次分片直连"（实现 proxy.FragTryer）。
 //
 // 默认是"值得"，这是刻意的：分流判 proxy 只说明这个站通常需要代理，不代表直连一定
@@ -885,7 +882,7 @@ func (p *Pool) fragDirectFreshLocked(host string) bool {
 // 既然分片这条路已验证可行，再按冷却强制走代理就是白白多付一跳。
 //
 // ⚠️ 入参统一过 hostOf：proxy 侧拿到的是 CONNECT 目标，形如 "example.com:443"；
-// 而 shouldDirect / DialAuto 这一侧读写的是不带端口的键。不归一的话，
+// 而 shouldDirect 这一侧读写的是不带端口的键。不归一的话，
 // 写进去的条目永远读不回来 —— 记忆与冷却都会静默失效（评审 R-KEY 抓到的就是这条）。
 func (p *Pool) NoteFragDirect(host string) {
 	host = hostOf(host)
@@ -916,55 +913,8 @@ func (p *Pool) ForgetFragDirect(host string) {
 	p.mu.Unlock()
 }
 
-func (p *Pool) bindDirect(host string, direct bool) {
-	p.mu.Lock()
-	p.direct[host] = direct
-	p.mu.Unlock()
-}
-
-func (p *Pool) unbind(host string) {
-	p.mu.Lock()
-	delete(p.direct, host)
-	p.mu.Unlock()
-}
-
-// DialAuto 在直连与代理之间选出口建连；首选失败时自动尝试另一条路。
-// 返回的 direct 表示"这是一次尝试性的直连"：TCP 能连不等于没被墙 —— GFW 常常
-// 让 TCP 握手通过，直到看见 TLS ClientHello 里的明文 SNI 才发 RST。代理层若观察
-// 到这种情况，应调 RetryProxy 改走代理并重放已缓存的数据。
-func (p *Pool) DialAuto(target string) (net.Conn, bool, error) {
-	host := hostOf(target)
-	wantDirect := p.shouldDirect(host)
-
-	if wantDirect {
-		if c, err := net.DialTimeout("tcp", target, p.directTimeout()); err == nil {
-			p.bindDirect(host, true)
-			return c, true, nil
-		}
-		p.unbind(host)
-		if c, err := p.Dial(target); err == nil {
-			return c, false, nil
-		}
-		return nil, false, fmt.Errorf("selector: no usable exit for %s", target)
-	}
-
-	if c, err := p.Dial(target); err == nil {
-		return c, false, nil
-	}
-	// 代理全挂时才试直连（可能这个站没被墙，只是节点都不通）。
-	if c, err := net.DialTimeout("tcp", target, p.directTimeout()); err == nil {
-		p.bindDirect(host, true)
-		return c, true, nil
-	}
-	return nil, false, fmt.Errorf("selector: no usable exit for %s", target)
-}
-
 // RetryProxy 在直连被判定阻断后改用代理，并记下"这个域名别再走直连"。
 func (p *Pool) RetryProxy(target string) (net.Conn, error) {
-	host := hostOf(target)
-	p.mu.Lock()
-	delete(p.direct, host)
-	p.mu.Unlock()
 	return p.Dial(target)
 }
 

@@ -171,6 +171,10 @@ func (s *Server) noteProxyConfirmed(host string) {
 //
 // 浏览器全程无感，只看到握手慢了一点。
 func (s *Server) relayWithReplay(client, up net.Conn, host string, fragStart bool) {
+	// 本请求如果在 dial() 里认领了探测权，在这里统一释放 —— 无论从哪个出口
+	// 离开（直连成立 / 阶梯②成立 / 落代理 / 客户端断开）。未认领时是 no-op。
+	defer s.endProbe(host)
+
 	endTunnel := s.cfg.Trace.Begin("connect."+routeTag(host), 0)
 	defer endTunnel()
 
@@ -375,12 +379,17 @@ func (s *Server) relayWithProxyReplay(client, up net.Conn, host string) {
 	if s.cfg.Pool != nil {
 		s.cfg.Pool.NoteProxyFailure(host)
 	}
-	up2, _, derr := s.dial(host)
+	up2, mode, derr := s.dial(host)
 	if derr != nil {
 		s.cfg.Logger.Printf("[route] %s proxy tunnel dead (%s), retry failed: %v", host, reason, derr)
 		return
 	}
 	defer up2.Close()
+	// 重拨可能认领了探测权（分片赌注），但这条路径把连接直接拿去用、不进
+	// relayWithReplay —— 不释放的话这个域名的赌注会被永久关掉。
+	if mode.direct() {
+		s.endProbe(host)
+	}
 	if _, err := up2.Write(first); err != nil {
 		return
 	}

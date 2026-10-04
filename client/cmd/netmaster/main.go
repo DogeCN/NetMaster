@@ -579,8 +579,6 @@ func cmdServe(args []string) {
 		Insecure:  cfg.InsecureEnabled(),
 		MuxTarget: *tunnels,
 	})
-	pool.SetDialTimeout(15 * time.Second)
-	pool.SetGeo(geo)
 	logger.Printf("tunnels: %d simultaneous connections to the edge", pool.MuxTarget())
 
 	// 3a. 社区优选：后台拉取 → 探测 → 并进池子。
@@ -685,6 +683,28 @@ func cmdServe(args []string) {
 		endProbe()
 		tr.Mark("probe.done", fmt.Sprintf("%d/%d nodes", len(pr.Nodes), len(dnsNodes)))
 		reportProbe(logger, tr, host, cfg.InsecureEnabled(), len(dnsNodes), pr)
+	}()
+
+	// 周期探活：每 10 分钟对池子头部 5 个节点做一次 TLS 握手（不带 WS 升级，
+	// 升级会真的建 DO 烧额度）。运行期原本没有复探，节点死了要等真实流量撞上
+	// 才知道 —— 空闲后的第一批请求就是那批撞墙的。探活是握手级的，探一次的
+	// 成本远低于一次对冲拨号 + 重放；失败按既有账本记（5 次判死），不会冤死节点。
+	// 探测权竞争由 RecheckTop 内部并发上限约束，不需要这里再限。
+	probeStop := make(chan struct{})
+	defer close(probeStop)
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-probeStop:
+				return
+			case <-t.C:
+				if n := pool.RecheckTop(context.Background(), 5); n < 5 {
+					logger.Printf("[probe] periodic recheck: %d/5 alive", n)
+				}
+			}
+		}
 	}()
 
 	// 首次连通验证：一次真实的传输层建连（TLS+WS+auth），在后台跑，

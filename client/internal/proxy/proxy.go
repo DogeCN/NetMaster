@@ -24,11 +24,10 @@ type Router interface {
 	Match(host string, port uint16) rules.Action
 }
 
-// Exiter 是出口选择器需要提供的最小能力面：分流决策（DialAuto 的 direct 返回值）、
-// 代理建连与"直连被阻断后改走代理"。selector.Pool 实现；测试可注入替身。
+// Exiter 是出口选择器需要提供的最小能力面：代理建连与"直连被阻断后改走代理"。
+// selector.Pool 实现；测试可注入替身。
 type Exiter interface {
 	Len() int
-	DialAuto(host string) (net.Conn, bool, error)
 	Dial(host string) (net.Conn, error)
 	RetryProxy(host string) (net.Conn, error)
 	NoteProxyFailure(host string)
@@ -92,6 +91,15 @@ type Server struct {
 	wg      sync.WaitGroup
 	closing chan struct{}
 	once    sync.Once
+
+	// probing 记录"正在对该域名做直连探测"（分片赌注 → 首段探测 → 可能的阶梯②）。
+	//
+	// 为什么需要：一次探测要 5s TCP 赌注 + 3s 首段窗口，而首屏是几十条并发连接
+	// 打同一个域名 —— 没有这个标记，它们会**各自**完整付一遍探测成本（各自拨号、
+	// 各自等窗口、各自落代理重放）。有了它：第一个请求负责探测，其余请求直接走
+	// 代理，探测结论出来后由记忆层（fragDirect/directBlocked）接管后续请求。
+	// 值不值得赌的分家门在 shouldTryFragDirect，这里只挡"同一批"重复。
+	probing sync.Map // host -> struct{}
 }
 
 // New 创建代理服务。
@@ -246,11 +254,14 @@ func (s *Server) dial(host string) (conn net.Conn, mode directMode, err error) {
 	// 记忆决定值不值得再试一次：成功记 6h（fragDirect），失败则在隧道真的送出
 	// 字节之后记 30min（directBlocked，见 NoteProxyConfirmed）—— 那 30 分钟里
 	// 这个域名直接走隧道，不再付探测成本。
-	if s.cfg.DirectFallback && s.httpsish(host) && s.shouldTryFragDirect(host) {
+	if s.cfg.DirectFallback && s.httpsish(host) && s.shouldTryFragDirect(host) && s.tryBeginProbe(host) {
 		if c, derr := net.DialTimeout("tcp", host, directProbeDialTimeout); derr == nil {
+			// 探测权由 relayWithReplay 释放（defer endProbe）：赌注的完整成本
+			// 包含它里面的 3s 首段窗口与阶梯②，不只是这里的拨号。
 			return c, directFrag, nil
 		}
 		// TCP 都建不起来（黑洞/无路由）：没什么可赌的，直接落隧道。
+		s.endProbe(host)
 	}
 	if !s.hasUsableExit() {
 		if s.cfg.DirectFallback {
@@ -276,6 +287,17 @@ func (s *Server) shouldTryFragDirect(host string) bool {
 	ft, ok := s.cfg.Pool.(FragTryer)
 	return ok && ft.ShouldTryFragDirect(host)
 }
+
+// tryBeginProbe 尝试认领该域名的探测权。返回 true = 本请求负责探测；
+// false = 已有别的请求在探测，调用方应直接落隧道（惊群挡板，见 Server.probing）。
+func (s *Server) tryBeginProbe(host string) bool {
+	_, loaded := s.probing.LoadOrStore(host, struct{}{})
+	return !loaded
+}
+
+// endProbe 释放探测权。未认领过的域名上是 no-op（relayWithReplay 对所有直连
+// 统一 defer 调它，不区分这个探测权是不是本请求认领的）。
+func (s *Server) endProbe(host string) { s.probing.Delete(host) }
 
 // needsFragDirect 查"这个域名是否已验证过分片直连可行"（含分片起步决策）。
 // 替身没实现 FragDirecter 时返回 false：明文起步，被拦了再补分片。
