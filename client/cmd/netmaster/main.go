@@ -700,7 +700,9 @@ func cmdServe(args []string) {
 			case <-probeStop:
 				return
 			case <-t.C:
-				if n := pool.RecheckTop(context.Background(), 5); n < 5 {
+				n := pool.RecheckTop(context.Background(), 5)
+				pool.SweepExpired() // 记忆表的过期条目惰性删除兜底，见 SweepExpired
+				if n < 5 {
 					logger.Printf("[probe] periodic recheck: %d/5 alive", n)
 				}
 			}

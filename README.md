@@ -143,13 +143,14 @@ usage: netmaster <serve|nodes|restore> [flags]
 
 | 子命令 | 作用 | 主要 flag |
 |---|---|---|
-| `serve` | 起本地代理、接管系统代理、退出还原 | `--server` `--password` `--manual` `--rules` `--no-ech` `--tunnels` |
+| `serve` | 起本地代理、接管系统代理、退出还原 | `--server` `--password` `--manual` `--rules` `--no-ech` `--tunnels` `--frag-oob` |
 | `nodes` | 持续发请求，实时观察自适应选路 | `--server` `--password` `--target` `--ipcheck` |
 | `restore` | 手动还原系统代理（serve 被强杀后用） | 无 |
 
 `serve` 的 flag：`--server <domain>`、`--password <pw>`、`--manual`（不接管系统代理，
 只打印监听地址）、`--rules <file>`（自定义分流规则文件）、`--no-ech`（关掉客户端→
-Worker 这段链路的 SNI 隐藏）、`--tunnels <1-8>`（同时保持几条隧道）。
+Worker 这段链路的 SNI 隐藏）、`--tunnels <1-8>`（同时保持几条隧道）、`--frag-oob`
+（分片首段改用 TCP 紧急数据发出，见下表 `frag-oob`）。
 
 `nodes` 的 flag：`--target <url>`（默认 `https://www.google.com/`）、
 `--ipcheck <url>`（发请求到该 URL 并统计观察到的出口 IP 分布）。
@@ -181,6 +182,7 @@ Worker 这段链路的 SNI 隐藏）、`--tunnels <1-8>`（同时保持几条隧
 | `tunnels` | int | 同时保持几条到边缘的隧道，1–8，省略时 4 |
 | `no-ech` | bool | true 时关掉客户端→Worker 这段链路的 SNI 隐藏（默认开启）。仅在遇到偶发 bad handshake、需要对照实验时才需要改；本域明文 SNI 已被 RST（2026-10-04 实测），关掉很可能直接连不上 |
 | `insecure` | bool | true 时不校验边缘证书（默认校验）。只给自建网关用自签证书的场景 |
+| `frag-oob` | bool | true 时分片直连的**第一个分片**用 TCP 紧急数据（MSG_OOB）发出（默认关闭）。只对"普通分片也被拦"的站点有用：紧急指针会让阻断设备的重组失灵。代价：紧急字节是否进入对端字节流取决于 SO_OOBINLINE，个别接收方会拿到坏记录 —— 确认目标站点普通分片失效后再开 |
 
 `tunnels` 为什么值得调：资源密集的页面（视频、图片流）一次会开几十条连接，多几条
 隧道才不至于在服务端回收连接的瞬间整页超时（每条隧道一生约 30 次出站建连的预算）。

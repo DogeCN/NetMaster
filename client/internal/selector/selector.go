@@ -949,6 +949,32 @@ func (p *Pool) DirectDownRecently(host string) bool {
 	return true
 }
 
+// SweepExpired 清掉三张记忆表里已过期的条目。
+//
+// 过期删除原本是**惰性**的（读到才删）：三张表的读取口都顺手删过期键，但"没再
+// 被访问"的过期条目永远躺在 map 里 —— 桌面进程一开几天，浏览过的每个域名都占
+// 一条，那是无界增长。挂进周期探活的节拍里每 10 分钟扫一次，增长就有界了。
+func (p *Pool) SweepExpired() {
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for h, at := range p.directBlocked {
+		if now.Sub(at) > directBlockedTTL {
+			delete(p.directBlocked, h)
+		}
+	}
+	for h, at := range p.directDown {
+		if now.Sub(at) > directDownTTL {
+			delete(p.directDown, h)
+		}
+	}
+	for h, at := range p.fragDirect {
+		if now.Sub(at) > fragDirectTTL {
+			delete(p.fragDirect, h)
+		}
+	}
+}
+
 // NoteProxyConfirmed 在代理隧道真的送出第一个字节之后调用（实现 proxy.ProxyConfirmer）。
 //
 // 为什么不在 RetryProxy 里就记 blocked：RetryProxy 只表示"我们开始试代理了"，
