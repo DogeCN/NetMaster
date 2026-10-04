@@ -187,14 +187,23 @@ function cmdMerge() {
     }
   }
 
-  // 出口阶梯分布：哪一级被用得最多。
-  const rungs = S.flatMap((s) => Object.entries(s.counts || {}).filter(([k]) => k === 'exit.rung'));
-  if (rungs.length) {
-    const agg = new Map();
-    for (const [, v] of rungs) agg.set(Number(v), (agg.get(Number(v)) || 0) + 1);
+  // 出口阶梯分布：哪一级被用得最多。键是 exit.rung0..3 —— **每一级一个键**。
+  //
+  // 为什么不能写成单个 exit.rung：p.count 是累加的，而 counts 在 flush 时**不重置**，
+  // 于是同一个键变成"各级编号之和"：3 次直连(0) + 1 次竞速(3) 记出来是 3，看起来
+  // 像"走了 3 次竞速"。这个坑真实出现过 —— 一次采样里冒出了"rung 4"，而代码里
+  // 根本没有第 4 级。
+  const rungCounts = new Map();
+  for (const s of S) {
+    for (const [k, v] of Object.entries(s.counts || {})) {
+      const m = /^exit\.rung([0-3])$/.exec(k);
+      if (m) rungCounts.set(Number(m[1]), (rungCounts.get(Number(m[1])) || 0) + v);
+    }
+  }
+  if (rungCounts.size) {
     console.log('\n=== 出口阶梯命中分布（0=直连 1=会话缓存 2=Router 3=竞速）===');
-    for (const [k, v] of [...agg].sort((a, b) => a[0] - b[0])) console.log(`  rung ${k}: ${v} 次`);
-    const dominated = [...agg].sort((a, b) => b[1] - a[1])[0];
+    for (const [k, v] of [...rungCounts].sort((a, b) => a[0] - b[0])) console.log(`  rung ${k}: ${v} 次`);
+    const dominated = [...rungCounts].sort((a, b) => b[1] - a[1])[0];
     console.log(`  最常走的是 rung ${dominated[0]}（${dominated[1]} 次）—— ` +
       '若期望走 0（直连）却总落在 3（竞速），说明"直连被判死"的判断偏保守。');
   }

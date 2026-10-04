@@ -311,7 +311,7 @@ class SessionDO {
       direct = await directConnect(atyp, host, port);
       endDirect();
       if (!direct.error) {
-        p.count("exit.rung", 0);
+        p.count("exit.rung0");
         return { socket: direct.socket };
       }
       console.error(`[exit] direct ${host}:${port} failed: ${direct.error}`);
@@ -328,7 +328,7 @@ class SessionDO {
       const r = await dialRelay(mem, host, port);
       endCache();
       if (!r.error) {
-        p.count("exit.rung", 1);
+        p.count("exit.rung1");
         return { socket: r.socket, hash, relay: mem };
       }
       this.log(`cached relay ${mem.host}:${mem.port} failed: ${r.error}`);
@@ -344,7 +344,7 @@ class SessionDO {
       const r = await dialRelay(hit, host, port);
       endRouter();
       if (!r.error) {
-        p.count("exit.rung", 2);
+        p.count("exit.rung2");
         this.rememberEgress(hash, hit);
         // http-connect 的 CONNECT 2xx 是端到端验证，可以learn；SNI 型的 TCP
         // 成功不构成验证（盲转发也能连），其健康由 GH 探测写进 KV，不进 Router。
@@ -371,7 +371,7 @@ class SessionDO {
       return { error: `${directErr}; ${race.error}` };
     }
     const relay = { ...parseRelay(race.relay), type: race.type || RELAY_TYPE_SNI };
-    p.count("exit.rung", 3);
+    p.count("exit.rung3");
     this.rememberEgress(hash, relay);
     if (relay.type === RELAY_TYPE_HTTP_CONNECT) {
       // CONNECT 2xx 是端到端验证，立即 learn。SNI 型的 TCP 成功不构成验证
