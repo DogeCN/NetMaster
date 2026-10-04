@@ -48,7 +48,18 @@ const CONNECT_BUDGET = 20;
 // PROF_FLUSHES_PER_SESSION 是**全会话**的 KV 写次数上限（不是每个目标各算一份）。
 // 见 profile.js 的 flush(budget)：一条连接会承载很多目标，按目标各算一份的话，
 // 一次首屏就能把配额烧掉，而那正是最不该花的场景。
-const PROF_FLUSHES_PER_SESSION = 3;
+const PROF_FLUSHES_PER_SESSION = 12;
+
+// PROF_FLUSH_EVERY_STREAMS 是"每开多少条流落一次盘"。
+//
+// 为什么需要它（2026-10-04 实测）：此前只在**关连接 / 撞预算回收**时 flush，于是
+// 中等负载一条都落不下来 —— 每会话 9~12 次请求既够不到 CONNECT_BUDGET(20)，客户端
+// 又在正常关闭之前被强杀，KV 里一条新记录都没有。而"坏窗口里那 20~40s 的尾巴"
+// 恰恰只在这种中等负载下出现，采不到就等于没有观测。
+//
+// 刻意**不用定时器**：pending timer 会阻止 DO 休眠（m0 E4/E9），而观测手段不该改变
+// 被观测对象 —— DO 驻留时长正是要省的东西。按流计数既不烧配额，也不依赖会话结束。
+const PROF_FLUSH_EVERY_STREAMS = 8;
 
 class SessionDO {
   constructor(state, env) {
@@ -72,6 +83,7 @@ class SessionDO {
     this.profSession = makeProfiler(this.env, { target: "session" });
     this.profTargets = new Map(); // target -> 采集器（见 profFor）
     this.profFlush = null; // 最近一次落盘的 promise，供 webSocketClose 等待
+    this.profStreams = 0; // 本会话开过的流数（按 PROF_FLUSH_EVERY_STREAMS 触发落盘）
   }
 
   // profFor 取（并缓存）某个目标的采集器。
@@ -89,8 +101,9 @@ class SessionDO {
     return p;
   }
 
-  // flushProfile 把本会话所有采集器落盘。写 KV 要配额，所以只在会话结束时做；
-  // 失败一律吞掉 —— profile 是排障工具，它坏了不该影响转发。
+  // flushProfile 把本会话所有采集器落盘。写 KV 要配额，所以只在会话结束时、以及
+  // 每 PROF_FLUSH_EVERY_STREAMS 条流时做；失败一律吞掉 —— profile 是排障工具，
+  // 它坏了不该影响转发。
   async flushProfile() {
     const all = [this.profSession, ...this.profTargets.values()];
     this.profTargets.clear();
@@ -517,6 +530,11 @@ class SessionDO {
       }, FIRST_BYTE_GRACE_MS);
     }
     this.streams.set(id, rec);
+    // 计数触发落盘（理由见 PROF_FLUSH_EVERY_STREAMS）：不 await —— 观测不该挡转发。
+    this.profStreams += 1;
+    if (this.profStreams % PROF_FLUSH_EVERY_STREAMS === 0) {
+      this.flushProfile();
+    }
     this.send(encodeResponse(id, STATUS_OK));
     this.pumpOutbound(id, rec);
   }
