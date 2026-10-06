@@ -23,10 +23,13 @@ tag = "v1"
 # 免费版必须用 new_sqlite_classes（new_classes 是旧版 SQLite 迁移，免费计划不接受）
 new_sqlite_classes = ["SessionDO"]
 
-# Router DO 的 v2（创建）/v3（删除）迁移已从本文件移除：RouterDO 从未成功部署
-# 到远端（带 v3 的两次 deploy 都在迁移这一步失败："Cannot apply deleted_classes
-# migration to non-existent class"），账号里没有这个类，也就无需删除迁移。
-# 留着它们只会让每次 deploy 都报错。
+# v2（创建 RouterDO）必须保留：远端脚本的迁移历史里已记录 v2，配置里删掉它
+# 会让 wrangler 认为历史断裂、全量重放 v1，报 10074（SessionDO already exists）。
+# RouterDO 的代码与绑定已删；远端也没有这个类（v3 删除迁移实测报
+# non-existent class），所以这里只对齐历史，不需要删除迁移。
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["RouterDO"]
 
 # KV：两个键。proxyip:top = 部署工作流测速排序后的中继候选（deploy.yml 的
 # "Probe relays" 步骤写入，运行期 order.js 消费并就地重排、顺序变化时写回）；
