@@ -43,7 +43,7 @@ SNI 阻断，客户端永远连不上**。实测（2026-10-03）：同一个 CF 
 workers.dev 域名被 RST（`tls: EOF` / `connection was forcibly closed`），换其他域名
 正常；workers.dev 的 HTTPS RR 不发布 ECH 配置，客户端的 ECH 兜底也启用不了。解法：
 控制台给 Worker 加 Custom Domain（Workers & Pages → netmaster → Settings →
-Domains & Routes → Add Custom Domain），config.json 的 `server` 填这个域名。
+Domains & Routes → Add Custom Domain），把它填进配置的 `server`（首次启动交互输入，或 `--server`）。
 客户端检测到 `*.workers.dev` 且验证失败时会打印这条提示。
 
 ## 看服务端日志
@@ -67,16 +67,16 @@ npx wrangler tail --format json    # JSON 格式
 
 注意：`DEBUG` 是变量不是 Secret，改完要重新部署才生效。
 
-中继池刷新（`refresh-relays` 定时任务）**没有服务端日志**——它跑在 GitHub Actions 的
-runner 上，不在 Worker 里。要看它的输出去 Actions 的 run 页面：那里逐条打印每个候选中继
-的成败与原因（`ok … 182ms` / `fail … (CONNECT status 405)`）。
+中继测速**没有服务端日志**——它跑在 GitHub Actions 的 deploy run 里（"Probe relays"
+步骤），不在 Worker 内。要看它的输出去 Actions 的 run 页面：逐条打印每个候选的成败与
+原因（`ok … 5975ms` / `fail … (certificate has expired)`），末行是写进 KV 的排序结果。
 
 ## 症状对照
 
 | 现象 | 含义 | 怎么办 |
 |---|---|---|
-| `no server: pass --server or set it in config.json / NETMASTER_SERVER` | 没给域名 | 填 config.json 或加 `--server` |
-| `no password: pass --password or set it in config.json / NETMASTER_PASSWORD` | 没给口令 | 同上 |
+| `no server: pass --server or set it in config / NETMASTER_SERVER` | 没给域名 | 交互输入一次即持久化，或加 `--server`；只想绕过用 `--local` |
+| `no password: pass --password or set it in config / NETMASTER_PASSWORD` | 没给口令 | 同上 |
 | `no entries: server domain unresolvable and community sources unreachable` | 域名解析不出来 **且** 三个社区源也全挂 | 先查域名绑定和本机 DNS |
 | `entries: N (server DNS; community still pending)` | 只等到了服务端域名的 DNS 候选就先就绪了（这是常态，不是问题） | 社区源在后台并入，几秒后会补一行 `entries: +M from community` |
 | `entries: +M from community (src), pool now K` | 社区优选已并入池子 | 正常；M=0 时说明社区源这次没给可用条目 |
@@ -163,6 +163,15 @@ netmaster restore
 Windows 上的实现细节：旧值存在 `%TEMP%/netmaster_sysproxy.json`，
 `Enable()` 是"先落盘旧值、再逐项写注册表"。中途失败会回滚——不回滚的话注册表可能已被改了
 一部分（比如 `ProxyEnable` 已置 1），系统代理会一直悬着指向本机端口。
+
+**看门狗自己是可观测的**：它的每一步（监视哪个 pid、owner 何时退出、还原成功与否）都写在
+`%AppData%/netmaster/watchdog`（256KiB 截断）。"自动还原没生效"先看这个文件——
+看门狗没留下任何痕迹 = 它根本没被创建成功或随终端被连坐杀掉。
+
+一个实测过的根因：从 Windows Terminal / VSCode 终端里启动 serve，终端把整棵进程树放进
+Job Object（关窗即全杀），`DETACHED_PROCESS` 防不了 Job 连坐——看门狗和 serve 一起蒸发。
+派生时已带 `CREATE_BREAKAWAY_FROM_JOB`（Job 不允许脱离则退回旧行为）；从这类终端跑长驻
+serve，建议用 `start /b` 或计划任务把进程放进独立树。
 
 三个平台各有实现，行为不同：
 

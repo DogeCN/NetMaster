@@ -70,8 +70,8 @@ npx wrangler deploy
 ```
 
 `wrangler.toml` 里的 KV `id` 是占位符 `00000000000000000000000000000000`，直接
-`wrangler deploy` 会因 id 非法而失败——**这是有意的：别拿占位符上线**。不需要 KV 时把
-`[[kv_namespaces]]` 整段删掉即可：缺少 KV 绑定时竞速只用内置兜底列表，功能不残。
+`wrangler deploy` 会因 id 非法而失败——**这是有意的：别拿占位符上线**（deploy 工作流会
+按 title=netmaster 解析真 id 就地改写）。
 
 `keep_vars = false` 是显式写出的：部署时删除 Worker 上已存在、但本文件里没有的变量。一份
 不描述现实的配置文件比没有配置文件更糟。
@@ -79,7 +79,7 @@ npx wrangler deploy
 ## 部署产物
 
 `_worker.js` 由 `server/build.mjs` 把 `src/` 下 10 个模块拼接成一个文件
-（`crypto / protocol / exits / socket / proxyip / race / router / profile / session / index`）。
+（`crypto / protocol / exits / socket / proxyip / order / profile / session / index`）。
 它是**生成物**，改 `src/` 之后重新 `node build.mjs`。
 
 模块顺序**从 import 图 DFS 推导**，不是手写的数组：顺序写死过一次，代价是"新增的
@@ -94,15 +94,12 @@ npx wrangler deploy
 | 变量 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `PASSWORD` | Secret | — | 首帧 HMAC 密钥。必需 |
-| `DEBUG` | var | 空 | `'1'` 打开 `[session]` / `[router]` 日志，配合 `wrangler tail` |
-| `RACE_SLOTS` | var | 6 | 竞速槽位数 |
-| `RACE_SLOT_TIMEOUT_MS` | var | 1500 | 单槽超时 |
-| `RACE_GLOBAL_TIMEOUT_MS` | var | 3000 | 竞速全局超时 |
-| `RACE_STAGGER_MS` | var | 120 | 槽位交错启动间隔 |
-| `RACE_KV_TOP` | var | 4 | 从 KV 取前 N 个中继 |
+| `DEBUG` | var | 空 | `'1'` 打开 `[session]` 日志，配合 `wrangler tail` |
+| `ORDER_SLOTS` | var | 6 | 顺序拨号的候选上限 |
+| `ORDER_SLOT_TIMEOUT_MS` | var | 5000 | 单条候选尝试上限 |
 | `PROFILE` | var | 关 | `'1'` 时会话结束把**分段耗时**写进 KV（见下"分段耗时采集"）。花 KV 写配额，每会话最多 3 次 |
 
-竞速参数非法或 ≤0 一律回落到默认（`posEnv`）：写错一个字符不该变成 0ms。
+顺序参数非法或 ≤0 一律回落到默认（`posEnv`）：写错一个字符不该变成 0ms。
 
 `DEBUG` 与 `PROFILE` 都是变量不是 Secret——改完要重新部署。`scripts/deploy.sh` 支持
 `PROFILE=1` 前缀，把它加在**部署时生成的临时配置**上；不要在控制台手改：`keep_vars = false`
@@ -114,73 +111,52 @@ npx wrangler deploy
 | 绑定 | 类型 | migration tag | 说明 |
 |---|---|---|---|
 | `SESSION` | Durable Object（内存） | `v1` | 每条 WS 一个实例，不落盘 |
-| `ROUTER` | Durable Object（SQLite） | `v2` | 全局单实例，存目标 → 出口映射 |
-| `KV` | KV namespace | — | 订阅更新任务写 `proxyip:top`（见下节） |
+| `KV` | KV namespace | — | `proxyip:top`（中继候选，见下节）+ `profile:*`（度量） |
 
 Migration 随 `wrangler deploy` 自动应用，不需要额外步骤。
 
-Router DO 的写入是"先返回、后落盘"：攒 5 秒或 50 条 flush 一次（DO Alarm 驱动），队列空了
-就撤掉待定 Alarm，避免空转唤醒消耗行写配额。flush 失败重试 1 次，仍失败就丢弃该批——缓存
-可以从竞速重建，不值得为它反复写。**进程驱逐时未 flush 的映射接受丢失。**
+迁移历史只能**追加**、不能改写——这是 2026-10-06 用三次红 CI 换来的教训：Router DO 移除时
+先删配置、再删迁移、最后补回，分别撞上 10074（SessionDO already exists，配置缺 v2 触发全量
+重放）与 10064（class is depended on by existing Durable Objects，线上有存量实例）。正确姿势
+是保留 v2（创建）、追加 v3（`deleted_classes = ["RouterDO"]`）。
 
-`forget` 不排队，立即生效：映射被证伪时必须马上删，不能跟着队列一起等 5 秒，否则下一条流
-会踩同一脚。
+## 中继测速（部署时）
 
-## 中继池刷新（GitHub Actions 定时任务，可选）
+`proxyip:top` 是顺序拨号用的"已测速排序的中继候选"。它**只在部署时写入**：
+`deploy.yml` 的 "Probe relays and write ranked order to KV" 步骤，候选硬编在工作流的
+`RELAYS` 环境变量（9 个 CMLiussss 域名型），由 `server/tools/probe-relays.mjs` 逐条做
+`PROBE_TIMES=2` 次真实 TLS 握手（证书校验通过才算可用），可用优先、延迟升序，
+取前 `RELAY_TOP_N=6` 条写进 KV。
 
-`proxyip:top` 是竞速用的"当前最健康的 4 个中继"。它由
-`.github/workflows/refresh-relays.yml` 刷新：**每小时左右**跑一次
-`server/tools/refresh-relays.mjs`，拉社区源 + 内置兜底 → 并发探测（CONNECT
-握手，3s 超时）→ 按成功率/延迟排序 → 取前 4 写进 KV，last-good-wins（本轮全败
-就不写，保留上一轮）。
-
-### 默认不开，也不影响使用
-
-这一点值得说清：
-
-- **不启用这个定时任务，代理照样能用。** KV 为空时竞速只用内置兜底列表
-  （`proxyip.js` 的 9 条 CMLiussss），功能不残，只是候选质量差一些、命中率
-  低一些。
-- **启用之后**，KV 里有新鲜的健康排名，竞速把 KV top4 排在候选最前，
-  CF 承载目标的出口质量明显更好。
-- **GitHub 的 `schedule` 是"每小时左右"而不是准点**（官方说明有几分钟级延迟，
-  高峰期可能更久）。看到 KV 时间戳比整点晚几分钟是**正常的**，不是故障。
-  另外仓库连续 60 天无活动时 GH 会自动停用定时任务——长期不用的 fork 别指望它。
-
-启用：给仓库配两个 Secret（`CLOUDFLARE_API_TOKEN` 需 **KV 写**权限、
-`CLOUDFLARE_ACCOUNT_ID`），然后手动 `workflow_dispatch` 跑一次看输出；
-建议先勾 `dry_run=true` 确认它会写什么。
+曾经有过一个每小时刷新的定时任务（refresh-relays.yml），2026-10-06 连 Worker Cron 一起
+停用：KV 写配额被打爆过一次，而部署是低频、可控、天然带"部署即验证"语义的写入时机。
+运行期仍会继续修正顺序——Session 的 `persistRelayOrder` 在顺序变化时写回 KV
+（每会话 3 次预算），这是唯一的运行期写入。
 
 ### 用到的 KV 键
 
-| 键 | 内容 |
-|---|---|
-| `proxyip:top` | 前 4 名中继（竞速读它） |
-
-只有这一个键，没有游标、没有 pending：探测是在 runner 上一次性跑完的，不存在
-"分批续跑"的中间状态。
+| 键 | 内容 | 谁写 |
+|---|---|---|
+| `proxyip:top` | 有序中继候选（JSON 数组） | 部署工作流 + 运行期重排（有预算） |
+| `profile:*` | 分段耗时度量 | 会话结束/按条数触发（每会话 3 次预算） |
 
 ### 排障
 
-run 页面就是唯一的排障现场，日志里逐条打印每个候选的成败与原因：
+排障现场是 Actions 的 deploy run 日志，"Probe relays" 步骤逐条打印每个候选的成败与原因：
 
 ```
-source https://ipdb.api.030101.xyz/?type=bestproxy: 10 entries
-source builtin:cmliussss: 9 entries
-probing 19 relays (concurrency 8, timeout 3000ms, target cp.cloudflare.com:80)
-probes: 3/19 usable
-  ok   ProxyIP.HK.CMLiussss.net:443 182ms
-  fail 8.218.70.238:443 46ms (CONNECT status 405)
-last-good-wins: no usable relay this round (19 probed) — keeping the previous proxyip:top
+probed 9 relays (times=2, target=www.cloudflare.com:443):
+  ok   ProxyIP.Oracle.CMLiussss.net:443 5975ms
+  fail ProxyIP.Aliyun.CMLiussss.net:443 5984ms (certificate has expired)
+  fail ProxyIP.HK.CMLiussss.net:443 6000ms (timeout)
+proxyip:top = [{"host":"ProxyIP.Oracle.CMLiussss.net",...}]
+KV proxyip:top written (3 entries)
 ```
 
-**绿灯不等于池子被刷新过**：本轮全败时也退出 0（定时任务红了会让人习惯性忽略），
-所以要认 `last-good-wins: …` 这一行，而不是只看 run 是不是绿的。
-
-本地干跑（真拉源 + 真探测，不写 KV）：
+本地干跑（真探测，不写 KV；KV_ID 缺省时自动跳过写入环节前先校验）：
 
 ```bash
-cd server && DRY_RUN=1 node tools/refresh-relays.mjs
+cd server && DRY_RUN=1 RELAYS="ProxyIP.KR.CMLiussss.net ..." node tools/probe-relays.mjs
 ```
 
 ## 构建与测试
@@ -192,10 +168,8 @@ cd server && npm ci && node build.mjs                # 服务端构建
 node test/crypto.mjs   # 鉴权与 TS 窗口
 node test/protocol.mjs # 帧编解码
 node test/integration.mjs
-node test/proxyip.mjs  # 中继 CONNECT、兜底列表、健康记忆
-node test/race.mjs     # 竞速与候选组装
-node test/router.mjs   # Router DO 队列与 flush
-node test/refresh-relays.mjs  # 中继池刷新脚本（替代 Worker Cron）
+node test/proxyip.mjs  # 中继 CONNECT 与解析
+node test/order.mjs    # 顺序出口：成功提前/失败置后/写回预算
 
 cd client && go vet ./... && go test ./...           # 客户端
 
@@ -205,7 +179,7 @@ cd client && go test ./internal/outbound -run TestProtoE2E -v
 ```
 
 注意：`scripts/test-all.sh` 里 crypto/protocol 是纯逻辑直跑，其余套件
-（integration / proxyip / race / router / refresh-relays）经 `socket.js` 摸平台模块，
+（integration / proxyip / order）经 `socket.js` 摸平台模块，
 脚本会挂 `NODE_OPTIONS="--import ./test/shims/register.mjs"`——单跑这些测试时同样要挂，
 否则 `ERR_UNSUPPORTED_ESM_URL_SCHEME`。
 
@@ -247,7 +221,7 @@ node tools/profile.mjs fingerprint doc.json
 工具的第一职责不是画图而是**防止"比错了"**：指纹不同就逐项点名差异、拒绝给出"谁更快"
 （exit 2）。本项目吃过一次亏——入口池改动前用了 `nodes[:64]` 随机截断，两次跑的节点池根本
 不是一回事，"7.2s → 5.1s"作废。服务端记录还带出口阶梯分布
-（`0=直连 1=会话缓存 2=Router 3=竞速`）：期望走 0 却总落在 3，说明"直连被判死"的判断偏保守。
+（`0=直连 1=会话缓存 2=顺序中继`）：期望走 0 却总落在 2，说明"直连被判死"的判断偏保守。
 
 两端 span 单位不同：客户端是 Go `time.Duration`（**纳秒**整数），服务端是 `ms`。工具会折算，
 手工对齐时别忘了——不折算的话客户端每个阶段都显示成 0。
@@ -275,7 +249,7 @@ macOS 产物未签名：首次运行会被 Gatekeeper 拦住，右键 → 打开
 [session] authenticated; stream 1 -> www.google.com:443
 [session] direct exit failed (…); trying proxyip
 [session] router relay X failed: …
-[session] race slot 0 ProxyIP.HK.CMLiussss.net:443 failed: …
+[session] relay ProxyIP.HK.CMLiussss.net:443 failed: …
 [session] stream 7 no first byte in 3000ms, forgetting route
 [router] flush dropped 3 rows: …
 ```

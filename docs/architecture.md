@@ -9,8 +9,7 @@
 |---|---|---|
 | Worker 入口 | `server/src/index.js` | 路径校验（固定 `/`）+ WebSocket 升级，转交 Session DO；非 WS 请求一律 404 空 body |
 | Session DO | `server/src/session.js` | 每连接一个实例：首帧认证、流表管理、帧分发、出口选路、背压 |
-| Router DO | `server/src/router.js` | 全局单实例（分片接口已预留）：目标 → 出口路径映射，SQLite + 异步批量 flush |
-| KV | `wrangler.toml` 绑定 `KV` | 中继健康排名（`proxyip:top`，由 GitHub Actions 的 refresh-relays 每小时写入），last-good-wins |
+| KV | `wrangler.toml` 绑定 `KV` | 两个键：`proxyip:top` = 部署工作流测速排序后的中继候选（部署时写入、运行期顺序变化时写回）；`profile:*` = 度量落盘。Router DO 已移除（见第 8 节） |
 | 客户端 | `client/` | SOCKS5/HTTP 入站、分流、入口优选、ECH 出站、mux |
 
 ### Session DO 的分配
@@ -52,31 +51,26 @@ Workers `connect()` 对 IPv6 字面量与 NAT64 合成地址一律立即失败�
 ```
 ① 直连 connect()                     成功即用（永远优先，不多付一跳）
    └ 失败
-② 会话级内存缓存（egress Map）       命中且能连通 → 用（learn 在建立缓存的那条流上已做）
+② 会话级内存缓存（egress Map）       命中且能连通 → 用
    └ 未命中 / 连通失败 → 删缓存
-③ Router DO lookup(GET /lookup)      命中且未过 TTL → 用，并写回会话缓存
-   └ 未命中 / 连通失败 → forget（立刻删，别让下一条流再踩同一脚）
-④ 竞速 startRace()                   候选 ≤6，任一成功即用；learn 按类型分时机（见下）
+③ 顺序拨号 dialOrdered()             候选按序逐个试（order.js）：成功提前、失败置后
    └ 全失败 → STATUS 0x03
 ```
-
-**learn 的时机按中继类型分**（type 由 KV 条目一路带到竞速赢家）：
-
-- `http-connect`：CONNECT 2xx 就是端到端验证，开流即 learn。
-- `sni`：TCP 连通不构成验证（盲转发也能连），**隧道首字节到达才 learn**（`pumpOutbound`
-  里的 `learnPending`）；3 秒首字节宽限超时则 forget 并丢弃。这是 Router DO 唯一的
-  跨会话复用来源——没有它，每个新会话都要为同一目标重付一轮竞速的子请求预算。
 
 要点：
 
 - **直连失败本身就是信号**：`connect()` 拨 CF 网段必被平台拒，所以"直连失败"≈"目标在
   CF 网段或不可达"，这时才值得付中继那一跳。
-- **没部署出口层就保持纯直连语义**：`ROUTER` 与 `KV` 绑定都缺席时，直连失败就是失败
-  （`session.js` 里 `if (!this.env.ROUTER && !this.env.KV) return { error: direct.error }`）。
-- **首字节宽限 3 秒**（`FIRST_BYTE_GRACE_MS`）：中继回了 200 只代表它愿意转发，不代表
-  目标可达。学到映射后 3 秒内没有首字节，就承认学错了——删会话缓存 + `forget`。
-- **Router DO 条目 TTL 1 小时**，与 refresh-relays 的刷新周期对齐；过期即视为未命中。
-- **会话缓存上限 512 条**（`EGRESS_CACHE_MAX`），只为本连接内省一次查询，不是状态。
+- **顺序的权威副本在 KV**（`proxyip:top`，部署工作流测速排序写入）；运行期成功提前 /
+  失败置后就地维护，**顺序变化才写回 KV**，每会话写回预算 3 次
+  （`RELAY_ORDER_WRITE_BUDGET`）。候选来源与淘汰逻辑详见 [relay.md](relay.md)。
+- **会话级 egress 缓存上限 512 条**（`EGRESS_CACHE_MAX`）：省掉同目标重复拨号并稳定
+  目标→中继亲和；命中后 3 秒内没有目标首字节即证伪删除（`FIRST_BYTE_GRACE_MS`）——
+  中继回了 200 只代表它愿意转发，不代表目标可达。
+- **预算闸门**：每会话 `CONNECT_BUDGET=20` 个子请求（connect 与 DO fetch 同池），见底后
+  排空在途流、回收会话，客户端重连拿新预算。
+- Router DO（跨会话的目标→出口映射）已于 2026-10-06 移除：候选缩到个位数后，跨会话
+  记忆的收益撑不起一个 DO 的子请求与运维成本。
 
 ## 4. 协议 v2 帧格式
 
@@ -154,18 +148,29 @@ mux   单 WS 多流，按 STREAM_ID 分发            internal/outbound/mux.go
 入口  域名 DNS 解析 + 社区优选源 + 延迟优选     internal/entry + selector.Optimize
 ```
 
-- **入口候选两个来源**：服务端域名自身的 DNS 解析（永远可用的兜底）+ 三个社区优选源
-  并行拉取。每次启动都尝试刷新，社区源有界等待 3 秒，全挂退磁盘缓存；候选总数上限 64
+- **入口候选三个来源**：服务端域名自身的 DNS 解析（永远可用的兜底）+ **本地优选缓存**
+  （appdata 单文件里的 `entry_cache`，启动即用）+ 三个社区优选源。缓存缺失、超过 24 小时
+  或条目少于 12 个时才在后台拉社区源并回写缓存——启动永不等待网络。候选总数上限 64
   （`maxEntries`）。
 - **IP 优选**（`selector.Optimize`）：对候选并发测延迟，取最快的 16 个进池。全流程 ≤ 10 秒，
   超预算就用已到手的结果——优选是优化，不是能不能用的前提。启动日志：
   `[probe] <N> entries -> <M> nodes in <耗时>`。
-- **分流**：并行拉四份内置 Clash 规则集（预算 3 秒），部分源挂了用缓存补，全挂退内置兜底集。
+- **分流**：内置 Clash 规则集（`rules.BuiltinOnly`，不拉订阅），geoip CN 先验走独立阶段。
   详见 [routing.md](routing.md)。
-- **传输**：优先 ECH（真实 SNI 加密，外层是 `cloudflare-ech.com`），ECH 有 2 秒尝试预算
-  （`echAttemptBudget`），超预算或结构性失败则退普通 TLS，并进入 60 秒短路（`echDownTTL`），
-  避免一批拨号同时踩坑。ECH 模式下直连优选 IP 而非域名——域名直连会让系统 DNS 解析出多个
+- **传输**：优先 ECH（真实 SNI 加密，外层是 `cloudflare-ech.com`，2026-10-04 实测生效）。
+  被边缘拒绝（ECHRejectionError）时用服务端下发的 RetryConfigList 自愈并热更新缓存；
+  仍有 2 秒尝试预算（`echAttemptBudget`）与 60 秒短路（`echDownTTL`）兜底。
+- **DoH 分两侧**：客户端用阿里（`223.5.5.5` / `dns.alidns.com` / `223.6.6.6`，IP 直连
+  无引导污染），两处使用——ECH 配置查询（HTTPS RR 的 ech 参数）与服务端域名解析；
+  服务端用 `cloudflare-dns.com` + `dns.google`（边缘可达），在 `exits.js` 的 `resolve4`
+  ——Workers 的 `connect()` 不接受域名目标，出站前必须自己解析。ECH 模式下直连优选 IP 而非域名——域名直连会让系统 DNS 解析出多个
   IP，其中不少并不承载目标域名，SYN 超时重传把握手拖到秒级。
+- **持久化**：一份文件存所有数据（`%AppData%/netmaster/netmaster.json`：配置、口令、
+  优选缓存）。首次启动交互式输入 server/password；`--local` 纯绕过模式（无 Worker、
+  无凭据）；`--reset` 清除全部持久化数据。
+- **持久化**：一份文件存所有数据（`%AppData%/netmaster/netmaster.json`：配置、口令、
+  优选缓存）。首次启动交互式输入 server/password；`--local` 纯绕过模式（无 Worker、
+  无凭据）；`--reset` 清除全部持久化数据。
 - **首次连通验证**：serve 启动后在后台做一次真实的 TLS+WS+首帧认证建流（目标
   `www.google.com:443`——平台禁拨 80、example.com 已迁 CF，见 m0-findings.md E6/E7），
   结果补一行 `tunnel established via node <addr>`。
@@ -175,9 +180,9 @@ mux   单 WS 多流，按 STREAM_ID 分发            internal/outbound/mux.go
 **没有任何 HTTP 诊断端点**——没有 `/health`、没有 `/stats`、没有 `/sub`。非 WS 请求
 一律 404 空 body 且无额外头（避免指纹）。部署是否健康，由"客户端能不能连上"直接回答。
 
-- 服务端：设 Worker 变量 `DEBUG=1`，`[session]` / `[router]` 前缀的日志会打开，用
+- 服务端：设 Worker 变量 `DEBUG=1`，`[session]` 前缀的日志会打开，用
   `npx wrangler tail` 实时查看。注意 M0 E9：**DO 内的 console 输出在 tail 上不可见**，
-  这些日志只有 worker 入口层的粗筛价值；"某件事到底有没有发生"要查 KV（`debug:lastExit`）。
+  这些日志只有 worker 入口层的粗筛价值。
 - 客户端：标准输出带时间戳的日志（`log.Ltime`），关键事件包括
   `entries: N (community: net|cache|none)`、`[probe] N entries -> M nodes in …`、
   `rules: N entries (fetched|cache|builtin, skipped K lines)`、
@@ -185,33 +190,34 @@ mux   单 WS 多流，按 STREAM_ID 分发            internal/outbound/mux.go
   `tunnel established via node …`、
   `[route] <host> direct unusable (…) — switched to proxy and replayed`。
 
-## 7. 中继健康检查（仓库侧）
+## 7. 中继测速（部署侧）
 
-Worker Cron 已移除（原因与替代方案见 PRD 附录 A6）。候选探测、排序与写入 `proxyip:top`
-由 `.github/workflows/refresh-relays.yml` 在 GitHub Actions 上每小时跑一次（可手动
-dispatch），主体在 `server/tools/refresh-relays.mjs`：
+Worker Cron 与每小时定时任务都已移除（KV 写配额被打爆过一次，2026-10-06）。候选探测、
+排序与写入 `proxyip:top` 现在只发生在**部署时**：`deploy.yml` 的 "Probe relays" 步骤，
+候选硬编在工作流的 `RELAYS`（9 个 CMLiussss 域名型），主体在 `server/tools/probe-relays.mjs`：
 
-1. **候选**：拉 IPDB bestproxy 等外部源 + 内置兜底（CMLiussss 后备列表）；`filterSelf`
-   剔除回指本 Worker 的条目。
-2. **并发探测**：TLS 握手探测（`tls.connect`，`servername=www.cloudflare.com`）区分
-   真正的 SNI 路由中继与盲转发器/失效节点——M0 之后 ProxyIP 只用 SNI 型中继。
-3. **排序**：成功率 desc → 平均延迟 asc（runner 每轮全新观测，没有可平滑的历史，
-   不做 EWMA），取前 4 写进 `proxyip:top`。
-4. **last-good-wins**：本轮全败不写、保留上一轮数据、退出码 0。
+1. **探测**：每条候选 `PROBE_TIMES=2` 次真实 TLS 握手（`servername=www.cloudflare.com`），
+   证书校验通过才算可用——盲转发 / 自签 / 轮换后端的"薛定谔中继"当场现形。
+2. **排序**：可用优先、延迟升序，取前 6 条（`RELAY_TOP_N`）写 `proxyip:top`。
+3. 全灭也照写（原列表的重排），不会清空 KV；部署是唯一写这个键的时机，运行期的顺序
+   变化写回由 Session 的 `persistRelayOrder` 负责（每会话 3 次预算）。
 
-排障现场是 Actions 的 run 页面，不是 `wrangler tail`；`cron:lastRun` / `cron:cursor` /
-`cron:pending` 三个 KV 键已不存在。
+排障现场是 Actions 的 deploy run 日志（探测结果逐条打印），不是 `wrangler tail`。
 
 ## 8. 已移除的东西
 
 写下来是为了别再找它们：
 
 - **NAT64 出口**：平台不支持 IPv6 出站（M0 E3）。
-- **Worker Cron 健康检查**：免费版触发不可靠且 50 子请求/轮逼出分批续跑；搬去
-  GitHub Actions（见上节与 PRD 附录 A6）。`cron.js`、`scheduled` handler、
-  `[triggers]` 已删。
-- **服务端关系型数据库**：已删除。中继亲和映射改用 Router DO 的 SQLite，部署不再需要建库
-  与建表步骤。
+- **Worker Cron 健康检查**：免费版触发不可靠且 50 子请求/轮逼出分批续跑；先搬到
+  GitHub Actions 每小时任务，2026-10-06 连它一起停用（KV 写配额），改为部署时测速
+  （见第 7 节）。`cron.js`、`scheduled` handler、`[triggers]` 已删。
+- **Router DO**：跨会话的目标→出口映射。候选缩到个位数后收益撑不起成本，2026-10-06
+  移除（`router.js`、`ROUTER` 绑定、v3 迁移 deleted_classes）。`learn/forget` 机制随行。
+- **竞速**：`race.js` 的多槽并发拨号被 `order.js` 的顺序拨号替代（理由见 relay.md）。
+- **每小时 refresh-relays 工作流**：`tools/refresh-relays.mjs` 与其 workflow 已删。
+- **服务端关系型数据库**：已删除，部署不再需要建库与建表步骤。（曾短暂存在的 Router DO
+  SQLite 也已随 Router DO 一起移除，见上。）
 - **`schema.sql`**：随上面那条一起消失。
 - **现成代理协议与用户标识符**：协议是自研的，口令两端本地派生，没有需要用户生成或
   保管的标识符，也不兼容任何现成代理协议。

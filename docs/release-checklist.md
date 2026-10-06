@@ -30,11 +30,11 @@
       ⚠️ **两条容易骗过你的地方**：
       1. 没有 `NETMASTER_E2E_WORKER` / `PASSWORD` 时 live 项会整段 SKIP，跳过的 run 也是绿的；
       2. `Protocol-level checks` 这一步用 `node test/$t.mjs | tail -1` 收尾，**退出码会被管道
-         吞掉**——`cron.mjs` 已删除、`proxyip`/`race` 需要 `cloudflare:*` shim，这些失败都
+         吞掉**——`proxyip`/`order` 需要 `cloudflare:*` shim，这些失败都
          只打印错误不改变结论。看这一步时要逐个套件确认有 `ALL PASS:` 字样。
-- [ ] **中继池刷新工作流可用**：手动 dispatch `refresh-relays.yml`（可先 `dry_run`），
-      最近一次 `success`。它是 Worker Cron 的替代品——池子空了，CF 托管目标就只剩内置
-      兜底列表。
+- [ ] **部署日志里的中继测速**：deploy run 的 "Probe relays" 步骤逐条打印候选成败，
+      末行 `KV proxyip:top written (N entries)`——N=0 说明 9 条候选全灭，CF 托管目标
+      出口不可用（此时 run 仍是绿的，要看这一行）。
 - [ ] **KV `id` 仍是占位符** `00000000000000000000000000000000`（32 个 0）。真实 id 由部署
       入口在部署时注入，入库文件里不该出现真值。
 - [x] **一次性诊断工作流已删**：`live-debug.yml`、`cron-debug.yml`（见第 6 节）。它们会把

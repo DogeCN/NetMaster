@@ -4,17 +4,17 @@
 
 Workers 的 `connect()` 不能拨 Cloudflare 自有网段（`server/src/exits.js` 的 `CF_V4` /
 `CF_V6` 会提前拒绝这类目标，省掉一次注定失败的连接）。而大量站点托管在 Cloudflare 上，
-于是这些目标只剩一条出路：借一个第三方 HTTP CONNECT 中继出站。
+于是这些目标只剩一条出路：借一个第三方 SNI 中继出站。
 
 ```
 浏览器 ──▶ netmaster ──▶ CF 边缘(Worker / Session DO) ──▶ 中继 ──▶ 目标站
-                                                          HTTP CONNECT
+                                                          按 SNI 转发
 ```
 
 **这一跳的出口 IP 决定了 Cloudflare 系站点给你 200 还是 403**——站点看到的是中继，不是你。
 
 隧道里跑的是客户端到目标的原始字节。目标是 HTTPS 时，TLS 由客户端端到端完成，中继只
-搬运密文：CONNECT 隧道正是为此设计的，我们不碰明文。
+搬运密文：SNI 型中继读 ClientHello 里的 SNI 决定转发去处，不碰明文。
 
 ### 关于 NAT64
 
@@ -26,107 +26,84 @@ level66 / well-known / Trex / nat64.net 四个前缀、多个目标全部如此�
 
 ## 中继条目
 
-- 类型：本版只有一种，类型名 `http-connect`（`RELAY_TYPE_HTTP_CONNECT`），写进 Router DO
-  的 `egress_type` 字段。
+- 类型：公共中继全是 `sni`（TLS ClientHello 路由）；自建 VPS 中继是 `http-connect`
+  （先 HTTP CONNECT 再转发）。类型决定 `dialRelay` 的握手方式。
 - 格式：`host[:port]`，端口缺省 **443**（`RELAY_PORT`）。中继语义就是反代 CF 的 443，所以
   只收 443 的条目。
 - 解析：`parseRelay()` 取最后一个冒号，后面是 1–5 位数字才算端口，否则整串当主机名——
   这样裸 IPv6 字面量不会被误拆。
 
-## 候选来源
+## 候选来源：部署工作流测速
 
-竞速按这个顺序组装候选（`race.js` 的 `buildCandidates`），去重后截断到槽位数：
+候选列表**硬编在部署工作流**里（`deploy.yml` 的 `RELAYS`，全部 9 个 CMLiussss 域名型
+候选），部署时由 `server/tools/probe-relays.mjs` 逐条做真实 TLS 握手探测——证书校验
+通过才算可用（盲转发/自签证书的候选当场现形），按延迟排序写进 KV 的 `proxyip:top`
+（默认取前 `RELAY_TOP_N=6` 条）。
 
-```
-① Router DO 命中映射（仅测试注入路径；生产上 Router 命中在 openExit ② 就直接拨了，
-   不会走到竞速）
-② KV 的 refresh-relays top4（key: proxyip:top，RACE_KV_TOP = 4）
-③ 内置兜底列表补齐到槽位数
-④ orderByHealth：把 TTL 内刚失败过的挪到尾部，其余保持原顺序
-```
+部署是**唯一**写这个键的时机。为什么这样设计：
 
-第 ④ 步刻意只做一件事——别把刚被拒绝的候选塞进 120ms 内就要启动的前几槽——不重排 KV 的
-名次（那是 refresh-relays 按"成功率 desc → 延迟 asc"算出来的，PRD 附录 A6）。
+- 候选表放 Worker 里会过时，而 Worker 无法自测（免费版没有 Cron，子请求预算也不允许
+  对每个目标都探测一遍）；
+- 定时任务已被取缔：KV 写配额被打爆过一次（2026-10-06，见 limitations.md），
+  部署是低频、可控、天然带"部署即验证"语义的写入时机。
 
-### 内置兜底列表
-
-`server/src/proxyip.js` 的 `FALLBACK_RELAY_HOSTS`，9 条 CMLiussss 域名型条目
-（HK / JP / KR / DE / Aliyun / Oracle / DigitalOcean / Vultr / Multacom）。
-
-硬编的是"从哪拿列表"，列表本身由 GitHub Actions 的 refresh-relays 拉取、探测后写进 KV
-（Worker Cron 已移除，PRD 附录 A6）。兜底列表的职责只是"源不可达时仍有得试"——社区源是
-个人维护的公益服务，说死就死。它同时也是探测池的兜底：refresh-relays 拉源失败时拿它去测。
+实测参考（2026-10-06，GH runner 视角）：9 条候选可用 3 条——Oracle / KR / JP；
+其余分别死于握手 alert（按连接轮换后端的"薛定谔中继"，`PROBE_TIMES=2` 也未必筛得干净）、
+证书过期、DNS 不存在、超时。ipdb 裸 IP 源 10/10 全灭（盲转发），已弃用。
 
 ### KV 池格式
 
-`server/tools/refresh-relays.mjs` 写进 `proxyip:top` 的是 JSON 数组，元素是对象：
+`proxyip:top` 是 JSON 数组：
 
 ```json
-[{"host":"ProxyIP.Vultr.CMLiussss.net","port":443,"type":"sni","ms":1084}]
+[{"host":"ProxyIP.Oracle.CMLiussss.net","port":443,"type":"sni","ms":5975}]
 ```
 
-`type` 是中继的握手方式：公共池全是 `sni`（TLS ClientHello 路由），自建 VPS 中继是
-`http-connect`。它决定 `dialRelay` 的握手方式，也决定 Session 何时把该映射 learn 进
-Router DO（http-connect 的 CONNECT 2xx 即验证；sni 要等隧道首字节）。
+`type` 是中继的握手方式；`ms` 是部署时的探测延迟，仅供参考。读取端是 `order.js` 的
+`parseRelayEntries()`，宽容解析三种格式（JSON 数组 / `{"relays":[...]}` / 纯文本逐行）；
+解析不出来当空池——客户端会看到 `0x03`（no proxyip candidate available）。
 
-读取端是 `race.js` 的 `parseRelayEntries()`，宽容解析以下三种都行：
+## 顺序拨号
 
-```
-# JSON 数组 或 { "relays": [...] }，元素是 "host[:port]" 或 { "host", "port" }
-["ProxyIP.US.CMLiussss.net:443", "1.2.3.4:443"]
-
-# 也接受订阅源原格式：纯文本逐行，# 之后是注释
-104.16.1.1:443
-ProxyIP.US.CMLiussss.net:443
-```
-
-解析不出来就当空池，由兜底列表接手——坏 JSON 不该让出口层整体不可用。
-
-## 竞速
-
-`server/src/race.js` 的 `startRace()`。
+`server/src/order.js` 的 `dialOrdered()`。候选按序**逐个**试，不再竞速：
 
 | 参数 | 默认 | 环境变量 |
 |---|---|---|
-| 槽位数 | 6 | `RACE_SLOTS` |
-| 单槽超时 | 1500 ms | `RACE_SLOT_TIMEOUT_MS` |
-| 全局超时 | 3000 ms | `RACE_GLOBAL_TIMEOUT_MS` |
-| 交错启动间隔 | 120 ms | `RACE_STAGGER_MS` |
-| KV 取前 N 个 | 4 | `RACE_KV_TOP` |
+| 候选上限 | 6 | `ORDER_SLOTS` |
+| 单条尝试上限 | 5000 ms | `ORDER_SLOT_TIMEOUT_MS` |
 
-环境变量值非法或 ≤0 一律回落到默认（写错一个字符不该变成 0ms）。
+为什么放弃竞速：竞速的收益是"新目标首建连最快"，代价是最坏 6 条并发出站 socket +
+等量子请求预算。候选池缩到个位数、且顺序本身带记忆之后，第一个候选几乎总是上次的
+赢家——并发换来的首包时间抵不过多烧的预算。顺序执行的代价是"首候选死了要逐个等下去"，
+由单条 5s 时限兜底（跨洋 SNI 中继握手实测 2-3s，5s 是留了余量的）。
 
 要点：
 
-- 槽位**全是中继候选**（NAT64 砍掉后不再有交错的两类）。
-- 单槽超时直接传进 `connectViaProxyIP`，让超时回收发生在出站连接自己手里——在赛道上丢
-  一个 Promise 只能丢引用，关不掉连接。
-- 任一槽成功即回收其余槽位；赢家已定后才到达的隧道立即 `close()`，不留悬挂出站 socket。
-- 全失败返回 `{ error: "all proxyip exits failed" }`，Session DO 回 `STATUS 0x03`。
+- **成功提前**：第 i>0 条成功 → 移到首位；
+- **失败置后**：失败 → 踢到末尾，继续试下一条。每条候选**只试一次**（没有尝试计数的话，
+  全灭场景会永远转圈——实现当场踩到的死循环）；
+- **顺序变了才写回 KV**：由 Session 的 `persistRelayOrder` 执行，**每会话预算 3 次**
+  （`RELAY_ORDER_WRITE_BUDGET`）——一次首屏可能重排几十次，不设上限的话 KV 写配额
+  就是这么被打爆的。预算花完后内存照常维护，只是不落盘：下一个会话从稍旧的顺序起步；
+- 全失败返回 `{ error: "all N proxyip exits failed" }`，Session DO 回 `STATUS 0x03`。
 
-## 健康记忆
+## 会话内亲和
 
-`proxyip.js` 内存里的 Map，`"host:port" → { ok, ms, at }`，TTL 10 分钟
-（`RELAY_HEALTH_TTL_MS`），上限 256 条。
-
-- 每次 `connectViaProxyIP` 无论成败都 `noteRelay()`。
-- TTL 的意义：硬编兜底列表必然随时间失效，10 分钟的探活记忆足以把刚失败过的中继踢到候选
-  尾部，又不至于长期锚定一个刚变坏的。
-- 这是优化不是状态：丢了顶多多试一次。
+Session DO 的 egress 缓存（LRU 512）：目标 → 中继的映射，**只在本 WebSocket 连接内
+有效**。命中直接拨上次的中继，不进候选序列；3 秒内没有目标首字节即证伪删除。中继顺序
+的会话内存副本同样在首用时从 KV 读一次，之后就地维护。
 
 ## 自建中继
 
-公共中继的出口 IP 被 Cloudflare 系站点拉黑是常态，动态列表 + 竞速 + 亲和记忆是**自愈
-机制，不是根治**。要根治只能自建：
+公共中继的出口 IP 被 Cloudflare 系站点拉黑是常态，部署测速 + 顺序记忆是**自愈机制，
+不是根治**。要根治只能自建：
 
 1. 找一台不在 Cloudflare 网段内的主机（VPS 即可，出口 IP 干净）；
 2. 在它上面跑一个只接受 `CONNECT host:port` 的 HTTP 代理，转发到目标，只认 443；
-3. 把 `host:443` 写进 refresh-relays 的候选源（workflow 环境变量或源列表），让它经
-   `proxyip:top` 进 KV；
+3. 把 `host:443` 加进 `deploy.yml` 的 `RELAYS` 列表，下次部署起参与测速排序；
 4. 务必做访问控制——一个开放的 CONNECT 代理会被当成开放代理扫描滥用。
 
-自建条目会和其他候选一起进入竞速，命中后由 Router DO 记住（`egress_type = http-connect`），
-之后同一目标直接复用。
+自建条目是 `http-connect` 型，CONNECT 2xx 即端到端验证，会与公共中继一起参与顺序拨号。
 
 ## 相关
 

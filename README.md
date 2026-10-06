@@ -27,8 +27,8 @@ HMAC 认证。没有用户标识符要生成、没有数据库 ID 要复制、�
                                   │  出口选路
                                   ├── 直连 connect() ───────────────────▶ 目标站   3 跳
                                   │
-                                  └── ProxyIP 中继（HTTP CONNECT）──────▶ 目标站   4 跳
-                                        候选：会话缓存 → Router DO → 竞速(KV top4 + 内置兜底)
+                                  └── ProxyIP 中继（按 SNI 转发）───────▶ 目标站   4 跳
+                                        候选：会话缓存 → 顺序拨号(KV 里的测速排序)
 ```
 
 跳数说明：直连是"客户端 → 目标"两跳；走服务端非 CF 托管目标是三跳；目标是
@@ -36,15 +36,15 @@ Cloudflare 承载的站点时，Workers 的 `connect()` 不能拨 CF 自己的 I
 中继，四跳。**NAT64 出口已砍**——M0 实测 Workers `connect()` 不支持 IPv6 出站
 （见 [docs/m0-findings.md](docs/m0-findings.md)）。
 
-直连这一侧还有一条**三级阶梯**（分流判 proxy 却没有可用出口时的兜底）：先退回尝试性
-直连，3 秒内**零字节即断**就改分片直连——把 ClientHello 切成 8B 片、8ms 间隔，阻断
-设备靠重组读 SNI，重组窗口先到期它就只看到碎片——再不行才落代理隧道。分片成功就**留在
-直连**：不多绕一跳，也不在服务端多烧一次 `connect()`。成败各自记 6 小时 / 30 分钟，
-日志打 `[frag]` / `[route]`，详见 [docs/routing.md](docs/routing.md)。
+直连这一侧有一条**降级阶梯**：明文直连被拦（3 秒内零字节即断/静默丢弃）就改分片直连——
+把 ClientHello 切成 8B 片、8ms 间隔，阻断设备靠重组读 SNI，重组窗口先到期它就只看到
+碎片——再不行才落代理隧道。分片成功就**留在直连**：不多绕一跳，也不在服务端多烧一次
+`connect()`。成败写进记忆（分片可行 6h / 该走代理 30min / TCP 失败 5min），日志打
+`[frag]` / `[route]`，详见 [docs/routing.md](docs/routing.md)。
 
-KV 里的中继健康排名（`proxyip:top`）由 GitHub Actions 的 `refresh-relays` 定时任务刷新，
-**默认不开也不影响使用**——不开时竞速只用内置兜底列表。启用方式与排障见
-[docs/operations.md](docs/operations.md)。
+服务端出口侧：中继候选由**部署工作流测速排序**写进 KV（`proxyip:top`），运行期按序
+**逐个**尝试（不再竞速），成功提前、失败置后，顺序变化写回 KV（每会话 3 次预算）。
+详见 [docs/relay.md](docs/relay.md)。
 
 ## 快速开始
 
@@ -98,8 +98,8 @@ npx wrangler deploy
 ```
 
 注意：`wrangler.toml` 里的 KV `id` 是占位符（`0000…0000`），直接 `wrangler deploy`
-会因 id 非法而失败——这是有意的，别拿占位符上线。无需 KV 时可以把
-`[[kv_namespaces]]` 整段删掉：缺少 KV 绑定时竞速只用内置兜底列表，功能不残。
+会因 id 非法而失败——这是有意的，别拿占位符上线。deploy 工作流会按 title=netmaster
+解析真 id 就地改写，本地手部部署参考 [docs/operations.md](docs/operations.md)。
 
 ### 2. 客户端
 
@@ -111,20 +111,21 @@ npx wrangler deploy
 cd client && go build -o netmaster.exe ./cmd/netmaster
 ```
 
-写一份 `config.json` 放在可执行文件旁边（或 `%AppData%/netmaster/config.json`）：
-
-```json
-{ "server": "<你的域名>", "password": "<PASSWORD>" }
-```
-
-然后：
+不需要手写配置文件：**首次启动会交互式询问服务地址与口令**，写进
+`%AppData%
+etmaster
+etmaster.json`（一份文件存所有持久化数据：配置、口令、
+节点优选缓存）。也可以用 flag / 环境变量给：
 
 ```bash
-./netmaster serve          # Windows 双击 netmaster-windows-amd64.exe 等价
+./netmaster serve --server <你的域名> --password <PASSWORD>
+./netmaster serve --local   # 纯绕过模式：直连/分片/ECH，不需要 Worker 与凭据
+./netmaster --reset         # 清除全部持久化数据
 ```
 
-双击启动的细节：首次双击若没有任何 config.json，会在 exe 旁边生成一份模板，填好
-两个值再点一次即可；任何启动错误都会等一次回车再关窗口，原因不会一闪而过。
+Windows 双击 `netmaster-windows-amd64.exe` 与交互式首次启动等价；任何启动错误都会
+等一次回车再关窗口，原因不会一闪而过。老版本放在程序目录的 `config.json` 会在首次
+启动时自动迁移进 appdata 文件。
 
 启动后监听端口自动选择（先试 8080 / 1080，被占则顺延），HTTP 入站监听
 `127.0.0.1:8080`、SOCKS5 监听 `127.0.0.1:1080`。系统代理自动指向选定端口，退出时
@@ -135,33 +136,41 @@ cd client && go build -o netmaster.exe ./cmd/netmaster
 ## 三个子命令
 
 ```
-usage: netmaster <serve|nodes|restore> [flags]
+usage: netmaster <serve|nodes|restore|--reset> [flags]
   serve   - run the local HTTP+SOCKS5 proxy and take over the system proxy
-  nodes   - keep firing requests and watch adaptive exit selection live
+            --local: bypass-only mode (direct/fragmented exits, no Worker)
+  nodes   - keep fetching a URL through the proxy to watch whether the tunnel works
   restore - restore the system proxy (after serve was killed uncleanly)
+  --reset - clear all persisted data (config, password, entry cache, lock)
 ```
 
 | 子命令 | 作用 | 主要 flag |
 |---|---|---|
-| `serve` | 起本地代理、接管系统代理、退出还原 | `--server` `--password` `--manual` `--rules` `--no-ech` `--tunnels` `--frag-oob` |
+| `serve` | 起本地代理、接管系统代理、退出还原 | `--server` `--password` `--manual` `--rules` `--no-ech` `--tunnels` `--frag-oob` `--local` |
 | `nodes` | 持续发请求，实时观察自适应选路 | `--server` `--password` `--target` `--ipcheck` |
 | `restore` | 手动还原系统代理（serve 被强杀后用） | 无 |
+| `--reset` | 清除全部持久化数据（配置、口令、优选缓存、单实例锁） | 无 |
 
 `serve` 的 flag：`--server <domain>`、`--password <pw>`、`--manual`（不接管系统代理，
 只打印监听地址）、`--rules <file>`（自定义分流规则文件）、`--no-ech`（关掉客户端→
 Worker 这段链路的 SNI 隐藏）、`--tunnels <1-8>`（同时保持几条隧道）、`--frag-oob`
-（分片首段改用 TCP 紧急数据发出，见下表 `frag-oob`）。
+（分片首段改用 TCP 紧急数据发出，见下表 `frag-oob`）、`--local`（纯绕过模式：直连/
+分片/ECH 出口，不建隧道、不需要凭据）。
 
 `nodes` 的 flag：`--target <url>`（默认 `https://www.google.com/`）、
 `--ipcheck <url>`（发请求到该 URL 并统计观察到的出口 IP 分布）。
 
-配置优先级：**命令行 flag > config.json > 环境变量**。环境变量兜底用
+配置优先级：**命令行 flag > 持久化文件 > 环境变量**。环境变量兜底用
 `NETMASTER_SERVER` 与 `NETMASTER_PASSWORD`（后者为空时再退到 `PASSWORD`）。
 加 `-h` 到任意子命令可看它自己的 flag。
 
 ## 配置说明
 
-`config.json` 的字段与 `serve` 的 flag 一一对应（名字去掉 `--`）：
+所有持久化数据在一个文件里：`%AppData%
+etmaster
+etmaster.json`（Linux/macOS 为
+`os.UserConfigDir()/netmaster/netmaster.json`）。配置块的字段与 `serve` 的 flag
+一一对应（名字去掉 `--`）：
 
 ```json
 {
@@ -189,9 +198,10 @@ Worker 这段链路的 SNI 隐藏）、`--tunnels <1-8>`（同时保持几条隧
 但每条常连隧道都按 Cloudflare DO 时长计费，免费版有每日上限。日常浏览留默认的 4
 就行；如果你的账号额度吃紧、且主要做低频浏览，降到 2 能明显省额度。
 
-查找顺序：`./config.json`，然后 `%AppData%/netmaster/config.json`（Linux/macOS 为
-`os.UserConfigDir()`）。两个位置都没有不是错误——全部配置也可以由 flag 给出。文件
-存在但 JSON 损坏是错误：静默忽略一份读不出来的配置，会让人以为它生效了。
+文件里还有一块 `entry_cache`：节点优选的候选 IP 与时间，启动立刻进池不用等网络；
+缓存缺失、超过 24 小时或条目太少时才在后台拉社区源并回写。老版本放在程序目录的
+`config.json` 首次启动时自动迁移进这份文件，老文件留在原地不动。`netmaster --reset`
+清除全部持久化数据。
 
 ## 限制与合规
 
@@ -200,7 +210,7 @@ Worker 这段链路的 SNI 隐藏）、`--tunnels <1-8>`（同时保持几条隧
   心跳走 WebSocket 协议层 Ping（边缘自动应答，不计消息、不唤醒 DO）、没有逐帧 ACK。
 - **Workers `connect()` 不支持 IPv6 出站**，NAT64 出口已从架构中移除；CF 承载目标的
   出口只剩 ProxyIP 中继一类。
-- **公共中继的出口 IP 被 Cloudflare 系站点拉黑是常态**，动态列表 + 竞速 + 亲和记忆
+- **公共中继的出口 IP 被 Cloudflare 系站点拉黑是常态**，部署测速 + 顺序记忆 + 会话亲和
   是自愈机制，不是根治。
 - **ECH 生效，且对本域是必需项。** 2026-10-04 实测（本机、`proxy.0xa.cc.cd`，zone 的
   Encrypted Client Hello 一直开着）：DNS 的 HTTPS RR 发布 `ech=`；启动日志
@@ -228,8 +238,8 @@ Worker 这段链路的 SNI 隐藏）、`--tunnels <1-8>`（同时保持几条隧
 |---|---|
 | [docs/PRD.md](docs/PRD.md) | 产品需求文档（v1.1 冻结基线，文末附 v2 实施修订记录） |
 | [docs/architecture.md](docs/architecture.md) | v2 架构、组件职责、协议帧格式、出口选路 |
-| [docs/relay.md](docs/relay.md) | ProxyIP 中继：为什么需要、候选来源、竞速、自建指引 |
-| [docs/routing.md](docs/routing.md) | 客户端分流规则与优先级；直连的三级阶梯（明文 → 分片 → 代理）与两级记忆 |
+| [docs/relay.md](docs/relay.md) | ProxyIP 中继：为什么需要、部署测速、顺序拨号、自建指引 |
+| [docs/routing.md](docs/routing.md) | 客户端分流规则与优先级；直连降级阶梯（明文 → 分片 → 代理）与三层记忆 |
 | [docs/limitations.md](docs/limitations.md) | 免费版限额表与实测数据 |
 | [docs/operations.md](docs/operations.md) | 部署、运维、日志与 DEBUG |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | 排障：连不上、ECH 回退、节点全挂、系统代理残留 |
@@ -244,9 +254,8 @@ cd client && go build ./... && go vet ./... && go test ./...
 # 服务端
 cd server && npm ci && node build.mjs && npm test
 
-# 单个服务端测试（真实存在的：crypto / integration / protocol / proxyip / race /
-# refresh-relays / router）
-cd server && node test/router.mjs
+# 单个服务端测试（真实存在的：crypto / integration / protocol / proxyip / order）
+cd server && node --import ./test/shims/register.mjs test/order.mjs
 
 # 端到端（Go 客户端 ↔ Node devserver，同协议对端）
 cd server && node test/devserver.mjs 0 devserver-password 0 &
