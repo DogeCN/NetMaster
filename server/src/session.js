@@ -1,7 +1,11 @@
 // SessionDO —— 每条 WebSocket 连接一个（PRD §7.1）。职责：
 //   首帧认证（HMAC + TS 窗口 + 流 ID 校验）→ 流表管理 → 开帧/数据帧/控制帧分发
-//   → 出口选路（直连优先，失败转 ProxyIP：会话缓存 → Router DO → 竞速，PRD §7.2）
+//   → 出口选路（直连优先，失败转 ProxyIP：会话缓存 → 竞速，PRD §7.2）
 //   → 每流响应帧与 CLOSE。
+//
+// Router DO 与 KV 的出口排名已砍（2026-10-06）：中继列表硬编三条实测幸存者
+// （proxyip.js），跨会话记忆的收益撑不起 Router DO 的子请求与运维成本；会话内
+// 的出口亲和由 egress 缓存承担。
 //
 // Hibernation：WS 经 acceptWebSocket 注册，空闲时 DO 休眠、连接保持；客户端
 // 协议层 Ping 在边缘自动应答，不唤醒 DO。唤醒后实例内存是空的——流表随休眠
@@ -11,14 +15,22 @@
 // 背压（PRD §4.7）：客户端→目标方向每流缓冲上限 1 MiB，超过即 CLOSE 该流，
 // 不影响其他流。
 
-import { dialRelay, parseRelay, RELAY_TYPE_SNI, RELAY_TYPE_HTTP_CONNECT } from './proxyip.js';
+import { dialRelay, parseRelay, RELAY_TYPE_SNI } from './proxyip.js';
 import { startRace } from './race.js';
-import { targetHash, routerName, routerShardId } from './router.js';
 // 名字直接用 profile.js 里的原名：**不要**写 `flush as flushProfile`。
 // build.mjs 的拼接式打包只是把 import 语句整行删掉，不处理重命名 —— 别名在源码里
 // 读着完全正常，符号却在 bundle 里不存在，表现为运行期 ReferenceError。
 // build.mjs 现在会硬拒绝带 as 的相对 import，所以这个坑至少不会再无声发生。
 import { makeProfiler, flush } from './profile.js';
+
+// target_hash = 目标域名（小写）SHA-256 前 16 字节十六进制。只存哈希不存域名：
+// egress 缓存是会话内的路由记忆，不是访问日志，没必要留可还原的目标名。
+async function targetHash(host) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(host).toLowerCase()));
+  return Array.from(new Uint8Array(d).slice(0, 16))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 const STREAM_BUFFER_LIMIT = 1024 * 1024;
 
@@ -318,8 +330,8 @@ class SessionDO {
       this.directFailed.add(hash);
       this.log(`direct exit failed (${direct.error}); trying proxyip`);
     }
-    // 没部署出口层（无 ROUTER/KV 绑定）时保持纯直连语义：直连失败就是失败。
-    if (!this.env.ROUTER && !this.env.KV) return { error: "direct failed" };
+    // 没有出口层变量的历史条件已随 RouterDO/KV 读取一起移除：候选是硬编列表，
+    // 竞速永远可用，直连失败就竞速。
 
     // ① 会话级缓存：只在本 WebSocket 会话内有效。
     const mem = this.egress.get(hash);
@@ -335,29 +347,8 @@ class SessionDO {
       this.egress.delete(hash);
     }
 
-    // ② Router DO：跨会话复用的唯一来源。
-    const endLookup = p.begin("exit.router.lookup");
-    const hit = await this.routerLookup(hash);
-    endLookup();
-    if (hit) {
-      const endRouter = p.begin("exit.router.dial");
-      const r = await dialRelay(hit, host, port);
-      endRouter();
-      if (!r.error) {
-        p.count("exit.rung2");
-        this.rememberEgress(hash, hit);
-        // http-connect 的 CONNECT 2xx 是端到端验证，可以learn；SNI 型的 TCP
-        // 成功不构成验证（盲转发也能连），其健康由 GH 探测写进 KV，不进 Router。
-        if (hit.type === RELAY_TYPE_HTTP_CONNECT) {
-          this.learn(hash, hit.type, `${hit.host}:${hit.port}`);
-        }
-        return { socket: r.socket, hash, relay: hit };
-      }
-      this.log(`router relay ${hit.host}:${hit.port} failed: ${r.error}`);
-      this.forget(hash); // 映射被证伪：立刻删，别让下一个流再踩同一脚
-    }
-
-    // ③ 竞速：候选 = KV top4 → 内置兜底补齐 6 槽（Router 映射刚被证伪或本就没有）。
+    // ② 竞速：候选 = 硬编中继列表（proxyip.js）按序补齐 6 槽。会话缓存刚被证伪
+    // 或本就没有时走到这里；赢家进会话缓存，同目标后续流直接复用。
     const endRace = p.begin("exit.race");
     const race = await startRace({ env: this.env, log: (m) => this.log(m) }, { host, port });
     endRace();
@@ -367,73 +358,20 @@ class SessionDO {
       // 记住了，于是这次根本没再拨。把它读成 "(已在本次会话失败)"，而不是再崩一次 ——
       // 上一版就是在这里崩的，而这里恰好是最常被走到的一行。
       const directErr = direct ? direct.error : "(already failed earlier this session)";
-      this.env.KV?.put("debug:lastExit", `${new Date().toISOString()} ${host}:${port} race: ${race.error} | direct: ${directErr}`).catch?.(() => {});
       return { error: `${directErr}; ${race.error}` };
     }
     const relay = { ...parseRelay(race.relay), type: race.type || RELAY_TYPE_SNI };
-    p.count("exit.rung3");
+    p.count("exit.rung2");
     this.rememberEgress(hash, relay);
-    if (relay.type === RELAY_TYPE_HTTP_CONNECT) {
-      // CONNECT 2xx 是端到端验证，立即 learn。SNI 型的 TCP 成功不构成验证
-      // （盲转发也能连），要等首字节 —— 见 openStream 里 rec.learnPending。
-      this.learn(hash, relay.type, race.relay);
-    }
-    return { socket: race.socket, hash, relay, learnPending: relay.type !== RELAY_TYPE_HTTP_CONNECT };
+    return { socket: race.socket, hash, relay };
   }
 
-  routerStub(hash) {
-    const r = this.env.ROUTER;
-    if (!r) return null;
-    return r.get(r.idFromName(routerName(routerShardId(hash))));
-  }
-
-  // routerLookup 命中返回 { host, port, type }。绑定缺席、请求出错、条目过期都
-  // 当未命中：映射只是缓存，缺了顶多多一次竞速。
-  async routerLookup(hash) {
-    const stub = this.routerStub(hash);
-    if (!stub) return null;
-    try {
-      this.charge("router/lookup");
-      const res = await stub.fetch(`https://router/lookup?hash=${hash}`);
-      if (!res.ok) return null;
-      const row = await res.json();
-      const relay = parseRelay(row?.id);
-      return relay ? { host: relay.host, port: relay.port, type: row.type } : null;
-    } catch (e) {
-      this.log(`router lookup failed: ${e.message || e}`);
-      return null;
-    }
-  }
-
-  // learn / forget 是异步旁路：不在出站连接的临界路径上，失败也无妨。
-  learn(hash, type, id) {
-    this.routerWrite(hash, "/learn", { hash, type, id });
-  }
-
-  forget(hash) {
-    this.routerWrite(hash, "/forget", { hash });
-  }
-
-  // charge 记一次子请求消耗（connect 与 DO fetch 同池）。Router DO 缺席时
-  // 不计——那次调用根本不会发生。
+  // charge 记一次子请求消耗（connect 与 DO fetch 同池）。
   charge(what) {
     this.connectCount++;
     if (this.connectCount >= CONNECT_BUDGET) {
       this.log(`subrequest budget ${this.connectCount} reached (last: ${what}), recycling session`);
     }
-  }
-
-  routerWrite(hash, path, body) {
-    const stub = this.routerStub(hash);
-    if (!stub) return;
-    this.charge(`router${path}`);
-    stub
-      .fetch(`https://router${path}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      })
-      .catch((e) => this.log(`router ${path} failed: ${e.message || e}`));
   }
 
   rememberEgress(hash, relay) {
@@ -502,7 +440,6 @@ class SessionDO {
       writing: false,
       hash: ex.hash || null,
       firstByteTimer: null,
-      learnPending: !!ex.learnPending, // SNI 型：首字节才是端到端验证，到点才 learn
       relayId: ex.relay ? `${ex.relay.host}:${ex.relay.port}` : null,
       prof: p, // 首字节到达时打点用（见 pumpOutbound）
       openedAt: Date.now(),
@@ -520,13 +457,12 @@ class SessionDO {
       endStream: p.begin("exit.stream"),
     };
     if (rec.hash) {
-      // 出口学到的映射先乐观记下，3 秒内没有首字节就承认学错了。
+      // 会话级出口亲和的证伪点：3 秒内没有首字节，就承认这次选的出口是错的，
+      // 把它从缓存里摘掉 —— 下一个流换一条，而不是踩同一脚。
       rec.firstByteTimer = setTimeout(() => {
         rec.firstByteTimer = null;
         this.log(`stream ${id} no first byte in ${FIRST_BYTE_GRACE_MS}ms, forgetting route`);
-        rec.learnPending = false;
         this.egress.delete(rec.hash);
-        this.forget(rec.hash);
       }, FIRST_BYTE_GRACE_MS);
     }
     this.streams.set(id, rec);
@@ -563,12 +499,6 @@ class SessionDO {
           if (rec.endTTFB) {
             rec.endTTFB();
             rec.endTTFB = null;
-          }
-          if (rec.learnPending) {
-            // SNI 中继此刻被端到端证实（数据真的穿过了隧道），写入 Router DO
-            // 供跨会话复用——这是竞速 6 槽预算之外唯一的复用来源。
-            rec.learnPending = false;
-            this.learn(rec.hash, RELAY_TYPE_SNI, rec.relayId);
           }
         }
         // 这一路实际送回来的字节数：与 exit.stream 的时长一起给出吞吐

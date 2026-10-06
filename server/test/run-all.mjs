@@ -16,8 +16,6 @@ const suites = [
   ["integration", true],
   ["proxyip", true],
   ["race", true],
-  ["router", true],
-  ["refresh-relays", true],
   ["profile", false],
   ["regressions", false],
 ];

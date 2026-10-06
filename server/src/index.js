@@ -9,9 +9,9 @@
 //   PASSWORD  必需。GitHub Secrets 配置，CI 透传成 Worker Secret。
 //   DEBUG     '1' 打开结构化日志（wrangler tail 查看）。
 //   SESSION   Session DO 绑定。
-//   ROUTER    Router DO 绑定（目标 → 出口映射）。缺席时出口层降级为纯直连。
-//   KV        出口健康排名（proxyip:top，由 GitHub Actions 的 refresh-relays
-//             定时任务写入）。缺席或为空时竞速只用内置兜底列表。
+//   KV        profile 度量的落盘（flushProfile，每会话有写预算）。出口排名的
+//             KV 键（proxyip:top）已随动态刷新一起移除（2026-10-06）：中继
+//             硬编在 proxyip.js 里。
 
 export default {
   async fetch(request, env) {
@@ -24,7 +24,7 @@ export default {
     return env.SESSION.get(id).fetch(request);
   },
 
-  // 无 scheduled handler：Worker Cron 已移除（PRD 附录 A6），中继池刷新由
-  // GitHub Actions 的 refresh-relays.yml 定时写 KV。留一个空壳反而危险 ——
+  // 无 scheduled handler：Worker Cron 已移除（PRD 附录 A6）；GH Actions 的
+  // refresh-relays 定时任务也已停用（中继改硬编）。留一个空壳反而危险 ——
   // DO 内 console 输出在 tail 上不可见（m0-findings.md E9），死代码坏了也看不见。
 };

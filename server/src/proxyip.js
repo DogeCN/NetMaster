@@ -33,18 +33,18 @@ export const RELAY_CONNECT_TIMEOUT_MS = 5000;
 // 失败过的中继踢到候选尾部，而不至于长期锚定一个刚变坏的。
 export const RELAY_HEALTH_TTL_MS = 600000;
 
-// 内置兜底列表（CMLiussss 域名型，PRD §8.2）。正式列表由 Cron 拉社区源（ymyuuu/IPDB
-// bestproxy 等）写进 KV，兜底列表只管"源不可达时仍有得试"。
+// 内置中继列表（CMLiussss 域名型）。这就是**正式列表**，不是兜底：
+// 动态更新（GH Actions 每小时探测写 KV）已于 2026-10-06 停用 —— KV 写配额紧张，
+// 而实测（tools/refresh-relays.mjs 的探测逻辑，2026-10-06 dry-run）ipdb 裸 IP 源
+// 10/10 全灭（盲转发/自签证书），真正能用的只有域名型这三条。顺序按实测握手
+// 延迟升序：KR 383ms、Vultr 2317ms、JP 4637ms。
+//
+// 列表失效时的信号：竞速全灭 → 客户端看到 0x03（all exits failed）。
+// 更新方式：git 历史里 tools/refresh-relays.mjs 的探测逻辑跑一轮，幸存者按延迟填入。
 export const FALLBACK_RELAY_HOSTS = [
-  "ProxyIP.HK.CMLiussss.net",
-  "ProxyIP.JP.CMLiussss.net",
   "ProxyIP.KR.CMLiussss.net",
-  "ProxyIP.DE.tp2024.CMLiussss.net",
-  "ProxyIP.Aliyun.CMLiussss.net",
-  "ProxyIP.Oracle.CMLiussss.net",
-  "ProxyIP.DigitalOcean.CMLiussss.net",
   "ProxyIP.Vultr.CMLiussss.net",
-  "ProxyIP.Multacom.CMLiussss.net",
+  "ProxyIP.JP.CMLiussss.net",
 ];
 
 // fallbackRelays 返回兜底候选（复制，调用方可自由打乱）。公共中继是 SNI 型。

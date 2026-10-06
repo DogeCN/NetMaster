@@ -2,9 +2,10 @@
 // 重点是时序：交错启动、单槽超时回收、全局超时、全部失败、赢家诞生后其余槽回收。
 import { startRelayMock, installMockConnect } from './proxyip.mjs';
 import {
-	startRace, buildCandidates, parseRelayEntries, raceConfig,
-	RACE_SLOTS, RACE_SLOT_TIMEOUT_MS, RACE_GLOBAL_TIMEOUT_MS, RACE_STAGGER_MS, KV_RELAY_KEY,
+	startRace, buildCandidates, raceConfig,
+	RACE_SLOTS, RACE_SLOT_TIMEOUT_MS, RACE_GLOBAL_TIMEOUT_MS, RACE_STAGGER_MS,
 } from '../src/race.js';
+import { FALLBACK_RELAY_HOSTS } from '../src/proxyip.js';
 
 let pass = 0, fail = 0;
 const ok = (c, n, x = '') => { if (c) { pass++; console.log('  PASS ' + n); } else { fail++; console.log('  FAIL ' + n + ' ' + x); } };
@@ -41,43 +42,18 @@ console.log('--- 配置与解析 ---');
 	ok(c.slots === RACE_SLOTS, 'default 6 slots', String(c.slots));
 	ok(RACE_SLOT_TIMEOUT_MS === 1500 && RACE_GLOBAL_TIMEOUT_MS === 3000 && RACE_STAGGER_MS === 120,
 		'PRD 7.3 defaults 1.5s / 3s / 120ms');
-
-	ok(parseRelayEntries('["a.example:443","b.example"]').length === 2, 'JSON array of strings');
-	ok(parseRelayEntries('{"relays":["a.example:443"]}').length === 1, 'object with relays[]');
-	ok(parseRelayEntries('{"relays":[{"host":"a.example","port":8080}]}')[0].port === 8080, 'object entries');
-	ok(parseRelayEntries('{"relays":[{"host":"a.example","port":443,"type":"sni"}]}')[0].type === 'sni', 'KV entry type preserved (B1)');
-	ok(parseRelayEntries('{"relays":[{"host":"a.example","port":443,"type":"bogus"}]}')[0].type === undefined, 'unknown type dropped -> dialRelay defaults');
-	ok(parseRelayEntries('a.example:443\n# 注释\n\nb.example:443').length === 2, 'plain text + comments');
-	ok(parseRelayEntries('a.example:443\na.example:443').length === 1, 'duplicates dropped');
-	ok(parseRelayEntries('b.example')[0].port === 443, 'port defaults to 443');
-	ok(parseRelayEntries('{oops').length === 0, 'broken JSON -> empty pool');
-	ok(parseRelayEntries('').length === 0, 'empty KV -> empty pool');
 }
 
-console.log('--- 候选组装 ---');
+console.log('--- 候选组装（硬编列表） ---');
 {
-	const kv = { KV: { get: async (k) => (k === KV_RELAY_KEY ? JSON.stringify(['k1:443', 'k2:443', 'k3:443', 'k4:443', 'k5:443']) : null) } };
-	const list = await buildCandidates({ env: kv }, raceConfig(kv.env));
-	ok(list.length === RACE_SLOTS, `pool fills to 6 slots (${list.length})`);
-	ok(list.slice(0, 4).every((c, i) => c.host === `k${i + 1}`), 'KV top4 comes first');
-	ok(list.every((c) => c.viaRouter === false), 'KV candidates are not flagged viaRouter');
-
-	const noKv = await buildCandidates({ env: {} }, raceConfig({}));
-	ok(noKv.length === RACE_SLOTS && noKv.every((c) => c.host.endsWith('.CMLiussss.net')),
-		'no KV binding -> fallback list only');
-
-	const withRouter = await buildCandidates(
-		{ env: kv, routerLookup: async () => ({ host: 'r.example', port: 443, type: 'http-connect' }) },
-		raceConfig(kv.env)
-	);
-	ok(withRouter[0].host === 'r.example' && withRouter[0].viaRouter === true, 'router hit is candidate 0 / viaRouter');
-	ok(withRouter[0].type === 'http-connect', 'router hit carries its type');
-
-	const dead = await buildCandidates(
-		{ env: kv, routerLookup: async () => { throw new Error('router down'); } },
-		raceConfig(kv.env)
-	);
-	ok(dead.length === RACE_SLOTS && dead[0].host === 'k1', 'router failure falls through to KV');
+	const c = raceConfig({});
+	ok(c.kvTop === undefined, 'no KV knob left');
+	const list = await buildCandidates({ env: {} }, c);
+	ok(list.length === Math.min(RACE_SLOTS, FALLBACK_RELAY_HOSTS.length),
+		`pool fills from the hardcoded list (${list.length})`);
+	ok(list.every((x, i) => x.host === FALLBACK_RELAY_HOSTS[i]), 'hardcoded order preserved (measured latency asc)');
+	ok(list.every((x) => x.type === 'sni'), 'all candidates are sni type');
+	ok(list.every((x) => x.viaRouter === undefined), 'no router flag left');
 
 	const r = await startRace({ env: {}, candidates: [] }, { host: 'x.example', port: 443 });
 	ok(!!r.error, 'no candidate -> error', JSON.stringify(r));
@@ -92,8 +68,7 @@ console.log('--- 竞速：选出赢家 ---');
 	const ms = Date.now() - t0;
 	ok(!r.error, 'race resolves with a winner', r.error || '');
 	ok(r.relay === good.key, 'winner is the reachable relay', r.relay);
-	ok(r.type === 'http-connect', 'winner carries candidate type (B1: session learns from it)', r.type);
-	ok(r.viaRouter === false, 'not via router');
+	ok(r.type === 'http-connect', 'winner carries candidate type', r.type);
 	ok(ms >= 20, `slot 1 waited for its stagger slot (${ms}ms)`);
 	r.socket.close();
 }
@@ -174,12 +149,13 @@ console.log('--- 竞速：交错时序 ---');
 	}
 }
 
-console.log('--- KV 候选真的会被拨 ---');
+console.log('--- 硬编候选真的会被拨 ---');
 {
-	const kvRelay = await relay({ mode: 'ok' });
-	const kv = { KV: { get: async (k) => (k === KV_RELAY_KEY ? JSON.stringify([kvRelay.key]) : null) } };
-	const r = await startRace({ env: { ...env(), ...kv } }, { host: 't.example', port: 443 });
-	ok(!r.error && r.relay === kvRelay.key, 'KV top relay is dialed through the real path', r.error || r.relay);
+	// 把桩中继登记成硬编列表第一名，竞速不注入 candidates 时就该拨到它。
+	const hardcoded = await relay({ mode: 'ok' });
+	endpoints.set(`${FALLBACK_RELAY_HOSTS[0]}:443`, endpoints.get(hardcoded.key));
+	const r = await startRace({ env: env() }, { host: 't.example', port: 443 });
+	ok(!r.error && r.relay === `${FALLBACK_RELAY_HOSTS[0]}:443`, 'first hardcoded relay is dialed through the real path', r.error || r.relay);
 	r.socket.close();
 }
 

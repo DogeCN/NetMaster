@@ -205,10 +205,10 @@ async function run() {
 
 	console.log('--- 兜底列表与解析 ---');
 	{
-		ok(fallbackRelays().length === 9, 'fallback list has 9 relays');
+		ok(fallbackRelays().length === 3, 'relay list has the 3 measured survivors');
 		ok(fallbackRelays().every((r) => r.port === RELAY_PORT && r.host.endsWith('.CMLiussss.net')),
 			'every fallback is CMLiussss on 443');
-		ok(FALLBACK_RELAY_HOSTS.includes('ProxyIP.HK.CMLiussss.net'), 'HK relay present (v0.1 fallback list)');
+		ok(FALLBACK_RELAY_HOSTS[0] === 'ProxyIP.KR.CMLiussss.net', 'KR first (lowest measured latency)');
 		ok(RELAY_TYPE_HTTP_CONNECT === 'http-connect', 'egress type name');
 		ok(parseRelay('1.2.3.4').port === 443, 'missing port defaults to 443');
 		ok(parseRelay('1.2.3.4:8080').host === '1.2.3.4' && parseRelay('1.2.3.4:8080').port === 8080, 'explicit port');

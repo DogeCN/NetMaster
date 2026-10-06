@@ -23,17 +23,14 @@ tag = "v1"
 # 免费版必须用 new_sqlite_classes（new_classes 是旧版 SQLite 迁移，免费计划不接受）
 new_sqlite_classes = ["SessionDO"]
 
-# Router DO：全局单实例（分片接口 idFromName("router:<shard>") 已在代码里预留），
-# 存 目标 → 出口路径 的映射，SQLite + Alarm 异步批量 flush。
-[[durable_objects.bindings]]
-name = "ROUTER"
-class_name = "RouterDO"
-
+# Router DO 已砍（2026-10-06）：中继列表硬编三条实测幸存者（proxyip.js），
+# 跨会话路由记忆的收益撑不起一个 DO 的子请求与运维成本。v3 迁移把类删掉。
 [[migrations]]
-tag = "v2"
-new_sqlite_classes = ["RouterDO"]
+tag = "v3"
+deleted_classes = ["RouterDO"]
 
-# KV：Cron 每小时写的 ProxyIP 健康结果（key: proxyip:top），last-good-wins。
+# KV：profile 度量的落盘（flushProfile）。出口排名（proxyip:top）已随动态刷新
+# 一起移除，KV 只写度量、每会话有硬预算（PROF_FLUSHES_PER_SESSION）。
 # id 是占位符——真实 namespace id 由 deploy 工作流从 CF API 解析后注入，
 # 直接 `wrangler deploy` 本文件会因 id 非法失败（这是有意的：别拿占位符上线）。
 [[kv_namespaces]]

@@ -63,14 +63,11 @@ function makeOpenExit(overrides = {}) {
     ...overrides,
   };
   const ctx = {
-    env: { ROUTER: {}, KV: { put: () => Promise.resolve() } },
+    env: {},
     directFailed: new Set(),
     egress: new Map(),
     log() {},
-    forget() {},
     rememberEgress() {},
-    learn() {},
-    routerLookup: async () => null,
     // openExit 现在会取目标采集器来给四级阶梯打 span。这里给一个**结构相同**
     // 的空实现（profile.js 里 enabled=false 时就是这个样子：不花任何代价）。
     //

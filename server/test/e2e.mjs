@@ -35,7 +35,6 @@ import {
   STATUS_FORBIDDEN,
   STATUS_NOEXIT,
 } from "../src/protocol.js";
-import { parseRelayEntries, KV_RELAY_KEY } from "../src/race.js";
 import { startDevserver } from "./devserver.mjs";
 
 // ---- 小工具 ----
@@ -933,22 +932,17 @@ function median(a) {
   return s.length % 2 ? s[(s.length - 1) / 2] : Math.round((s[s.length / 2 - 1] + s[s.length / 2]) / 2);
 }
 
-// 6 Router DO 生效：跨连接复用同一目标的映射。必须每轮换新连接——同一连接里
-// 第 2/3 轮命中的是 Session DO 的会话级内存缓存（session.js 的 this.egress），
-// 那样证明不了 Router DO。每轮之间等 6s，让 Router DO 的 +5s Alarm flush 落盘。
+// 6 出口韧性：跨连接的 3 次顺序连接打同一 CF-hosted 目标。
+// Router DO 已砍（2026-10-06，中继硬编三条）：跨连接没有记忆，每条连接重新竞速；
+// 这里验证的改成"反复连接都能成"——会话级 egress 缓存只在本连接内生效，
+// 0x03 重试一次的惯例保留（公共中继波动不是出口层失效）。
 async function item6() {
-  if (cfg.mode !== "live") {
-    return step("6.1 router do: 3 sequential connects to the same CF-hosted target", async () =>
-      skip("local mode: devserver has no ROUTER binding")
-    );
-  }
-  await step("6.1 router do: 3 sequential connects to the same CF-hosted target", async () => {
+  await step("6.1 exit resilience: 3 sequential connects to the same CF-hosted target", async () => {
     const rows = [];
     for (let i = 1; i <= 3; i++) {
-      // 每轮 0x03 重试一次（与 live_test.go 的 CF-hosted 用例同一惯例）：路由命中后
-      // 拨的是上轮学到的公共中继，中继瞬断会让该轮 0x03——服务端会 forget 并回退
-      // 竞速，竞速 6 槽也全败才到客户端。这是中继池波动，不是 Router 失效；
-      // 重试仍败才判 FAIL。失败会拖慢该轮（两次竞速超时），不影响判定本身。
+        // 每轮 0x03 重试一次（与 live_test.go 的 CF-hosted 用例同一惯例）：公共中继
+        // 瞬断会让该轮 0x03——会话内缓存被证伪、下一轮回退竞速，竞速也全败才到客户端。
+        // 这是中继池波动，不是出口层失效；重试仍败才判 FAIL。
       let row = null;
       for (let attempt = 1; attempt <= 2 && (!row || row.status !== STATUS_OK); attempt++) {
         const m = new Mux(cfg.endpoint, cfg.password);
@@ -971,16 +965,14 @@ async function item6() {
         }
         await m.close();
         note(
-          `round ${i}${attempt > 1 ? ` (retry after 0x03 — relay volatility, not router)` : ""}: ` +
+          `round ${i}${attempt > 1 ? ` (retry after 0x03 — relay volatility, not the exit layer)` : ""}: ` +
             `${row.error ? `error: ${row.error}` : `status ${statusName(row.status)}`}, ` +
             `open ${row.openMs}ms, total ${row.totalMs}ms${row.http ? `, HTTP ${row.http}` : ""}`
         );
       }
       rows.push(row);
-      if (i < 3) await sleep(6000); // 等 Router DO Alarm flush（FLUSH_DELAY_MS = 5000）
     }
-    note("Router DO storage is not readable through any public Cloudflare API, so this is a");
-    note("black-box observation (no 0x03 from round 2 on + latency), not proof of a DO hit.");
+    note("No cross-connection route memory exists anymore (Router DO removed); each new connection re-races.");
     const bad = rows.filter((r, i) => i > 0 && r.status !== STATUS_OK);
     if (bad.length) return fail(`round(s) ${bad.map((r) => r.round).join(", ")} did not get 0x00 even after one retry → cached route not reused (or relay pool down, see 5.1)`);
     const retried = rows.filter((r) => r.attempt > 1).map((r) => r.round);
@@ -998,30 +990,6 @@ async function item6() {
 // 有数据时照旧校验格式（喂给 race.js 的 parseRelayEntries 能读回可用中继）。
 // 不再读 cron:lastRun：那个键随 Worker Cron 一起没了，refresher 只写 proxyip:top
 // 一个键；新鲜度只能去 Actions 的 run 页面看（这里如实说明，不伪造证据）。
-async function item7() {
-  await step("7.1 relay pool in KV (proxyip:top)", async () => {
-    if (!CF.token || !CF.account) {
-      return skip("CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID not set (KV is only readable through the Cloudflare REST API)");
-    }
-    const ns = await resolveKvNamespace();
-    if (ns.error) return fail(ns.error);
-    const top = await kvGet(ns.id, KV_RELAY_KEY);
-    note(`namespace ${ns.id} (${ns.how})`);
-    const show = (k, v) => (v.missing ? `${k} = (missing)` : v.error ? `${k} = ERROR ${v.error}` : `${k} = ${v.value.trim().slice(0, 300)}`);
-    note(show(KV_RELAY_KEY, top));
-    if (top.error) return fail("KV read failed");
-
-    if (top.missing || !String(top.value).trim()) {
-      return skip("subscription refresh workflow has not run; enable it to populate proxyip:top");
-    }
-    const relays = parseRelayEntries(top.value);
-    if (!relays.length) return fail(`proxyip:top present but yields 0 usable relays: ${top.value.trim().slice(0, 120)}`);
-    note("freshness: no lastRun key — the refresher writes only proxyip:top; check the Actions run page for when it last ran");
-    return pass(`${relays.length} relay(s): ${relays.map((r) => `${r.host}:${r.port}`).join(", ")}`);
-  });
-}
-
-// 8 空闲存活：一条已认证的会话，只走 WS 协议层 Ping，静置 cfg.idleSec 秒。
 async function item8() {
   await step(`8.1 idle survival: protocol-level ping only, ${cfg.idleSec}s`, async () => {
     const m = new Mux(cfg.endpoint, cfg.password);
@@ -1102,7 +1070,6 @@ try {
   await item4();
   await item5();
   await item6();
-  await item7();
   await item8();
   await item9();
 } finally {
