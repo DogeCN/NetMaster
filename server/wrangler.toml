@@ -29,8 +29,9 @@ new_sqlite_classes = ["SessionDO"]
 tag = "v3"
 deleted_classes = ["RouterDO"]
 
-# KV：profile 度量的落盘（flushProfile）。出口排名（proxyip:top）已随动态刷新
-# 一起移除，KV 只写度量、每会话有硬预算（PROF_FLUSHES_PER_SESSION）。
+# KV：两个键。proxyip:top = 部署工作流测速排序后的中继候选（deploy.yml 的
+# "Probe relays" 步骤写入，运行期 order.js 消费并就地重排、顺序变化时写回）；
+# profile:* = 度量落盘（flushProfile，每会话有写预算）。
 # id 是占位符——真实 namespace id 由 deploy 工作流从 CF API 解析后注入，
 # 直接 `wrangler deploy` 本文件会因 id 非法失败（这是有意的：别拿占位符上线）。
 [[kv_namespaces]]

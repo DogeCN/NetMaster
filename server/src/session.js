@@ -16,7 +16,7 @@
 // 不影响其他流。
 
 import { dialRelay, parseRelay, RELAY_TYPE_SNI } from './proxyip.js';
-import { startRace } from './race.js';
+import { dialOrdered, KV_RELAY_KEY } from './order.js';
 // 名字直接用 profile.js 里的原名：**不要**写 `flush as flushProfile`。
 // build.mjs 的拼接式打包只是把 import 语句整行删掉，不处理重命名 —— 别名在源码里
 // 读着完全正常，符号却在 bundle 里不存在，表现为运行期 ReferenceError。
@@ -44,6 +44,11 @@ const FIRST_BYTE_GRACE_MS = 3000;
 
 // 会话级出口缓存上限：只为省掉同连接内的重复查询，不是状态。
 const EGRESS_CACHE_MAX = 512;
+
+// RELAY_ORDER_WRITE_BUDGET 是本会话允许的"候选顺序写回 KV"次数上限。
+// KV 写配额紧张（2026-10-06 被打爆过一次），而一次首屏可能重排几十次 ——
+// 预算花完后内存照常维护，只是不落盘，下一会话从稍旧的顺序起步。
+const RELAY_ORDER_WRITE_BUDGET = 3;
 
 // CONNECT_BUDGET 是本会话一生允许的**子请求**数（耗尽后回收换新预算）。
 //
@@ -87,6 +92,10 @@ class SessionDO {
     this.closedIds = new Set(); // 近期已关流：迟到数据帧按原样丢弃，不误解析成开帧
     this.egress = new Map(); // target_hash -> { host, port }：本连接内的出口亲和
     this.directFailed = new Set(); // 直连被平台拒绝的目标（hash），本连接内不再重试
+    // 中继候选的会话内存副本：首次需要时从 KV 读一次（dialOrdered 经 setter 回填），
+    // 之后成功提前/失败置后就地维护；顺序变化经 persistRelayOrder 写回 KV。
+    this.relayOrder = null;
+    this.relayOrderWrites = 0; // 本会话已花掉的顺序写回预算
     this.connectCount = 0; // 本激活期已消耗的子请求数（connect 与 DO fetch 都计）
     this.idleTimer = null;
     this.draining = false; // 预算见底且仍有在途流：等它们跑完再回收
@@ -347,23 +356,48 @@ class SessionDO {
       this.egress.delete(hash);
     }
 
-    // ② 竞速：候选 = 硬编中继列表（proxyip.js）按序补齐 6 槽。会话缓存刚被证伪
-    // 或本就没有时走到这里；赢家进会话缓存，同目标后续流直接复用。
-    const endRace = p.begin("exit.race");
-    const race = await startRace({ env: this.env, log: (m) => this.log(m) }, { host, port });
-    endRace();
-    if (race.error) {
-      console.error(`[exit] race ${host}:${port} all slots failed: ${race.error}`);
+    // ② 顺序出口：候选顺序 = KV 里的部署测速结果，会话内就地维护
+    // （成功提前、失败置后），顺序变化写回 KV（有预算，见 persistRelayOrder）。
+    // 赢家进 egress 缓存，同目标后续流直接复用、不再进这里。
+    const sess = this;
+    const endOrder = p.begin("exit.order");
+    const picked = await dialOrdered(
+      {
+        env: this.env,
+        get order() { return sess.relayOrder; },
+        set order(v) { sess.relayOrder = v; },
+        log: (m) => sess.log(m),
+        onReorder: (o) => sess.persistRelayOrder(o),
+      },
+      { host, port }
+    );
+    endOrder();
+    if (picked.error) {
+      console.error(`[exit] order ${host}:${port} exhausted: ${picked.error}`);
       // direct 为 null 是正常情形：本会话早前那条流已经把直连判死、directFailed
       // 记住了，于是这次根本没再拨。把它读成 "(已在本次会话失败)"，而不是再崩一次 ——
       // 上一版就是在这里崩的，而这里恰好是最常被走到的一行。
       const directErr = direct ? direct.error : "(already failed earlier this session)";
-      return { error: `${directErr}; ${race.error}` };
+      return { error: `${directErr}; ${picked.error}` };
     }
-    const relay = { ...parseRelay(race.relay), type: race.type || RELAY_TYPE_SNI };
+    const relay = { ...parseRelay(picked.relay), type: picked.type || RELAY_TYPE_SNI };
     p.count("exit.rung2");
     this.rememberEgress(hash, relay);
-    return { socket: race.socket, hash, relay };
+    return { socket: picked.socket, hash, relay };
+  }
+
+  // persistRelayOrder 把重排后的候选顺序写回 KV。
+  //
+  // 只在顺序真的变了时被调（dialOrdered 的 onReorder），但**写回有预算**：一次
+  // 页面加载能造出几十个新目标，极端情况下每个都可能重排一次 —— 不设上限的话
+  // KV 写配额就是这么被打爆的（2026-10-06 的教训）。预算花完后内存照常更新，
+  // 只是不再落盘：下一个会话从 KV 读到的是稍旧的顺序，代价只是多试几条。
+  persistRelayOrder(order) {
+    this.relayOrder = order;
+    if (!this.env.KV || this.relayOrderWrites >= RELAY_ORDER_WRITE_BUDGET) return;
+    this.relayOrderWrites++;
+    const body = JSON.stringify(order.map((r) => ({ host: r.host, port: r.port, type: r.type || RELAY_TYPE_SNI })));
+    this.env.KV.put(KV_RELAY_KEY, body).catch(() => {});
   }
 
   // charge 记一次子请求消耗（connect 与 DO fetch 同池）。

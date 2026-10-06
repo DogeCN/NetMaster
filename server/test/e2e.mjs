@@ -889,7 +889,7 @@ async function item5() {
         continue;
       }
       if (r.status === STATUS_NOEXIT) {
-        bump("all race slots failed (STATUS 0x03)");
+        bump("all ordered relays failed (STATUS 0x03)");
         continue;
       }
       if (r.status !== STATUS_OK) {
@@ -916,7 +916,7 @@ async function item5() {
     }
     await m.close();
     const rate = (ok / cfg.rounds) * 100;
-    note(`target ${cfg.cf.host}:${cfg.cf.port} (CF-hosted → ProxyIP race), ${cfg.rounds} rounds`);
+    note(`target ${cfg.cf.host}:${cfg.cf.port} (CF-hosted → sequential ProxyIP dial), ${cfg.rounds} rounds`);
     note(`stream-open latency: ${lat.length ? `min ${Math.min(...lat)}ms / median ${median(lat)}ms / max ${Math.max(...lat)}ms` : "no successful opens"}`);
     for (const [r, c] of reasons) note(`failure x${c}: ${r}`);
     // 分级阈值（PRD A7）：≥99% 达标；50-99% 是已知公共中继池波动（PASS 但明示
@@ -972,7 +972,7 @@ async function item6() {
       }
       rows.push(row);
     }
-    note("No cross-connection route memory exists anymore (Router DO removed); each new connection re-races.");
+    note("No cross-connection route memory exists anymore (Router DO removed); each new connection walks the ordered list afresh.");
     const bad = rows.filter((r, i) => i > 0 && r.status !== STATUS_OK);
     if (bad.length) return fail(`round(s) ${bad.map((r) => r.round).join(", ")} did not get 0x00 even after one retry → cached route not reused (or relay pool down, see 5.1)`);
     const retried = rows.filter((r) => r.attempt > 1).map((r) => r.round);

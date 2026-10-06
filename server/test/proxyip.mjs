@@ -1,12 +1,11 @@
 // proxyip.mjs — HTTP CONNECT 中继出口单测。用本地 net.createServer 模拟中继
 // （200 / 403 / 不回话三态），connect() 用 node:net 包装成 Workers socket 形状。
-// 同时导出这套装配函数给 race.mjs 复用（那边需要同一批中继桩）。
+// 同时导出这套装配函数给 order.mjs 复用（那边需要同一批中继桩）。
 import net from 'node:net';
 import { Readable, Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import {
-	connectViaProxyIP, fallbackRelays, parseRelay, noteRelay, relayHealth, orderByHealth,
-	FALLBACK_RELAY_HOSTS, RELAY_PORT, RELAY_HEALTH_TTL_MS, RELAY_TYPE_HTTP_CONNECT,
+	connectViaProxyIP, parseRelay, RELAY_PORT, RELAY_TYPE_HTTP_CONNECT,
 } from '../src/proxyip.js';
 
 // ---- 本地中继桩 ----
@@ -203,35 +202,13 @@ async function run() {
 		ok(!!r.error, 'unreachable relay -> error (no hang)', r.error);
 	}
 
-	console.log('--- 兜底列表与解析 ---');
+	console.log('--- 解析 ---');
 	{
-		ok(fallbackRelays().length === 3, 'relay list has the 3 measured survivors');
-		ok(fallbackRelays().every((r) => r.port === RELAY_PORT && r.host.endsWith('.CMLiussss.net')),
-			'every fallback is CMLiussss on 443');
-		ok(FALLBACK_RELAY_HOSTS[0] === 'ProxyIP.KR.CMLiussss.net', 'KR first (lowest measured latency)');
 		ok(RELAY_TYPE_HTTP_CONNECT === 'http-connect', 'egress type name');
 		ok(parseRelay('1.2.3.4').port === 443, 'missing port defaults to 443');
 		ok(parseRelay('1.2.3.4:8080').host === '1.2.3.4' && parseRelay('1.2.3.4:8080').port === 8080, 'explicit port');
 		ok(parseRelay('ProxyIP.US.CMLiussss.net').host === 'ProxyIP.US.CMLiussss.net', 'hostname relay');
 		ok(parseRelay('') === null, 'empty -> null');
-	}
-
-	console.log('--- 健康记忆 ---');
-	{
-		const now = 1000000;
-		noteRelay('r.good', 443, true, 12, now);
-		noteRelay('r.bad', 443, false, 900, now);
-		ok(relayHealth('r.good', 443, now + 1000)?.ok === true, 'fresh success remembered');
-		ok(relayHealth('r.good', 443, now + RELAY_HEALTH_TTL_MS + 1) === null, 'entry expires after TTL');
-		// 上一条断言顺手把过期条目删了（TTL 记忆不攒垃圾），重新记一遍再看排序
-		noteRelay('r.good', 443, true, 12, now);
-		const ordered = orderByHealth(
-			[{ host: 'r.bad', port: 443 }, { host: 'r.unknown', port: 443 }, { host: 'r.good', port: 443 }],
-			now + 1000
-		);
-		ok(ordered[0].host === 'r.good', 'known-good first');
-		ok(ordered[2].host === 'r.bad', 'known-dead last');
-		ok(ordered[1].host === 'r.unknown', 'unknown keeps relative order');
 	}
 
 	restore();
@@ -241,7 +218,7 @@ async function run() {
 	return fail === 0 ? 0 : 1;
 }
 
-// 被 race.mjs import 时不跑用例。
+// 被 order.mjs import 时不跑用例。
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
 	process.exit(await run());
 }

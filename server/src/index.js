@@ -9,9 +9,8 @@
 //   PASSWORD  必需。GitHub Secrets 配置，CI 透传成 Worker Secret。
 //   DEBUG     '1' 打开结构化日志（wrangler tail 查看）。
 //   SESSION   Session DO 绑定。
-//   KV        profile 度量的落盘（flushProfile，每会话有写预算）。出口排名的
-//             KV 键（proxyip:top）已随动态刷新一起移除（2026-10-06）：中继
-//             硬编在 proxyip.js 里。
+//   KV        proxyip:top = 部署工作流测速排序后的中继候选（deploy.yml 写入，
+//             order.js 消费、就地重排、顺序变化时写回）；profile:* = 度量落盘。
 
 export default {
   async fetch(request, env) {

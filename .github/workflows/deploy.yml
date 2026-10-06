@@ -86,6 +86,27 @@ jobs:
           sed -i "s/^id = \"00000000000000000000000000000000\"/id = \"$KV_ID\"/" wrangler.toml
           grep -A3 kv_namespaces wrangler.toml
 
+      # 中继候选表就硬编在这里（RELAYS，全部 9 个 CMLiussss 域名型候选）：
+      # 部署时逐条做真实 TLS 握手探测（证书校验通过 = 中继真的能转发 CF 目标），
+      # 按延迟排序写进 KV 的 proxyip:top；Worker 侧运行期只消费、就地重排。
+      # 为什么不放 Worker 里：列表会过时，而 Worker 无法自测（免费版没有 Cron，
+      # 子请求预算也不允许每个目标都探测一遍）。为什么不用定时任务：KV 写配额
+      # 被打爆过一次（2026-10-06），部署是唯一写 KV 的时机。
+      - name: Probe relays and write ranked order to KV
+        env:
+          KV_ID: ${{ steps.kv.outputs.id }}
+          RELAYS: >-
+            ProxyIP.KR.CMLiussss.net
+            ProxyIP.Vultr.CMLiussss.net
+            ProxyIP.JP.CMLiussss.net
+            ProxyIP.HK.CMLiussss.net
+            ProxyIP.Aliyun.CMLiussss.net
+            ProxyIP.Oracle.CMLiussss.net
+            ProxyIP.DigitalOcean.CMLiussss.net
+            ProxyIP.Multacom.CMLiussss.net
+            ProxyIP.DE.tp2024.CMLiussss.net
+        run: node tools/probe-relays.mjs
+
       - name: Deploy Worker
         run: npx wrangler deploy
 

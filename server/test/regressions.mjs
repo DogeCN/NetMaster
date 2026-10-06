@@ -2,7 +2,7 @@
 // **回退实现，本文件必须变红**。绿了不算数。
 //
 // 为什么它们能存在，而 CRITICAL-1 那类缺陷当初抓不住：
-// 审查指出 openExit 的块级作用域 bug 时，`race.mjs` 测了 startRace 返回 error、
+// 审查指出 openExit 的块级作用域 bug 时，出口层测试测了出口失败返回 error、
 // `integration.mjs` 测了客户端收到 0x03，两条都绿 —— 但 integration 连的是
 // devserver 这个**替身**，真实的 SessionDO.openExit 零覆盖，而
 // `node --check` 只查语法、查不出运行期未定义标识符。
@@ -53,7 +53,7 @@ function makeOpenExit(overrides = {}) {
   const src = extractOpenExit(read('session.js'));
   const body = src.replace('async openExit(atyp, host, port) {', 'async function openExit(atyp, host, port) {');
   const factory = new Function(
-    'targetHash', 'directConnect', 'dialRelay', 'startRace', 'parseRelay',
+    'targetHash', 'directConnect', 'dialRelay', 'dialOrdered', 'parseRelay',
     'RELAY_TYPE_HTTP_CONNECT', 'RELAY_TYPE_SNI', 'console',
     `${body}\nreturn openExit;`
   );
@@ -84,8 +84,8 @@ function makeOpenExit(overrides = {}) {
   };
   const targetHash = async () => 'h';
   const directConnect = async () => (cfg.directFails ? { error: 'blocked' } : { socket: {} });
-  const startRace = async () => (cfg.raceFails ? { error: 'all slots failed' } : { socket: {}, relay: 'r:1' });
-  const fn = factory(targetHash, directConnect, async () => ({ error: 'x' }), startRace,
+  const dialOrdered = async () => (cfg.raceFails ? { error: 'all 6 proxyip exits failed' } : { socket: {}, relay: 'r:1', type: 'sni' });
+  const fn = factory(targetHash, directConnect, async () => ({ error: 'x' }), dialOrdered,
     () => ({ host: 'r', port: 1 }), 'http-connect', 'sni', console).bind(ctx);
   // 返回 ctx 是为了让用例能直接摆布实例状态（比如"本会话已判死直连"）。
   // bind() 出来的是函数，属性不在上面。
@@ -100,10 +100,10 @@ function makeOpenExit(overrides = {}) {
 // 客户端拿不到任何响应帧，只能干等 20s 超时；认证期间排队的开帧也一起丢掉。
 //
 // 回退到块内 const 时本用例报 ReferenceError。
-test('openExit reports an error when direct and every race slot fail', async () => {
+test('openExit reports an error when direct and every ordered relay fail', async () => {
   const openExit = makeOpenExit();
   const res = await openExit('example.com', 443);
-  assert.equal(res.error, 'blocked; all slots failed',
+  assert.equal(res.error, 'blocked; all 6 proxyip exits failed',
     `expected a normal error result, got ${JSON.stringify(res)}`);
   assert.ok(!res.socket);
 });
@@ -121,7 +121,7 @@ test('openExit survives a session where direct was already proven bad', async ()
 });
 
 // TestOpenExitSucceedsViaDirect 是对照组：直连通就该直接返回。
-test('openExit returns the direct socket without racing', async () => {
+test('openExit returns the direct socket without walking the relay list', async () => {
   const openExit = makeOpenExit({ directFails: false });
   const res = await openExit('example.com', 443);
   assert.ok(res.socket, 'a working direct exit must be used as-is');

@@ -25,33 +25,11 @@ export const RELAY_TYPE_SNI = "sni";
 // 中继语义就是反代 CF 的 443，因此只收 443 的条目（与 v0.1 的解析一致）。
 export const RELAY_PORT = 443;
 
-// 等 CONNECT 响应头的上限。竞速的 1.5s 单槽超时由 race.js 传进来，这里的值只兜
-// 单独调用（不经竞速）的场合。
+// 等 CONNECT 响应头的上限。单独调用（不经 order.js 顺序尝试）的场合兜底用。
 export const RELAY_CONNECT_TIMEOUT_MS = 5000;
 
-// 中继可用性缓存 TTL。硬编兜底列表必然随时间失效，10 分钟的探活记忆足以把刚
-// 失败过的中继踢到候选尾部，而不至于长期锚定一个刚变坏的。
-export const RELAY_HEALTH_TTL_MS = 600000;
-
-// 内置中继列表（CMLiussss 域名型）。这就是**正式列表**，不是兜底：
-// 动态更新（GH Actions 每小时探测写 KV）已于 2026-10-06 停用 —— KV 写配额紧张，
-// 而实测（tools/refresh-relays.mjs 的探测逻辑，2026-10-06 dry-run）ipdb 裸 IP 源
-// 10/10 全灭（盲转发/自签证书），真正能用的只有域名型这三条。顺序按实测握手
-// 延迟升序：KR 383ms、Vultr 2317ms、JP 4637ms。
-//
-// 列表失效时的信号：竞速全灭 → 客户端看到 0x03（all exits failed）。
-// 更新方式：git 历史里 tools/refresh-relays.mjs 的探测逻辑跑一轮，幸存者按延迟填入。
-export const FALLBACK_RELAY_HOSTS = [
-  "ProxyIP.KR.CMLiussss.net",
-  "ProxyIP.Vultr.CMLiussss.net",
-  "ProxyIP.JP.CMLiussss.net",
-];
-
-// fallbackRelays 返回兜底候选（复制，调用方可自由打乱）。公共中继是 SNI 型。
-export function fallbackRelays() {
-  return FALLBACK_RELAY_HOSTS.map((host) => ({ host, port: RELAY_PORT, type: RELAY_TYPE_SNI }));
-}
-
+// 候选列表不在这里：硬编在部署工作流（deploy.yml 的 RELAYS），部署时测速排序
+// 写进 KV 的 proxyip:top，Worker 侧由 order.js 顺序消费并就地重排。
 // parseRelay 拆 "host[:port]"，端口缺省 443（订阅源格式，纯文本 ip:port）。
 export function parseRelay(s) {
   const t = String(s || "").trim();
@@ -61,46 +39,6 @@ export function parseRelay(s) {
     if (port > 0 && port < 65536) return { host: t.slice(0, i), port };
   }
   return t ? { host: t, port: RELAY_PORT } : null;
-}
-
-// ---- 中继健康记忆（内存） ----
-
-const health = new Map(); // "host:port" -> { ok, ms, at }
-
-function relayKey(host, port) {
-  return `${host}:${port}`;
-}
-
-export function noteRelay(host, port, ok, ms, now) {
-  health.set(relayKey(host, port), { ok: !!ok, ms: Number(ms) || 0, at: now ?? Date.now() });
-  if (health.size > 256) {
-    // Map 保插入序，丢最旧的；健康记录是优化，不是状态。
-    health.delete(health.keys().next().value);
-  }
-}
-
-export function relayHealth(host, port, now) {
-  const e = health.get(relayKey(host, port));
-  const t = now ?? Date.now();
-  if (!e || t - e.at >= RELAY_HEALTH_TTL_MS) {
-    health.delete(relayKey(host, port));
-    return null;
-  }
-  return e;
-}
-
-// orderByHealth 把 TTL 内探活失败过的中继挪到尾部，其余保持原顺序。
-// KV top4 的名次是 Cron 按 EWMA 算出来的，不能被这里打乱；我们只做一件事——
-// 别把刚被拒的候选塞进 120ms 内就要启动的前几槽。now 供测试注入时钟。
-export function orderByHealth(list, now) {
-  const rank = (c) => {
-    const h = relayHealth(c.host, c.port, now);
-    return !h ? 1 : h.ok ? 0 : 2;
-  };
-  return list
-    .map((c, i) => [rank(c), i, c])
-    .sort((a, b) => a[0] - b[0] || a[1] - b[1])
-    .map((x) => x[2]);
 }
 
 // ---- HTTP CONNECT ----
@@ -230,7 +168,6 @@ export async function connectViaProxyIP(relayHost, relayPort, targetHost, target
       timeoutMs - (Date.now() - t0)
     );
     if (status < 200 || status > 299) throw new Error(`relay CONNECT status ${status}`);
-    noteRelay(relayHost, relayPort, true, Date.now() - t0);
     return {
       socket: {
         readable: tunnel(reader, leftover),
@@ -242,7 +179,6 @@ export async function connectViaProxyIP(relayHost, relayPort, targetHost, target
     };
   } catch (e) {
     try { socket?.close(); } catch {}
-    noteRelay(relayHost, relayPort, false, Date.now() - t0);
     return { error: `${e.message || e} (${Date.now() - t0}ms)` };
   }
 }

@@ -15,7 +15,7 @@ const suites = [
   ["protocol", false],
   ["integration", true],
   ["proxyip", true],
-  ["race", true],
+  ["order", true],
   ["profile", false],
   ["regressions", false],
 ];
