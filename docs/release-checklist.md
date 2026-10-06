@@ -104,7 +104,8 @@ integration/proxyip/race/router，带 `cloudflare:*` shim）→ 五平台 `go ve
 - [ ] **acceptance 再手动 dispatch 一次**（合并后它的 `push: branches: [v2]` 触发器不再
       生效，必须手动跑），live 两项 PASS；
 - [ ] **协议层验收**（可选）：dispatch `e2e.yml`，`worker` 填你的域名、`mode=live`；
-- [ ] **中继池有数据**：`refresh-relays.yml` 最近一次 success，且 KV 里 `proxyip:top` 有值
+- [ ] **中继池有数据**：deploy run 的 "Probe relays" 步骤末行为
+      `KV proxyip:top written (N entries)` 且 N ≥ 1
       （用 `acceptance.yml` 的 `KV health snapshot` 步骤看，或
       `npx wrangler kv key get proxyip:top --namespace-id <id> --remote`）；
 - [ ] **客户端实机**：任选一台机器跑 `netmaster serve`，日志出现
@@ -135,7 +136,7 @@ integration/proxyip/race/router，带 `cloudflare:*` shim）→ 五平台 `go ve
   `%TEMP%/netmaster_sysproxy.json`。
 - **口令泄露**：`npx wrangler secret put PASSWORD` 换新口令，所有客户端同步改
   `config.json`。两端不一致时表现为连不上（服务端只回 `0x01`，看不出原因）。
-- **中继池空/全败**：`refresh-relays.yml` 的日志是验收依据（无论成败都留 artifact）；
+- **中继池空/全败**：deploy run 的 "Probe relays" 步骤日志是验收依据；
   池子空时竞速退化为内置兜底列表，功能不残但 CF 托管目标会明显变差。
 
 ## 7. 合并后清理（一次性，2026-10-03 已完成，留档备查）
@@ -148,7 +149,7 @@ integration/proxyip/race/router，带 `cloudflare:*` shim）→ 五平台 `go ve
 - [x] 修 `acceptance.yml` 的 `Protocol-level checks`：去掉已删除的 `cron`、给需要平台 shim 的
       套件加 `NODE_OPTIONS="--import ./test/shims/register.mjs"`、整步加 `set -o pipefail`；
 - [x] 修 `docs/architecture.md` 的 Cron 章节（组件表、§7 整节）——Worker Cron 已删除，
-      中继池刷新搬到 `refresh-relays.yml`；
+      中继测速搬到部署工作流；
 - [x] 把 `refresh-relays.log` 这类本地产物加进 `.gitignore`。
 
 ## 附：两个版本号容易混

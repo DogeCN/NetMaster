@@ -8,7 +8,7 @@
 //   http-connect（自建 VPS）：connect() 拨中继 → HTTP CONNECT → 隧道。目标是
 //   HTTPS 时 TLS 由客户端端到端完成，中继只搬运密文。
 //
-// 出口类型名：写进 Router DO 的 egress_type，KV 条目带同一字段（PRD §7.4）。
+// 出口类型名：随中继条目一路带到赢家，决定 dialRelay 的握手方式。
 
 import { connect } from './socket.js';
 import { resolve4 } from './exits.js';

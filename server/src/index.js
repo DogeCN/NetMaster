@@ -23,7 +23,7 @@ export default {
     return env.SESSION.get(id).fetch(request);
   },
 
-  // 无 scheduled handler：Worker Cron 已移除（PRD 附录 A6）；GH Actions 的
-  // refresh-relays 定时任务也已停用（中继改硬编）。留一个空壳反而危险 ——
+  // 无 scheduled handler：Worker Cron 已移除（PRD 附录 A6）；中继候选由部署
+  // 工作流测速写 KV，没有任何定时写方。留一个空壳反而危险 ——
   // DO 内 console 输出在 tail 上不可见（m0-findings.md E9），死代码坏了也看不见。
 };

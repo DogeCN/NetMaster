@@ -28,7 +28,7 @@ npm ci
 
 # 1) 本地自检（进程内拉起 devserver.mjs + 本地 HTTP 目标）
 #    跑第 1-4 项证明脚本逻辑正确；第 5-9 项如实 SKIP。
-#    注意 --import 那个 shim：脚本 import 了 src/race.js（拿 KV 键名与中继解析），
+#    注意 --import 那个 shim：脚本 import 了 src/order.js（拿 KV 键名与中继解析），
 #    而它的依赖链里有 cloudflare:sockets。这是仓库里其它套件同样的做法。
 node --import ./test/shims/register.mjs test/e2e.mjs
 echo "exit=$?"
@@ -173,13 +173,13 @@ GitHub Actions 里（口令与 token 走 secrets）：
 8. **本地模式不是部署验收。** 它的 PASS 只证明脚本逻辑本身（第 1-4 项），
    输出里会明确标注。
 9. **第 7 项为空判 SKIP 而不是 FAIL。** `proxyip:top` 由 GitHub Actions 的
-   `refresh-relays` 定时任务写（Worker Cron 已移除），而那个定时任务**默认不开**：
+   部署工作流测速写入（refresh-relays 定时任务已停用）：
    KV 为空只说明"还没启用刷新或还没跑过"，与"这个 Worker 能不能用"无关，红着
    一项会误导排障。同理脚本不再读 `cron:lastRun`——那个键随 Worker Cron 一起
    没了，refresher 只写 `proxyip:top` 一个键；新鲜度只能去 Actions 的 run 页面
    看，脚本如实说明而不伪造证据。
    要让第 7 项真正参与验收：给仓库配 `CLOUDFLARE_API_TOKEN`（需 KV 读权限）与
-   `CLOUDFLARE_ACCOUNT_ID`，并手动 dispatch 一次 `refresh-relays`。
+   `CLOUDFLARE_ACCOUNT_ID`，并重新部署一次（部署即测速写 KV）。
 10. **第 4 项在 live 模式会被压到 25 条流。** 真实 Worker 在第 30 次出站连接后
     `close(1000, "budget")` 回收会话（见 9.1），所以"一条连接开 100 条流"在真实
     部署上做不到 —— 这不是脚本的局限，是免费版子请求预算的直接后果。local 模式

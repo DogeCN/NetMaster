@@ -65,7 +65,6 @@
 | 直连 TCP 失败负记忆 | 5 分钟 | `selector.go` `directDownTTL` |
 | 分片直连记忆 | 6 小时 | `selector.go` `fragDirectTTL` |
 | geoip 表 TTL | 7 天 | `geoip.go` `DefaultTTL` |
-| 中继池刷新周期 | 每小时左右（GH Actions `schedule`） | `refresh-relays.yml` |
 
 ## 存储配额
 

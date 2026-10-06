@@ -176,13 +176,6 @@ func DialTLS(addr string, port uint16, sni string, insecure bool) (net.Conn, err
 	return conn, nil
 }
 
-// ECHOverConn 在已建立的 TCP 连接 raw 上做带 ECH 的 TLS 握手。
-// 允许把 TCP 直连到指定的优选 IP（而非域名），同时仍用 ECH 加密真实 SNI。
-// 这解决了「优选 IP 被域名直连绕过」的问题：既能用优选 IP，又能隐 SNI。
-func ECHOverConn(raw net.Conn, realSNI string, ech []byte) (net.Conn, error) {
-	return ECHOverConnCfg(raw, realSNI, ech, true)
-}
-
 // ECHOverConnDeadline 与 ECHOverConnCfg 相同，但握手时限由调用方给。
 //
 // 为什么需要：ECHOverConnCfg 用的是"给用户建隧道"的 6 秒时限。启动探测要连着跑

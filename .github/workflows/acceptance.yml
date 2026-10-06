@@ -93,8 +93,8 @@ jobs:
           NETMASTER_E2E_ROUNDS: ${{ inputs.rounds }}
         run: go test ./internal/outbound/ -run TestLiveCFHosted -v -count=1 -timeout 600s
 
-      # 中继健康排名是否还在（由 refresh-relays 每小时写入；Cron 移除后 KV 只有这一个键）。
-      # namespace id 走 repo variable（与 refresh-relays.yml 的 vars.NETMASTER_KV_ID 同源）：
+      # 中继候选（proxyip:top）是否还在：部署工作流测速写入，运行期顺序重排会更新它。
+      # namespace id 走 repo variable（与 deploy.yml 的 KV 解析同源）：
       # id 是标识符不是凭据，但 wrangler.toml 的占位符策略是"真值不入库"，这里别再硬编——
       # namespace 重建后硬编的那份会静默指向空池。
       - name: KV health snapshot

@@ -135,26 +135,29 @@ const fetchTimeout = 4 * time.Second
 // 尾部的重复/劣质条目没有探测价值。
 const maxPerSource = 50
 
-// Community 并行拉取全部社区源，合并去重。
+// CommunityLists 并发拉取全部社区源，返回**每个源各自的列表**（按 Sources 的固定
+// 顺序，与网络到达顺序无关），并顺手剔掉不在 Cloudflare 网段内的条目。
 //
-// 每次调用都会尝试网络（"每次启动更新"），**不落盘**：不写磁盘缓存、失败也不读缓存。
-// 理由是这几个源本身就是"IP 优选"性质的短名单 —— 缓存一份旧的没有价值，反而会让
-// "为什么连不上"这类问题多出一个可能：拿到一份早已失效的旧列表还以为源挂了。
-// 拉不到就如实返回空，让上层用服务端域名解析兜底（见 main.resolveEntries）。
+// 每次调用都会尝试网络；serve 的启动路径用它的返回值维护 appdata 里的优选缓存
+// （刷新判据见 main 的 entryCacheTTL / minCachedEntries），live 测试走 Community。
 //
 // 拉取走 TLS 分片（见 fetchSource）：这几个源全是被墙域名，普通 TLS 握手送出的明文
 // SNI 会让连接在 ClientHello 之后就被 RST —— 实测这三个源在同一台机器上，普通握手能
 // 通但延迟高且不稳，分片之后才是可依赖的路径。
-//
-// 返回的 source 说明这次候选从哪来：net / none。
-// CommunityLists 并发拉取全部社区源，返回**每个源各自的列表**（按 Sources 的固定
-// 顺序，与网络到达顺序无关），并顺手剔掉不在 Cloudflare 网段内的条目。
 //
 // 为什么要"按源返回"而不是拍平：拍平只能按 channel 到达顺序合并，而三个源的响应
 // 时间差异很大（协助者实测 522ms / 896ms / 1395ms），于是"合并后的前 N 条"每次
 // 启动都不一样 —— 而 pages.dev 单源就返回 150 条 > maxEntries 64，截断前的顺序
 // 直接决定哪 64 条活下来。**结果就是节点池不可复现，任何 A/B 测量都失去前提。**
 // 按源返回后调用方能做按源交错取样：名额在源之间稳定分配，源挂掉时自动让位。
+
+// Community 并行拉取全部社区源，合并去重。live 测试与"一次性全量拉取"场景用；
+// serve 的启动路径走 CommunityLists（名额分配在调用方做）。
+func Community(ctx context.Context) (nodes []Node, source string) {
+	lists, src := CommunityLists(ctx)
+	return Merge(lists...), src
+}
+
 func CommunityLists(ctx context.Context) (lists [][]Node, source string) {
 	type result struct {
 		idx   int
@@ -209,13 +212,6 @@ func sourceLabel(rawURL string) string {
 		return u.Host
 	}
 	return rawURL
-}
-
-// Community 拍平版：给诊断命令与只关心"合并结果"的调用点用。内部走 CommunityLists，
-// 所以同样带网段过滤。
-func Community(ctx context.Context) (nodes []Node, source string) {
-	lists, src := CommunityLists(ctx)
-	return Merge(lists...), src
 }
 
 // fragClient 是拉取订阅用的 HTTP 客户端：TLS 握手之前（也就是连接建立之前），

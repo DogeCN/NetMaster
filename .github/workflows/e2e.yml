@@ -67,7 +67,7 @@ jobs:
           NETMASTER_KV_ID: ${{ secrets.NETMASTER_KV_ID }}
         run: |
           set -o pipefail   # 脚本的报错走 stderr，tee 会吞掉退出码
-          # e2e.mjs 经 src/race.js → proxyip.js → socket.js 摸 cloudflare:sockets，
+          # e2e.mjs 经 src/order.js → proxyip.js → socket.js 摸 cloudflare:sockets，
           # 必须挂 shim（与 scripts/test-all.sh 同因；B5 报告写明的前置条件）。
           node --import ./test/shims/register.mjs test/e2e.mjs 2>&1 | tee e2e-output.txt
           echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
