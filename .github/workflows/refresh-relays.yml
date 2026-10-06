@@ -16,8 +16,12 @@ on:
   push:
     branches: [main, v2]
     paths: [".github/workflows/refresh-relays.yml"]
-  schedule:
-    - cron: "0 * * * *"
+  # schedule 已停用（2026-10-06）：KV 写入额度被打爆（邮箱一屏 CI failed +
+  # KV limit exceeded）。要用手动跑 workflow_dispatch（可勾 dry_run 只看不写）。
+  # 重开前先确认：脚本每轮的 KV 写入次数（见 tools/refresh-relays.mjs）× 24
+  # 远小于每日写入配额，且给服务端流量留了余量。
+  # schedule:
+  #   - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
