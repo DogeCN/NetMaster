@@ -89,6 +89,7 @@ npx wrangler tail --format json    # JSON 格式
 | `[frag] <host> plain direct was blocked — TLS fragmentation got through, staying direct` | 规则直连域名明文起步被拦，阶梯②补了枪分片、穿过去了 | 同上：留在直连并学会"这个域名要分片"（记 6 小时） |
 | `[frag] <host> fragmented direct also blocked (…) — falling back to proxy` | 分片也穿不过去，已落代理 | 正常自愈；分片记忆同时清掉，下次直接走代理 |
 | `[frag] <host> remembered fragmentation no longer works (…) — forgetting it` | 旧的分片记忆已失效 | 正常；不清它会让此后 6 小时每条连接白付约 400ms 再落代理 |
+| `[frag] fragmented-direct disabled (--no-frag) …` | 启动时用了 `--no-frag` | 见下"站点对直连来源回 403" |
 | `[route] <host> proxy tunnel dead (…) — switched exit and replayed` | 隧道建立但零字节即断，已换出口 | 正常自愈；Worker 侧也会把坏中继忘掉 |
 
 ## ECH：怎么知道现在是哪一态
@@ -126,6 +127,28 @@ cd client && go run ./cmd/echprobe <域名>
 带出来，方便排查。只要连接本身成功了，说明至少普通 TLS 走通了。
 
 个别站点既无 ECH 又被 IP + SNI 双拦，客户端无法本地绕过。
+
+## 站点对直连来源回 403（如 arena.ai）
+
+症状：某个站反复 403，而其他站正常；同一 URL 有时又通。这不是隧道问题——**是站点的 WAF
+按来源 IP 拒绝**：客户端的"分片直连"阶梯会把 CF 承载的目标直接连出去（从你家宽带 IP），
+站点回 403；而 403 是合法 HTTP 响应，阶梯的判据（首字节有没有回来）把它当成"直连成立"，
+不回退到代理，还把 `fragDirect` 记 6 小时。
+
+判据（两条命令就能定位）：
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}
+' https://<站点>/          # 本机直连：403？
+curl -sS -x http://127.0.0.1:8080 -o /dev/null -w '%{http_code}
+' https://<站点>/   # 经客户端
+```
+
+解法：
+
+- **`netmaster serve --no-frag`**（或 config `"no-frag": true`）：关掉分片直连，这类站点
+  直接走 Worker 中继；
+- 或只针对该站：写一份规则文件（`DOMAIN,<站点>`）用 `--rules` 强制走代理。
 
 ## 节点全挂
 

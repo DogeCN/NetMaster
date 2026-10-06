@@ -548,6 +548,7 @@ func cmdServe(args []string) {
 	fragOOB := fs.Bool("frag-oob", cfg.FragOOBValue(), "send the first ClientHello fragment as TCP urgent data (MSG_OOB); only for sites where plain fragmentation is blocked (config: frag-oob)")
 	tunnels := fs.Int("tunnels", tunnelDefault(cfg), "simultaneous proxy tunnels, 1-8; more helps busy pages but burns the free DO time quota (config: tunnels)")
 	local := fs.Bool("local", false, "bypass-only mode: direct/fragmented/ECH exits, no Worker tunnel, no credentials")
+	noFrag := fs.Bool("no-frag", cfg.NoFragEnabled(), "never use the fragmented-direct bet: proxy-routed hosts go straight through the tunnel, blocked direct hosts switch over instead of retrying fragmented (config: no-frag)")
 	fs.Parse(args)
 
 	// 首次启动：交互式补齐两必填项并持久化。--local 不需要服务端，跳过。
@@ -579,6 +580,7 @@ func cmdServe(args []string) {
 		tr.Fact("insecure", boolWord(cfg.InsecureEnabled(), "on", "off"))
 		tr.Fact("rules-file", rulesFileLabel(*rulesFile))
 		tr.Fact("frag", fmt.Sprintf("%dB/%dms/%dB%s", tlsfrag.Chunk, tlsfrag.Delay.Milliseconds(), tlsfrag.MaxSpan, boolWord(*fragOOB, "+oob", "")))
+		tr.Fact("frag-direct", boolWord(*noFrag, "off", "on"))
 	}
 
 	// 单实例（PRD §6.5 step 1）：两个 serve 会互相抢系统代理。锁只拦"接管系统
@@ -730,6 +732,12 @@ func cmdServe(args []string) {
 	endRules()
 	logger.Printf("rules: %d entries (%s, skipped %d lines)", router.Size(), router.Source(), router.SkippedLines())
 
+	if *noFrag {
+		// 这条开关会改变"哪些目标走直连"，日志里必须说 —— 否则用户看到所有站都
+		// 多绕一跳却不知道为什么（与 ECH 那行同一个理由：静默的行为改变最坑）。
+		logger.Printf("[frag] fragmented-direct disabled (--no-frag): proxy-routed hosts go straight through the tunnel")
+	}
+
 	// 4. 监听端口自动选择：先试 8080/1080，被占则顺延。用户通常不需要知道
 	//    端口号 —— 系统代理自动指向选定值；--manual 下端口只用来打印。
 	httpPort, err := pickPort(8080)
@@ -749,6 +757,7 @@ func cmdServe(args []string) {
 		Router:         router,
 		Pool:           pool,
 		DirectFallback: true,
+		NoFrag:         *noFrag,
 		Logger:         logger,
 		DialTimeout:    5 * time.Second,
 		Trace:          tr,

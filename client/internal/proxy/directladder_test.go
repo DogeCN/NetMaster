@@ -163,3 +163,61 @@ var (
 	_ DirectDownTracker = (*stubPool)(nil)
 	_                   = rules.Direct
 )
+
+// TestNoFragSkipsTheDirectBet 钉住 --no-frag 的核心语义：分流判 proxy 的目标
+// 不再赌直连，直接落隧道。
+//
+// 为什么需要这个开关：直连的成败判据只有传输层（首字节有没有回来），看不见应用层
+// 语义 —— 站点 WAF 按来源 IP 拒绝时回的是合法 403，阶梯会当成"直连成立"，不但不
+// 回退，还把 fragDirect 记 6 小时（2026-10-06 arena.ai：本机直连 403 / 经中继 200）。
+func TestNoFragSkipsTheDirectBet(t *testing.T) {
+	pool := newStubPool(3)
+	s := newDirectServer(t, pool)
+	s.cfg.Router = alwaysProxyRouter{}
+	s.cfg.NoFrag = true
+	addr := liveAddr(t)
+
+	// 池子给得出连接，且 NoFrag 下不该碰直连。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	pool.dialFn = func(string) (net.Conn, error) { return net.Dial("tcp", ln.Addr().String()) }
+
+	c, mode, err := s.dial(addr)
+	if err != nil {
+		t.Fatalf("dial with --no-frag: %v", err)
+	}
+	c.Close()
+	if mode != exitProxy {
+		t.Fatalf("mode=%d; --no-frag must skip the direct bet entirely and use the tunnel", mode)
+	}
+}
+
+// TestNoFragDisablesTheFragRetry 钉住阶梯②也关了：规则直连明文起步被拦后直接
+// 改道，不再补一枪分片。
+func TestNoFragDisablesTheFragRetry(t *testing.T) {
+	dpi := newDPIListener(t, dpiFragOnly) // 明文被拦、分片能过：正是②的用武之地
+	pool := newStubPool(0)
+	s := newDirectServer(t, pool)
+	s.cfg.NoFrag = true
+
+	driveTunnel(t, s, dpi.addr(), clientHello(), 8*time.Second)
+
+	if pool.proxyTries() == 0 {
+		t.Fatal("--no-frag 下明文被拦必须直接落代理，而不是补分片")
+	}
+	if pool.NeedsFragDirect(hostOfTest(dpi.addr())) {
+		t.Error("--no-frag 下不该写入分片记忆")
+	}
+}

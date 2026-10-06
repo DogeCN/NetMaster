@@ -58,6 +58,20 @@ type Config struct {
 	// 缺省（不写）= 关闭：紧急字节是否进入对端字节流取决于 SO_OOBINLINE，开了的
 	// 接收方会拿到坏记录，所以只在确认目标站点"普通分片被拦、OOB 能过"时手动打开。
 	FragOOB *bool `json:"frag-oob,omitempty"`
+	// NoFrag 关掉"分片直连"这条降级路径：分流判 proxy 的目标不再赌直连（直接走
+	// 隧道），规则直连的目标被拦后也不再补一枪分片（直接改道）。
+	//
+	// 为什么需要它：直连的成败判据只有传输层（首字节有没有回来），看不见应用层
+	// 语义 —— 站点 WAF 按来源 IP 拒绝时回的是合法 403，阶梯会当成"直连成立"，
+	// 不但不回退，还把 fragDirect 记 6 小时。2026-10-06 的 arena.ai 就是这种：
+	// 本机直连 403（CF-RAY …-SEA）、经香港中继 200（…-HKG）。对这类站点，
+	// 唯一的解就是别赌直连。
+	NoFrag *bool `json:"no-frag,omitempty"`
+}
+
+// NoFragEnabled 返回"关掉分片直连"开关的生效值。nil 视为 false（保留直连赌注）。
+func (c Config) NoFragEnabled() bool {
+	return c.NoFrag != nil && *c.NoFrag
 }
 
 // FragOOBValue 返回分片 OOB 开关的生效值。nil 视为 false（关闭）。

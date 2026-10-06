@@ -13,11 +13,12 @@ netmaster serve --server <域名> --password <PASSWORD>
 `%AppData%/netmaster/netmaster.json`——一份文件存所有持久化数据：配置、口令、
 节点优选缓存。启动后监听端口自动选择（先试 8080/1080，被占顺延），接管系统代理并指向
 选定端口，退出时自动还原；被强杀时由看门狗兜底还原（行为落在同目录的 `watchdog`
-日志里）。`--manual` 只打印地址不接管；`--local` 纯绕过模式（直连/分片/ECH 出口，
-不建隧道、不需要凭据）；`--reset` 清除全部持久化数据。
+日志里）。`--manual` 只打印地址不接管；`--no-frag` 关掉分片直连（站点 WAF 按来源 IP 拒绝直连
+时用，如 arena.ai）；`--local` 纯绕过模式（直连/分片/ECH 出口，不建隧道、不需要凭据）；
+`--reset` 清除全部持久化数据。
 
 配置来源优先级：命令行 flag > 持久化文件 > 默认值。字段与 serve 的 flag 一一对应
-（server / password / manual / rules / tunnels / no-ech / insecure / frag-oob），
+（server / password / manual / rules / tunnels / no-ech / insecure / frag-oob / no-frag），
 另有 `entry_cache` 块（节点优选缓存）。详见 [../docs/operations.md](../docs/operations.md)。
 
 ## 命令

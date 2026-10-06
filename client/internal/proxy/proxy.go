@@ -62,6 +62,9 @@ type Config struct {
 	Pool Exiter
 	// DirectFallback 路由未覆盖或节点池为空时是否直连（默认 true）
 	DirectFallback bool
+	// NoFrag 关掉分片直连：分流判 proxy 的目标不再赌直连（直接走隧道），
+	// 规则直连的目标被拦后也不再补一枪分片。理由见 config.NoFrag 的说明。
+	NoFrag bool
 	// RetryViaProxy 在"尝试性直连"被判定阻断后改用代理重连（见 relayWithReplay）。
 	// 默认走 Pool.RetryProxy；测试可注入替身。
 	RetryViaProxy func(host string) (net.Conn, error)
@@ -254,7 +257,8 @@ func (s *Server) dial(host string) (conn net.Conn, mode directMode, err error) {
 	// 记忆决定值不值得再试一次：成功记 6h（fragDirect），失败则在隧道真的送出
 	// 字节之后记 30min（directBlocked，见 NoteProxyConfirmed）—— 那 30 分钟里
 	// 这个域名直接走隧道，不再付探测成本。
-	if s.cfg.DirectFallback && s.httpsish(host) && s.shouldTryFragDirect(host) && s.tryBeginProbe(host) {
+	// --no-frag 时整段跳过：不赌直连，直接落隧道（arena.ai 这类站点只有这一条路）。
+	if s.cfg.DirectFallback && !s.cfg.NoFrag && s.httpsish(host) && s.shouldTryFragDirect(host) && s.tryBeginProbe(host) {
 		if c, derr := net.DialTimeout("tcp", host, directProbeDialTimeout); derr == nil {
 			// 探测权由 relayWithReplay 释放（defer endProbe）：赌注的完整成本
 			// 包含它里面的 3s 首段窗口与阶梯②，不只是这里的拨号。
@@ -266,12 +270,16 @@ func (s *Server) dial(host string) (conn net.Conn, mode directMode, err error) {
 	if !s.hasUsableExit() {
 		if s.cfg.DirectFallback {
 			// 这条分支**就是**"尝试性直连"的定义：我们没有把握它通，
-			// 只是没有可用的出口了才退回来试。所以形态必须是 directFrag
+			// 只是没有可用的出口了才退回来试。所以形态必须是直连形态
 			// —— 否则调用方不会走 relayWithReplay，整条"被阻断→分片→改道"
 			// 的链路就一次都不会执行（这正是它此前一直惰性的原因）。
+			// --no-frag 下退化为明文起步（且阶梯②关闭），被拦即报错。
 			c, derr := net.DialTimeout("tcp", host, s.cfg.DialTimeout)
 			if derr != nil {
 				return nil, exitProxy, derr
+			}
+			if s.cfg.NoFrag {
+				return c, directPlain, nil
 			}
 			return c, directFrag, nil
 		}

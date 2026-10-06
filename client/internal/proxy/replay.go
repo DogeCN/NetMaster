@@ -188,8 +188,8 @@ func (s *Server) relayWithReplay(client, up net.Conn, host string, fragStart boo
 	fd := s.fragDirecter()
 	// 分片记忆可以把明文起步升级成分片起步：规则直连域名若上一轮验证过"必须
 	// 分片"，就没必要每次都先吃一次拦截再补。remembered 只用于日志与打点。
-	remembered := fd != nil && fd.NeedsFragDirect(host)
-	frag := fragStart || remembered
+	remembered := !s.cfg.NoFrag && fd != nil && fd.NeedsFragDirect(host)
+	frag := !s.cfg.NoFrag && (fragStart || remembered)
 	endWrite := s.cfg.Trace.Begin("replay.write-first", 0,
 		fmt.Sprintf("fragmented=%v remembered=%v", frag, remembered))
 	writeErr := writeFlight(up, first, frag)
@@ -251,7 +251,7 @@ func (s *Server) relayWithReplay(client, up net.Conn, host string, fragStart boo
 
 	// ② 明文起步被拦：还差一步分片没试。重新拨一次直连，带分片把首段重写。
 	// 成功就留在直连（2 跳），并把"这个域名要分片"记下来；失败才落③。
-	if !frag {
+	if !frag && !s.cfg.NoFrag {
 		if up2, data2, ok := s.retryWithFrag(host, first); ok {
 			_ = up.Close()
 			if _, err := client.Write(data2); err != nil {
@@ -271,7 +271,7 @@ func (s *Server) relayWithReplay(client, up net.Conn, host string, fragStart boo
 	// 高于 directBlocked（见 selector.Pool 的字段注释），而下面紧接着写下的
 	// "这个域名该走代理"会被它压掉。后果是此后 6 小时内每条连接都先白付约 400ms
 	// 的分片、再落代理 —— 一次失败的探测，代价按 TTL 持续计费。
-	if fd != nil {
+	if !s.cfg.NoFrag && fd != nil {
 		fd.ForgetFragDirect(host)
 		if remembered {
 			s.cfg.Logger.Printf("[frag] %s remembered fragmentation no longer works (%s) — forgetting it", host, reason)
