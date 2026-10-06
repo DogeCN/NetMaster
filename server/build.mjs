@@ -110,7 +110,8 @@ out += `\n// ===== entry =====\n`;
 for (const imp of platformImports) out += imp + '\n';
 out += `export default __default;\n`;
 // Durable Object classes must be exported from the worker module.
-out += `export { SessionDO, RouterDO };\n`;
+// RouterDO 已随 Router DO 一起移除（2026-10-06）。
+out += `export { SessionDO };\n`;
 
 writeFileSync(join(here, '_worker.js'), out, 'utf8');
 console.log(`built _worker.js (${out.length} bytes) from ${order.length} modules`);
