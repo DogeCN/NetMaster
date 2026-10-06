@@ -23,11 +23,10 @@ tag = "v1"
 # 免费版必须用 new_sqlite_classes（new_classes 是旧版 SQLite 迁移，免费计划不接受）
 new_sqlite_classes = ["SessionDO"]
 
-# Router DO 已砍（2026-10-06）：中继列表硬编三条实测幸存者（proxyip.js），
-# 跨会话路由记忆的收益撑不起一个 DO 的子请求与运维成本。v3 迁移把类删掉。
-[[migrations]]
-tag = "v3"
-deleted_classes = ["RouterDO"]
+# Router DO 的 v2（创建）/v3（删除）迁移已从本文件移除：RouterDO 从未成功部署
+# 到远端（带 v3 的两次 deploy 都在迁移这一步失败："Cannot apply deleted_classes
+# migration to non-existent class"），账号里没有这个类，也就无需删除迁移。
+# 留着它们只会让每次 deploy 都报错。
 
 # KV：两个键。proxyip:top = 部署工作流测速排序后的中继候选（deploy.yml 的
 # "Probe relays" 步骤写入，运行期 order.js 消费并就地重排、顺序变化时写回）；

@@ -13,7 +13,7 @@ for t in crypto protocol; do
   printf '  %-12s ' "$t"
   node "test/$t.mjs" | tail -1
 done
-for t in integration proxyip race router refresh-relays; do
+for t in integration proxyip order; do
   printf '  %-12s ' "$t"
   NODE_OPTIONS="--import ./test/shims/register.mjs" node "test/$t.mjs" | tail -1
 done
