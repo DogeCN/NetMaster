@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
+
 	"netmaster/internal/config"
 	"netmaster/internal/entry"
 	"netmaster/internal/geoip"
@@ -203,6 +205,90 @@ func rulesOverridesFromFile(path string) rules.Overrides {
 // 12 并发探测 64 个仍在秒级完成，代价可接受。
 const maxEntries = 64
 
+// entryCacheTTL / minCachedEntries 决定"启动后要不要后台刷新优选缓存"：
+// 缓存超过一天，或条目少于 12 个（单源抖动常见的幸存数），就拉一次社区源。
+// 刷新在后台跑，永不占启动时间 —— 缓存的价值就是"启动不等网络"。
+const (
+	entryCacheTTL    = 24 * time.Hour
+	minCachedEntries = 12
+)
+
+// mergeNodes 合并多批入口候选：按 addr:port 去重、保持各批内部顺序、总量截到 cap。
+func mergeNodes(batches ...[]entry.Node) []entry.Node {
+	seen := make(map[string]struct{}, maxEntries)
+	var out []entry.Node
+	for _, b := range batches {
+		for _, n := range b {
+			key := fmt.Sprintf("%s:%d", n.Addr, n.Port)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			if len(out) >= maxEntries {
+				return out
+			}
+			seen[key] = struct{}{}
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// promptConn 首次启动的交互式配置：补齐 server/password 两必填项并写进 f。
+// 口令用 term.ReadPassword 关闭回显 —— 口令不该躺在任何人的终端回滚缓冲里
+// （与 --password flag 不打进 -h 是同一条纪律）。stdin 不是终端时不读，
+// 返回可操作的报错，绝不 hang 住管道启动。
+func promptConn(f *config.File, serverFlag, passwordFlag string) error {
+	interactive := term.IsTerminal(int(os.Stdin.Fd()))
+	in := bufio.NewReader(os.Stdin)
+	if serverFlag != "" {
+		f.Server = normalizeServer(serverFlag)
+	}
+	if f.Server == "" {
+		if !interactive {
+			return errors.New("no server configured: run netmaster in a terminal to enter it, or pass --server / --local")
+		}
+		fmt.Print("server domain (e.g. nm.example.com): ")
+		line, _ := in.ReadString('\n')
+		f.Server = normalizeServer(strings.TrimSpace(line))
+		if f.Server == "" {
+			return errors.New("server domain is required")
+		}
+	}
+	if passwordFlag != "" {
+		f.Password = passwordFlag
+	}
+	if f.Password == "" {
+		if !interactive {
+			return errors.New("no password configured: run netmaster in a terminal to enter it, or pass --password / --local")
+		}
+		fmt.Print("worker password: ")
+		pw, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if err != nil {
+			line, _ := in.ReadString('\n')
+			pw = []byte(strings.TrimSpace(line))
+		}
+		if len(pw) == 0 {
+			return errors.New("password is required")
+		}
+		f.Password = string(pw)
+	}
+	return nil
+}
+
+// cmdReset 清除所有持久化数据（配置、口令、优选缓存、单实例锁）。
+func cmdReset() {
+	removed := config.Reset()
+	if len(removed) == 0 {
+		fmt.Println("nothing to reset: no persisted data found")
+		return
+	}
+	for _, p := range removed {
+		fmt.Println("removed " + p)
+	}
+	fmt.Println("persisted data cleared")
+}
+
 // dnsHeadroom 是服务端域名解析结果先占的名额。DNS 源排在最前且"永远可用"
 // （社区源挂了它还得兜底），但也不能让它吃掉整个预算——实测它通常只回 1~4 个 A 记录，
 // 给 16 个名额足够，宽了就是浪费社区源的位置。
@@ -309,6 +395,9 @@ func main() {
 	switch os.Args[1] {
 	case "-h", "--help", "help":
 		usage()
+		return
+	case "--reset":
+		cmdReset()
 		return
 	case "serve":
 		cmdServe(os.Args[2:])
@@ -436,28 +525,49 @@ func cmdServe(args []string) {
 	profOn, profPath := profile.FromEnv()
 	tr := profile.New(profOn)
 
-	cfg, cfgPath, err := config.Load()
+	cfgFile, cfgPath, err := config.LoadFile()
 	if err != nil {
 		fatal(err.Error())
 	}
-	if doubleClick && cfgPath == "" {
-		// 首次双击且没有任何配置：生成模板再退出，用户填好两个值即可再点。
-		path, _ := config.WriteTemplate()
-		fatal("no config.json found — created a template at " + path +
-			"\nopen it, fill in server and password, then start netmaster again")
+	cfg := cfgFile.Config
+
+	// 老版本把 config.json 放在程序目录：读到它就把整份数据迁进 appdata 单文件，
+	// 老文件留在原地不动（用户可能还要给旧版用）。
+	if cfgPath == config.LegacyPath() && cfgFile.Server != "" {
+		if p, serr := config.Save(cfgFile); serr == nil {
+			cfgPath = p
+			fmt.Printf("config migrated to %s\n", p)
+		}
 	}
 
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	server, password := connFlags(fs, cfg)
-	manual := fs.Bool("manual", cfg.Manual, "don't take over the system proxy, just print listen addrs (config.json: manual)")
-	rulesFile := fs.String("rules", cfg.Rules, "custom rules file (config.json: rules)")
-	noECH := fs.Bool("no-ech", cfg.ECHDisabled(), "disable ECH SNI hiding on the client->worker hop (config.json: no-ech)")
-	fragOOB := fs.Bool("frag-oob", cfg.FragOOBValue(), "send the first ClientHello fragment as TCP urgent data (MSG_OOB); only for sites where plain fragmentation is blocked (config.json: frag-oob)")
-	tunnels := fs.Int("tunnels", tunnelDefault(cfg), "simultaneous proxy tunnels, 1-8; more helps busy pages but burns the free DO time quota (config.json: tunnels)")
+	manual := fs.Bool("manual", cfg.Manual, "don't take over the system proxy, just print listen addrs (config: manual)")
+	rulesFile := fs.String("rules", cfg.Rules, "custom rules file (config: rules)")
+	noECH := fs.Bool("no-ech", cfg.ECHDisabled(), "disable ECH SNI hiding on the client->worker hop (config: no-ech)")
+	fragOOB := fs.Bool("frag-oob", cfg.FragOOBValue(), "send the first ClientHello fragment as TCP urgent data (MSG_OOB); only for sites where plain fragmentation is blocked (config: frag-oob)")
+	tunnels := fs.Int("tunnels", tunnelDefault(cfg), "simultaneous proxy tunnels, 1-8; more helps busy pages but burns the free DO time quota (config: tunnels)")
+	local := fs.Bool("local", false, "bypass-only mode: direct/fragmented/ECH exits, no Worker tunnel, no credentials")
 	fs.Parse(args)
-	host, pw := requireConn(*server, passwordValue(password, cfg))
+
+	// 首次启动：交互式补齐两必填项并持久化。--local 不需要服务端，跳过。
+	// 非交互（stdin 不是终端，比如从脚本里管道启动）时不 hang，给出可操作的报错。
+	if !*local && (cfgFile.Server == "" || passwordValue(password, cfg) == "") {
+		if err := promptConn(&cfgFile, *server, *password); err != nil {
+			fatal(err.Error())
+		}
+		cfg = cfgFile.Config
+		if p, serr := config.Save(cfgFile); serr == nil {
+			cfgPath = p
+			fmt.Printf("config saved to %s\n", p)
+		}
+	}
+	host, pw := "", ""
+	if !*local {
+		host, pw = requireConn(*server, passwordValue(password, cfg))
+	}
 	tlsfrag.OOB = *fragOOB
-	if *tunnels < 1 || *tunnels > selector.MaxMuxTarget {
+	if !*local && (*tunnels < 1 || *tunnels > selector.MaxMuxTarget) {
 		fatal(fmt.Sprintf("tunnels must be between 1 and %d, got %d", selector.MaxMuxTarget, *tunnels))
 	}
 
@@ -510,34 +620,89 @@ func cmdServe(args []string) {
 		logger.Printf("config: %s", cfgPath)
 	}
 
-	// 1. 入口候选分两批到。服务端域名的 DNS 解析是毫秒级的，社区优选列表要一两秒
-	//    （实测每源 0.5–1.4s，整体 3s 预算）。启动路径**只等前者**：探测、建隧道、
-	//    就绪都不该被社区源拖住 —— 用户在这段时间里什么都做不了。后者到了在后台
-	//    探测、并进池子（selector.Pool.AddNodes）。
-	entriesStart := time.Now()
-	dnsNodes := entry.FromServer(context.Background(), host)
-	if len(dnsNodes) > dnsHeadroom {
-		dnsNodes = dnsNodes[:dnsHeadroom]
-	}
-	communityPending := true
-	if len(dnsNodes) == 0 {
-		// 域名一个 IP 都解析不出来：退回"等社区源"的老路径。空池子比慢启动更糟 ——
-		// Dial 在没有候选时直接失败，用户看到的是整页打不开。
-		logger.Printf("entries: server domain did not resolve; waiting for community sources")
-		dnsNodes, _ = resolveEntries(context.Background(), host)
-		communityPending = false
-	}
-	tr.Mark("entries.dns", fmt.Sprintf("%d candidates from server DNS", len(dnsNodes)))
-	if communityPending {
-		logger.Printf("entries: %d (server DNS; community still pending)", len(dnsNodes))
-	} else {
-		logger.Printf("entries: %d (community, server DNS empty)", len(dnsNodes))
-	}
-	// 节点池的**实际成员**是耗时的一部分：探测耗的是被选中的那批，不同的成员
-	// 意味着不同的网络路径。不登记它，"这次快了 2 秒"就可能是"这次池子更好"。
-	if tr != nil {
-		tr.FactInt("entries", len(dnsNodes))
-		tr.FactInt("entry-fetch-ms", int(time.Since(entriesStart).Milliseconds()))
+	// 1. 入口候选：三批来源，启动路径只等毫秒级的那批。
+	//    服务端域名 DNS（毫秒级）与优选缓存（本地文件，读文件而已）立刻就位；
+	//    社区优选（一两秒）只在"缓存不够多或太旧"时后台刷新，永不占启动时间。
+	var pool *selector.Pool
+	var dnsNodes []entry.Node
+	if !*local {
+		entriesStart := time.Now()
+		dnsNodes = entry.FromServer(context.Background(), host)
+		if len(dnsNodes) > dnsHeadroom {
+			dnsNodes = dnsNodes[:dnsHeadroom]
+		}
+		var cachedNodes []entry.Node
+		if cfgFile.EntryCache != nil {
+			cachedNodes = cfgFile.EntryCache.Nodes
+		}
+		initial := mergeNodes(dnsNodes, cachedNodes)
+		// 刷新判据：缓存缺失/超过一天/条目太少。满足其一就后台拉社区源。
+		refreshNeeded := cfgFile.EntryCache == nil ||
+			time.Since(cfgFile.EntryCache.When) > entryCacheTTL ||
+			len(cachedNodes) < minCachedEntries
+
+		if len(initial) == 0 {
+			// DNS 与缓存都两手空空：退回"等社区源"的老路径。空池子比慢启动更糟 ——
+			// Dial 在没有候选时直接失败，用户看到的是整页打不开。
+			logger.Printf("entries: server domain did not resolve and no cache; waiting for community sources")
+			blocked, _ := resolveEntries(context.Background(), host)
+			initial = blocked
+			refreshNeeded = false // 刚拉过，不再后台重复
+		}
+		tr.Mark("entries.dns", fmt.Sprintf("%d candidates (dns %d, cache %d)", len(initial), len(dnsNodes), len(cachedNodes)))
+		logger.Printf("entries: %d (dns %d, cache %d)", len(initial), len(dnsNodes), len(cachedNodes))
+		if tr != nil {
+			tr.FactInt("entries", len(initial))
+			tr.FactInt("entry-fetch-ms", int(time.Since(entriesStart).Milliseconds()))
+		}
+
+		// 3. 节点池：先用 DNS+缓存这批候选把隧道立起来，**不等探测**。
+		//    探测的产物（按延迟排序、剔掉升级被拒的）对这几个"自己域名的 A 记录"意义有限，
+		//    而它要花一秒上下；坏候选由池子自己的失败记忆处理（noteFailure → 判死 → 换一个）。
+		pool = selector.New(selector.Config{
+			Nodes:    initial,
+			SNI:      host,
+			Password: pw,
+			UseECH:   !*noECH,
+			// 缺省校验证书（config 可设 "insecure": true 关闭）。标准部署下
+			// SNI 就是 server 域名，边缘返回该域名的正规证书，校验应当通过；
+			// 校验失败属于真实攻击面，宁可连不上让用户看见，也不静默放行。
+			Insecure:  cfg.InsecureEnabled(),
+			MuxTarget: *tunnels,
+		})
+		logger.Printf("tunnels: %d simultaneous connections to the edge", pool.MuxTarget())
+
+		if refreshNeeded {
+			go func() {
+				commCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				lists, src := entry.CommunityLists(commCtx)
+				limit := maxEntries - pool.Len()
+				if limit < 0 {
+					limit = 0
+				}
+				extra := entry.Interleave(lists, limit)
+				if len(extra) == 0 {
+					logger.Printf("entries: community gave nothing (%s); staying on dns+cache", src)
+					return
+				}
+				// 直接进池，**不等探测**。
+				//
+				// 探测（TCP 筛查 + TLS + WS 升级）与"拨一条 mux"验的是同一件事，而后者
+				// 是必须付的成本：池子的拨号本来就带失败记忆（noteFailure → 判死 → 换一个）。
+				// 先探测一遍等于把这段成本串行付两次，代价是"候选已知"到"有可用传输"之间
+				// 白等两三秒 —— 而这段等待正好压在用户的第一个请求上。
+				added := pool.AddNodes(extra)
+				logger.Printf("entries: +%d from community (%s), pool now %d", added, src, pool.Len())
+				if tr != nil {
+					tr.FactInt("entries", pool.Len())
+				}
+				// 刷新结果落进单文件缓存：下次启动直接用，不再等社区源。
+				if _, err := config.SaveEntryCache(append(append([]entry.Node{}, initial...), extra...)); err != nil {
+					logger.Printf("WARN entry cache: %v", err)
+				}
+			}()
+		}
 	}
 
 	// IP 归属判断：规则未明确分流的主机靠它决定首次走直连还是代理。
@@ -564,54 +729,6 @@ func cmdServe(args []string) {
 	}
 	endRules()
 	logger.Printf("rules: %d entries (%s, skipped %d lines)", router.Size(), router.Source(), router.SkippedLines())
-
-	// 3. 节点池：先用服务端 DNS 那几个候选把隧道立起来，**不等探测**。
-	//    探测的产物（按延迟排序、剔掉升级被拒的）对这几个"自己域名的 A 记录"意义有限，
-	//    而它要花一秒上下；坏候选由池子自己的失败记忆处理（noteFailure → 判死 → 换一个）。
-	pool := selector.New(selector.Config{
-		Nodes:    dnsNodes,
-		SNI:      host,
-		Password: pw,
-		UseECH:   !*noECH,
-		// 缺省校验证书（config.json 可设 "insecure": true 关闭）。标准部署下
-		// SNI 就是 server 域名，边缘返回该域名的正规证书，校验应当通过；
-		// 校验失败属于真实攻击面，宁可连不上让用户看见，也不静默放行。
-		Insecure:  cfg.InsecureEnabled(),
-		MuxTarget: *tunnels,
-	})
-	logger.Printf("tunnels: %d simultaneous connections to the edge", pool.MuxTarget())
-
-	// 3a. 社区优选：后台拉取 → 探测 → 并进池子。
-	//
-	// 失败只是"没有额外候选"：可用性由服务端 DNS 那条路保证（它不依赖任何第三方）。
-	// 这也是为什么它可以放到后台 —— 社区源的价值是"多几个 IP 抗封锁"，不是"能不能用"。
-	if communityPending {
-		go func() {
-			commCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			lists, src := entry.CommunityLists(commCtx)
-			limit := maxEntries - pool.Len()
-			if limit < 0 {
-				limit = 0
-			}
-			extra := entry.Interleave(lists, limit)
-			if len(extra) == 0 {
-				logger.Printf("entries: community gave nothing (%s); staying on server DNS", src)
-				return
-			}
-			// 直接进池，**不等探测**。
-			//
-			// 探测（TCP 筛查 + TLS + WS 升级）与"拨一条 mux"验的是同一件事，而后者
-			// 是必须付的成本：池子的拨号本来就带失败记忆（noteFailure → 判死 → 换一个）。
-			// 先探测一遍等于把这段成本串行付两次，代价是"候选已知"到"有可用传输"之间
-			// 白等两三秒 —— 而这段等待正好压在用户的第一个请求上。
-			added := pool.AddNodes(extra)
-			logger.Printf("entries: +%d from community (%s), pool now %d", added, src, pool.Len())
-			if tr != nil {
-				tr.FactInt("entries", pool.Len())
-			}
-		}()
-	}
 
 	// 4. 监听端口自动选择：先试 8080/1080，被占则顺延。用户通常不需要知道
 	//    端口号 —— 系统代理自动指向选定值；--manual 下端口只用来打印。
@@ -677,70 +794,73 @@ func cmdServe(args []string) {
 	// 它的产物不是"过滤候选"（这几个本来就要用），而是启动日志里那两行判据：ECH 当前
 	// 是哪一态、以及 [probe] 的三段耗时。放在后台，用户不必等它 —— 而它也不再挡在
 	// "隧道能不能建起来"前面（建隧道由下面的 Verify/Warm 直接做）。
-	go func() {
-		endProbe := tr.Begin("probe.total", 12*time.Second)
-		pr := selector.Optimize(context.Background(), dnsNodes, host, cfg.InsecureEnabled())
-		endProbe()
-		tr.Mark("probe.done", fmt.Sprintf("%d/%d nodes", len(pr.Nodes), len(dnsNodes)))
-		reportProbe(logger, tr, host, cfg.InsecureEnabled(), len(dnsNodes), pr)
-	}()
+	// --local 没有服务端，无隧道可探：这一段连同下面的周期探活、连通验证全部跳过。
+	if !*local {
+		go func() {
+			endProbe := tr.Begin("probe.total", 12*time.Second)
+			pr := selector.Optimize(context.Background(), dnsNodes, host, cfg.InsecureEnabled())
+			endProbe()
+			tr.Mark("probe.done", fmt.Sprintf("%d/%d nodes", len(pr.Nodes), len(dnsNodes)))
+			reportProbe(logger, tr, host, cfg.InsecureEnabled(), len(dnsNodes), pr)
+		}()
 
-	// 周期探活：每 10 分钟对池子头部 5 个节点做一次 TLS 握手（不带 WS 升级，
-	// 升级会真的建 DO 烧额度）。运行期原本没有复探，节点死了要等真实流量撞上
-	// 才知道 —— 空闲后的第一批请求就是那批撞墙的。探活是握手级的，探一次的
-	// 成本远低于一次对冲拨号 + 重放；失败按既有账本记（5 次判死），不会冤死节点。
-	// 探测权竞争由 RecheckTop 内部并发上限约束，不需要这里再限。
-	probeStop := make(chan struct{})
-	defer close(probeStop)
-	go func() {
-		t := time.NewTicker(10 * time.Minute)
-		defer t.Stop()
-		for {
-			select {
-			case <-probeStop:
-				return
-			case <-t.C:
-				n := pool.RecheckTop(context.Background(), 5)
-				pool.SweepExpired() // 记忆表的过期条目惰性删除兜底，见 SweepExpired
-				if n < 5 {
-					logger.Printf("[probe] periodic recheck: %d/5 alive", n)
+		// 周期探活：每 10 分钟对池子头部 5 个节点做一次 TLS 握手（不带 WS 升级，
+		// 升级会真的建 DO 烧额度）。运行期原本没有复探，节点死了要等真实流量撞上
+		// 才知道 —— 空闲后的第一批请求就是那批撞墙的。探活是握手级的，探一次的
+		// 成本远低于一次对冲拨号 + 重放；失败按既有账本记（5 次判死），不会冤死节点。
+		// 探测权竞争由 RecheckTop 内部并发上限约束，不需要这里再限。
+		probeStop := make(chan struct{})
+		defer close(probeStop)
+		go func() {
+			t := time.NewTicker(10 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-probeStop:
+					return
+				case <-t.C:
+					n := pool.RecheckTop(context.Background(), 5)
+					pool.SweepExpired() // 记忆表的过期条目惰性删除兜底，见 SweepExpired
+					if n < 5 {
+						logger.Printf("[probe] periodic recheck: %d/5 alive", n)
+					}
 				}
 			}
-		}
-	}()
+		}()
 
-	// 首次连通验证：一次真实的传输层建连（TLS+WS+auth），在后台跑，
-	// 结果出来补一行日志 —— 部署是否健康，这一行就是最直接的回答。
-	// *.workers.dev 在中国大陆被 SNI 阻断（实测同一 CF IP：workers.dev 的
-	// ClientHello 被 RST，其他域名正常），这是"连不上"的头号原因，失败时
-	// 直接把方向指给用户。
-	go func() {
-		// 先预热，再验证 —— 顺序是有代价的，不能反。
-		//
-		// 预热（TopUp）是"让请求能用"的那件事：它并行对冲拨号、建好的传输立刻挂进池子，
-		// 用户请求马上就能用上。而 Verify 只是"这个部署健不健康"的提示行。
-		// 原先是 Verify 在前，而它串行试最多 3 个节点、每个都可能耗满拨号超时
-		// （坏窗口实测 6s 级）—— 于是预热被硬生生推迟十几秒，首个请求只能干等。
-		// 现在改成：预热先跑，验证等它的结果（VerifyOnLive 不自己拨号）。
-		pool.Warm()
+		// 首次连通验证：一次真实的传输层建连（TLS+WS+auth），在后台跑，
+		// 结果出来补一行日志 —— 部署是否健康，这一行就是最直接的回答。
+		// *.workers.dev 在中国大陆被 SNI 阻断（实测同一 CF IP：workers.dev 的
+		// ClientHello 被 RST，其他域名正常），这是"连不上"的头号原因，失败时
+		// 直接把方向指给用户。
+		go func() {
+			// 先预热，再验证 —— 顺序是有代价的，不能反。
+			//
+			// 预热（TopUp）是"让请求能用"的那件事：它并行对冲拨号、建好的传输立刻挂进池子，
+			// 用户请求马上就能用上。而 Verify 只是"这个部署健不健康"的提示行。
+			// 原先是 Verify 在前，而它串行试最多 3 个节点、每个都可能耗满拨号超时
+			// （坏窗口实测 6s 级）—— 于是预热被硬生生推迟十几秒，首个请求只能干等。
+			// 现在改成：预热先跑，验证等它的结果（VerifyOnLive 不自己拨号）。
+			pool.Warm()
 
-		endVerify := tr.Begin("tunnel.verify", 10*time.Second)
-		if node, err := pool.VerifyOnLive("www.google.com:443", 10*time.Second); err != nil {
-			endVerify()
-			tr.Mark("tunnel.failed", err.Error())
-			logger.Printf("tunnel failed: %v", err)
-			if strings.HasSuffix(host, ".workers.dev") {
-				logger.Println("hint: *.workers.dev domains are SNI-blocked in mainland China (and ECH is not published for them).")
-				logger.Println("      bind a custom domain to the Worker in the Cloudflare dashboard")
-				logger.Println("      (Workers & Pages -> netmaster -> Settings -> Domains & Routes -> Add Custom Domain),")
-				logger.Println("      then put that domain in config.json as \"server\". See docs/deployment.md.")
+			endVerify := tr.Begin("tunnel.verify", 10*time.Second)
+			if node, err := pool.VerifyOnLive("www.google.com:443", 10*time.Second); err != nil {
+				endVerify()
+				tr.Mark("tunnel.failed", err.Error())
+				logger.Printf("tunnel failed: %v", err)
+				if strings.HasSuffix(host, ".workers.dev") {
+					logger.Println("hint: *.workers.dev domains are SNI-blocked in mainland China (and ECH is not published for them).")
+					logger.Println("      bind a custom domain to the Worker in the Cloudflare dashboard")
+					logger.Println("      (Workers & Pages -> netmaster -> Settings -> Domains & Routes -> Add Custom Domain),")
+					logger.Println("      then put that domain in the config as \"server\". See docs/deployment.md.")
+				}
+			} else {
+				endVerify()
+				tr.Mark("tunnel.ok", "via "+node)
+				logger.Printf("tunnel established via node %s", node)
 			}
-		} else {
-			endVerify()
-			tr.Mark("tunnel.ok", "via "+node)
-			logger.Printf("tunnel established via node %s", node)
-		}
-	}()
+		}()
+	}
 
 	waitForSignal()
 
@@ -776,23 +896,55 @@ func pickPort(preferred int) (int, error) {
 }
 
 // cmdWatchdog 内部命令：等待 owner 进程退出，若系统代理仍指向 netmaster 则还原。
-// serve 被强杀（任务管理器结束进程、断电）时，由它把系统代理还原回去。
+// serve 被强杀（任务管理器结束进程、断电、终端关窗）时，由它把系统代理还原回去。
 //
 // owner pid 走环境变量而不是命令行参数：这是两个进程之间的内部约定，用户没有理由传它，
 // 而一个自称 "--owner-pid" 的 flag 会出现在 -h 里，让人以为那是个可调的东西。
+//
+// 看门狗是 detached 进程，没有可见输出 —— 曾经"静默退出即可"，结果它到底活没活、
+// 还原没还原、还是死在了半路，出了事完全无从排查（用户报"自动还原没生效"时
+// 连它是否存在过都证明不了）。现在把每一步写进 appdata 的 watchdog 日志。
 func cmdWatchdog(args []string) {
 	_ = args
+	wdLog := func(format string, a ...any) {
+		f, err := os.OpenFile(watchdogLogPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		fmt.Fprintf(f, time.Now().Format("2006-01-02 15:04:05 ")+" "+format+"\n", a...)
+	}
 	pid, err := strconv.Atoi(strings.TrimSpace(os.Getenv("NETMASTER_OWNER_PID")))
 	if err != nil || pid <= 0 {
+		wdLog("refused: missing NETMASTER_OWNER_PID")
 		fmt.Fprintln(os.Stderr, "watchdog can only be spawned by serve (missing NETMASTER_OWNER_PID)")
 		os.Exit(2)
 	}
+	wdLog("watching owner pid %d", pid)
 	procwait.Wait(pid) // 阻塞到 owner 退出
+	wdLog("owner %d exited", pid)
 	// owner 已消失：若状态文件还在，说明它没走正常清理流程 → 还原。
-	if cleaned, err := sysproxy.CleanupStale(); err == nil && cleaned {
-		// 看门狗静默退出即可，日志对用户不可见。
-		_ = cleaned
+	cleaned, err := sysproxy.CleanupStale()
+	if err != nil {
+		wdLog("restore FAILED: %v", err)
+		return
 	}
+	if cleaned {
+		wdLog("stale takeover restored")
+	} else {
+		wdLog("nothing to restore (no stale state)")
+	}
+}
+
+// watchdogLogPath 是看门狗的落点：与持久化文件同目录。超过 256KiB 就截断重写，
+// 这是诊断日志不是审计日志，只保留最近一段。
+func watchdogLogPath() string {
+	p := config.LockPath("")
+	const max = 256 << 10
+	if fi, err := os.Stat(p); err == nil && fi.Size() > max {
+		_ = os.Remove(p)
+	}
+	return p
 }
 
 func cmdRestore(args []string) {

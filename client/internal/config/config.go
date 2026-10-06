@@ -1,18 +1,16 @@
-// Package config 负责 config.json 的查找与解析（标准库零依赖）。
+// Package config 负责全部持久化数据的读写：一份文件存所有东西。
+//
+// 文件固定在 %AppData%/netmaster/netmaster.json（os.UserConfigDir），包含
+// 配置（server/password/开关）与节点优选缓存两块。程序目录不再落任何文件
+// ——双击运行的用户不该在 exe 旁边看到一坨随行文件。
 //
 // 配置来源优先级：命令行 flag > 配置文件 > 默认值。实现上，配置文件只用来
 // 提供 flag 的默认值 —— flag 总是显式声明，配置值被当作"默认的默认"，所以
 // 优先级天然成立，不需要任何合并逻辑。
 //
-// 可配置项与 serve 的 flag 一一对应（名字去掉 --）：server / password /
-// manual / rules / no-ech / tunnels。insecure 只有配置项没有 flag（自我签名
-// 证书场景太窄，不值得占一行命令行帮助）。nodes / restore 同样读取 server /
-// password。
-//
-// 查找顺序：./config.json，然后 %AppData%/netmaster/config.json
-// （os.UserConfigDir）。两个位置都不存在不是错误 —— 所有配置也都可以由
-// flag 给出。文件存在但损坏是错误：静默忽略一份读不出来的配置，会让人
-// 以为它生效了。
+// 兼容：老版本把 config.json 放在程序目录（./config.json）。首次用新版启动
+// 时若 appdata 文件不存在而 ./config.json 存在，LoadFile 会把它原样读回；
+// 调用方（serve）随后 Save 一次即完成迁移，老文件留在原地不动。
 package config
 
 import (
@@ -20,9 +18,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
+
+	"netmaster/internal/entry"
 )
 
-// Config 是 config.json 的结构。
+// Config 是配置块的结构。
 //
 // 字段与 serve 的 flag 一一对应，不多一个：曾经有个 LatencyToleranceMs
 // （出口优选容差），它描述的"延迟容忍 / 自优化选路"在 v2 里已随 nodepool
@@ -82,63 +83,123 @@ func (c Config) ECHDisabled() bool {
 	return c.NoECH != nil && *c.NoECH
 }
 
-// LockPath 返回 serve 单实例锁文件的路径：与实际加载的 config.json 同目录；
-// 没有配置文件时退到 UserConfigDir/netmaster，再退到当前目录。
-func LockPath(cfgPath string) string {
-	if cfgPath != "" {
-		return filepath.Join(filepath.Dir(cfgPath), "serve.lock")
-	}
-	if base, err := os.UserConfigDir(); err == nil && base != "" {
-		return filepath.Join(base, "netmaster", "serve.lock")
-	}
-	return "serve.lock"
+// EntryCache 是节点优选结果的持久化块：上次社区源拉到的候选 IP 与时间。
+//
+// 优选缓存的意义是启动不等社区源：有缓存时立刻进池，后台再决定要不要刷新
+// （不够多或太旧才刷）。缓存里只是"值得试的候选"，不是可用性结论 —— 可用性
+// 由池子的拨号失败记忆管。
+type EntryCache struct {
+	When  time.Time    `json:"when"`
+	Nodes []entry.Node `json:"nodes"`
 }
 
-// searchPaths 返回按优先级排列的候选路径。
-func searchPaths() []string {
-	paths := []string{"config.json"}
-	if base, err := os.UserConfigDir(); err == nil && base != "" {
-		paths = append(paths, filepath.Join(base, "netmaster", "config.json"))
-	}
-	return paths
+// File 是持久化文件的整体结构：配置块 + 缓存块，一个文件存所有需要落盘的
+// 数据。Config 内嵌以保持平铺 —— 老版 config.json 里手填的字段原样可读。
+type File struct {
+	Config
+	EntryCache *EntryCache `json:"entry_cache,omitempty"`
 }
 
-// Load 读配置。返回 (配置, 实际加载的文件路径)。
-func Load() (Config, string, error) {
-	for _, p := range searchPaths() {
+// appPathOverride 供测试把持久化文件钉进临时目录；非空时 AppPath 直接返回它。
+var appPathOverride string
+
+// AppPath 返回持久化文件的路径：%AppData%/netmaster/netmaster.json。
+// UserConfigDir 拿不到（极老系统/容器）时退到当前目录，功能不受影响。
+func AppPath() string {
+	if appPathOverride != "" {
+		return appPathOverride
+	}
+	if base, err := os.UserConfigDir(); err == nil && base != "" {
+		return filepath.Join(base, "netmaster", "netmaster.json")
+	}
+	return "netmaster.json"
+}
+
+// legacyPath 是老版本在程序目录留下的配置。只为迁移而读，不再写入。
+const legacyPath = "config.json"
+
+// LegacyPath 返回老版本配置的路径，供调用方判断"刚加载的是否需要迁移"。
+func LegacyPath() string { return legacyPath }
+
+// LockPath 返回 serve 单实例锁文件的路径：与持久化文件同目录。
+func LockPath(_ string) string {
+	return filepath.Join(filepath.Dir(AppPath()), "serve.lock")
+}
+
+// LoadFile 读持久化文件。查找顺序：appdata 的 netmaster.json → 老的
+// ./config.json（只读不写，调用方 Save 一次即完成迁移）。
+// 两个位置都不存在不是错误 —— 所有配置也都可以由 flag / 首次交互给出。
+// 文件存在但损坏是错误：静默忽略一份读不出来的配置，会让人以为它生效了。
+func LoadFile() (File, string, error) {
+	for _, p := range []string{AppPath(), legacyPath} {
 		b, err := os.ReadFile(p)
 		if err != nil {
 			continue // 不存在或读不了：换下一个位置
 		}
-		var c Config
-		if err := json.Unmarshal(b, &c); err != nil {
-			return Config{}, p, fmt.Errorf("parse %s: %w", p, err)
+		var f File
+		if err := json.Unmarshal(b, &f); err != nil {
+			return File{}, p, fmt.Errorf("parse %s: %w", p, err)
 		}
-		return c, p, nil
+		return f, p, nil
 	}
-	return Config{}, "", nil
+	return File{}, "", nil
 }
 
-// template 是首次启动时写出的 config.json 样例。占位符本身是合法 JSON，
-// 用户只要替换两个尖括号里的值。
-//
-// 故意只写必填的两项：manual / rules 是可选增强，把四个字段全铺开会让
-// 第一次打开这个文件的人以为都得填。要用它们照 README 加即可。
-const template = `{
-  "server": "<your worker domain, e.g. nm.example.com>",
-  "password": "<the PASSWORD you set on the Worker>"
+// LoadFileAt 显式读指定路径（测试用；生产路径由 AppPath 决定）。
+func LoadFileAt(path string) (File, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return File{}, err
+	}
+	var f File
+	if err := json.Unmarshal(b, &f); err != nil {
+		return File{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return f, nil
 }
-`
 
-// WriteTemplate 在当前目录写出配置模板，返回绝对路径。
-// 只在"完全没有配置文件"时由 serve 的双击路径调用；任意位置已有配置则不动。
-func WriteTemplate() (string, error) {
-	if _, found, _ := Load(); found != "" {
-		return "", nil
+// Load 只取配置块（nodes/restore 等不关心缓存的调用方用）。
+func Load() (Config, string, error) {
+	f, p, err := LoadFile()
+	return f.Config, p, err
+}
+
+// Save 把整份持久化数据写进 appdata 文件（目录不存在则创建）。
+// 文件里含口令，权限收窄到属主可读写。
+func Save(f File) (string, error) {
+	p := AppPath()
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return p, err
 	}
-	abs, _ := filepath.Abs("config.json")
-	if err := os.WriteFile("config.json", []byte(template), 0o644); err != nil {
-		return abs, err
+	b, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return p, err
 	}
-	return abs, nil
+	if err := os.WriteFile(p, append(b, '\n'), 0o600); err != nil {
+		return p, err
+	}
+	return p, nil
+}
+
+// Reset 清除所有持久化数据：appdata 文件、serve 单实例锁，以及老版本留在
+// 程序目录的 config.json（若存在）。文件不存在不算错误。
+func Reset() []string {
+	var removed []string
+	for _, p := range []string{AppPath(), LockPath(""), legacyPath} {
+		if err := os.Remove(p); err == nil {
+			removed = append(removed, p)
+		}
+	}
+	return removed
+}
+
+// SaveEntryCache 把节点优选结果落进持久化文件（其余内容原样保留）。
+// 由 serve 的后台刷新调用：刷新成功才有必要写，失败静默 —— 缓存是优化不是状态。
+func SaveEntryCache(nodes []entry.Node) (string, error) {
+	f, _, err := LoadFile()
+	if err != nil {
+		return AppPath(), err
+	}
+	f.EntryCache = &EntryCache{When: time.Now(), Nodes: nodes}
+	return Save(f)
 }

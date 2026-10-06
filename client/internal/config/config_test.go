@@ -3,8 +3,12 @@ package config
 import (
 	"encoding/json"
 	"os"
-	"strings"
+	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
+
+	"netmaster/internal/entry"
 )
 
 // writeConfig 在当前目录写 config.json（调用方负责先 chdir 进去）。
@@ -144,54 +148,86 @@ func TestNoConfigIsNotAnError(t *testing.T) {
 	}
 }
 
-// 模板必须是合法 JSON，且只含必填项 —— 它是"第一次双击"看到的第一份配置，
-// 多一个字段就多一个"这个要不要填"的疑问。
-func TestTemplate(t *testing.T) {
-	var m map[string]any
-	if err := json.Unmarshal([]byte(template), &m); err != nil {
-		t.Fatalf("template is not valid JSON: %v", err)
+// appdata 钉进临时目录：测试绝不能碰真实的用户配置。
+func pinAppPath(t *testing.T) {
+	t.Helper()
+	old := appPathOverride
+	appPathOverride = filepath.Join(t.TempDir(), "netmaster.json")
+	t.Cleanup(func() { appPathOverride = old })
+}
+
+// Save → LoadFile 往返：配置与优选缓存都要原样回来。
+func TestSaveLoadFileRoundTrip(t *testing.T) {
+	pinAppPath(t)
+
+	f := File{Config: Config{Server: "a.example", Password: "p"}}
+	f.EntryCache = &EntryCache{When: time.Now(), Nodes: []entry.Node{{Addr: "1.2.3.4", Port: 443}}}
+	if _, err := Save(f); err != nil {
+		t.Fatalf("save: %v", err)
 	}
-	for _, k := range []string{"server", "password"} {
-		if _, ok := m[k]; !ok {
-			t.Errorf("template should contain %q", k)
-		}
+	got, path, err := LoadFile()
+	if err != nil {
+		t.Fatalf("load: %v", err)
 	}
-	if len(m) != 2 {
-		t.Errorf("template should only carry the required fields, got %v", m)
+	if path != AppPath() {
+		t.Errorf("loaded from %q, want %q", path, AppPath())
 	}
-	if !strings.Contains(template, "<") {
-		t.Error("template should use <...> placeholders")
+	if got.Server != "a.example" || got.Password != "p" {
+		t.Errorf("config round-trip = %+v", got.Config)
+	}
+	if got.EntryCache == nil || len(got.EntryCache.Nodes) != 1 || got.EntryCache.Nodes[0].Addr != "1.2.3.4" {
+		t.Errorf("entry cache round-trip = %+v", got.EntryCache)
 	}
 }
 
-// WriteTemplate 在有配置时不动手（避免覆盖用户填好的值）。
-func TestWriteTemplateSkipsWhenConfigExists(t *testing.T) {
-	chdirTemp(t)
-	writeConfig(t, `{"server":"keep.me","password":"x"}`)
-	path, err := WriteTemplate()
+// Save 出的文件权限收窄：里面躺着口令。
+func TestSaveFilePermissions(t *testing.T) {
+	pinAppPath(t)
+	if _, err := Save(File{Config: Config{Server: "a", Password: "p"}}); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(AppPath())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if path != "" {
-		t.Error("WriteTemplate must not overwrite an existing config")
-	}
-	b, _ := os.ReadFile("config.json")
-	if !strings.Contains(string(b), "keep.me") {
-		t.Error("existing config should be left untouched")
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
+		t.Errorf("perm = %o, want 600 (the file carries the password)", fi.Mode().Perm())
 	}
 }
 
-// 无配置时写模板。
-func TestWriteTemplateCreates(t *testing.T) {
-	chdirTemp(t)
-	path, err := WriteTemplate()
-	if err != nil {
+// Reset 清掉 appdata 文件与锁；再 Reset 一次不报错。
+func TestResetRemovesPersistedData(t *testing.T) {
+	pinAppPath(t)
+	if _, err := Save(File{Config: Config{Server: "a"}}); err != nil {
 		t.Fatal(err)
 	}
-	if path == "" {
-		t.Fatal("expected a path back")
+	if err := os.WriteFile(LockPath(""), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat("config.json"); err != nil {
-		t.Fatalf("config.json not created: %v", err)
+	removed := Reset()
+	if len(removed) == 0 {
+		t.Fatal("expected files to be removed")
+	}
+	if _, err := os.Stat(AppPath()); !os.IsNotExist(err) {
+		t.Error("appdata file survived Reset")
+	}
+	// 空状态上再 Reset 一次：安全无副作用（幂等）。
+	Reset()
+	if _, err := os.Stat(AppPath()); !os.IsNotExist(err) {
+		t.Error("appdata file reappeared")
+	}
+}
+
+// 老版 ./config.json 仍可读（迁移的读侧），且 appdata 优先。
+func TestLegacyConfigStillReadable(t *testing.T) {
+	pinAppPath(t)
+	chdirTemp(t)
+	writeConfig(t, `{"server":"legacy.example","password":"p"}`)
+	cfg, path, err := Load()
+	if err != nil {
+		t.Fatalf("load legacy: %v", err)
+	}
+	if path != legacyPath || cfg.Server != "legacy.example" {
+		t.Errorf("got (%+v, %q)", cfg, path)
 	}
 }
