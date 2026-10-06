@@ -25,11 +25,16 @@ new_sqlite_classes = ["SessionDO"]
 
 # v2（创建 RouterDO）必须保留：远端脚本的迁移历史里已记录 v2，配置里删掉它
 # 会让 wrangler 认为历史断裂、全量重放 v1，报 10074（SessionDO already exists）。
-# RouterDO 的代码与绑定已删；远端也没有这个类（v3 删除迁移实测报
-# non-existent class），所以这里只对齐历史，不需要删除迁移。
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["RouterDO"]
+
+# v3 删除 RouterDO：线上还有存量 RouterDO 实例，直接从 bundle 撤掉导出会报
+# 10064（class is depended on by existing Durable Objects），必须走删除迁移。
+# 之前报 non-existent class 是因为配置缺 v2、迁移链断裂所致，补齐后即正常。
+[[migrations]]
+tag = "v3"
+deleted_classes = ["RouterDO"]
 
 # KV：两个键。proxyip:top = 部署工作流测速排序后的中继候选（deploy.yml 的
 # "Probe relays" 步骤写入，运行期 order.js 消费并就地重排、顺序变化时写回）；
